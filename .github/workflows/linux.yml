@@ -5,6 +5,12 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "Open tmate SSH session on failure"
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -43,3 +49,7 @@ jobs:
           PYTHONPATH=python python3 -c \
             "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
           python3 -m compileall -q python/trt_dit_plugins
+
+      - name: Debug session (tmate)
+        if: failure() && inputs.debug
+        uses: mxschmitt/action-tmate@v3
