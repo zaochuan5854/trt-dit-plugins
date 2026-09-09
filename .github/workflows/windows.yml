@@ -63,6 +63,15 @@ jobs:
           echo '```' >> $env:GITHUB_STEP_SUMMARY
           Get-Content build-build.log -Tail 60 >> $env:GITHUB_STEP_SUMMARY
           echo '```' >> $env:GITHUB_STEP_SUMMARY
+          $t = @()
+          if (Test-Path build-cmake.log) { $t += "cmake:"; $t += Get-Content build-cmake.log -Tail 30 }
+          if (Test-Path build-build.log) { $t += "build:"; $t += Get-Content build-build.log -Tail 40 }
+          $msg = ($t -join "`n").Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+          "CI_LOG_TAIL=$msg" >> $env:GITHUB_ENV
+
+      - name: Publish log tail as annotation
+        if: failure()
+        run: echo "::notice title=ci-log-tail::${{ env.CI_LOG_TAIL }}"
 
       - name: Registration check (no GPU)
         run: |

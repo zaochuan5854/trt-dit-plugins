@@ -36,11 +36,15 @@ jobs:
             libnvinfer-safe-headers-dev=${TRT_VER} \
           && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-      - name: Configure and build (all cores)
+      - name: Configure
         run: |
           set -o pipefail
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release 2>&1 | tee /tmp/cmake.log
-          cmake --build build --parallel $(nproc) 2>&1 | tee /tmp/build.log
+
+      - name: Build (2 jobs, hosted RAM is 16 GB)
+        run: |
+          set -o pipefail
+          cmake --build build --parallel 2 2>&1 | tee /tmp/build.log
 
       - name: Report logs to summary on failure
         if: failure()
@@ -54,6 +58,23 @@ jobs:
           tail -60 /tmp/build.log >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
           df -h / >> $GITHUB_STEP_SUMMARY || true
+          python3 - <<'EOF' >> $GITHUB_ENV
+          import os
+          chunks = []
+          for tag, path, n in (("cmake", "/tmp/cmake.log", 30), ("build", "/tmp/build.log", 40)):
+              try:
+                  with open(path, errors="replace") as f:
+                      lines = f.read().splitlines()[-n:]
+              except OSError:
+                  lines = ["<missing>"]
+              chunks.append(tag + ":\n" + "\n".join(lines))
+          msg = "\n".join(chunks).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"CI_LOG_TAIL={msg}")
+          EOF
+
+      - name: Publish log tail as annotation
+        if: failure()
+        run: echo "::notice title=ci-log-tail::${CI_LOG_TAIL}"
 
       - name: Registration check (no GPU)
         run: ./build/regcheck ./build/libtrt_dit_plugins.so
