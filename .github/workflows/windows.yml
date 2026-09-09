@@ -57,11 +57,11 @@ jobs:
         run: |
           echo '### cmake.log (tail)' >> $env:GITHUB_STEP_SUMMARY
           echo '```' >> $env:GITHUB_STEP_SUMMARY
-          Get-Content build-cmake.log -Tail 40 >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path build-cmake.log) { Get-Content build-cmake.log -Tail 40 >> $env:GITHUB_STEP_SUMMARY }
           echo '```' >> $env:GITHUB_STEP_SUMMARY
           echo '### build.log (tail)' >> $env:GITHUB_STEP_SUMMARY
           echo '```' >> $env:GITHUB_STEP_SUMMARY
-          Get-Content build-build.log -Tail 60 >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path build-build.log) { Get-Content build-build.log -Tail 60 >> $env:GITHUB_STEP_SUMMARY }
           echo '```' >> $env:GITHUB_STEP_SUMMARY
           $t = @()
           if (Test-Path build-cmake.log) { $t += "cmake:"; $t += Get-Content build-cmake.log -Tail 30 }
