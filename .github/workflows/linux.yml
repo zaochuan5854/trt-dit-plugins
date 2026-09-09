@@ -38,8 +38,22 @@ jobs:
 
       - name: Configure and build (all cores)
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --parallel $(nproc)
+          set -o pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release 2>&1 | tee /tmp/cmake.log
+          cmake --build build --parallel $(nproc) 2>&1 | tee /tmp/build.log
+
+      - name: Report logs to summary on failure
+        if: failure()
+        run: |
+          echo '### cmake.log (tail)' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -40 /tmp/cmake.log >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo '### build.log (tail)' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -60 /tmp/build.log >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          df -h / >> $GITHUB_STEP_SUMMARY || true
 
       - name: Registration check (no GPU)
         run: ./build/regcheck ./build/libtrt_dit_plugins.so
