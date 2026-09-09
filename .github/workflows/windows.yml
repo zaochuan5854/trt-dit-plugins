@@ -35,14 +35,47 @@ jobs:
           cuda: "13.2.0"
           method: network
 
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Fetch TensorRT SDK
         run: |
-          if (-not $env:TRT_ZIP) { throw "Set TENSORRT_WINDOWS_URL repository variable (see workflow file)" }
-          Invoke-WebRequest $env:TRT_ZIP -OutFile $env:RUNNER_TEMP/trt.zip
-          Expand-Archive $env:RUNNER_TEMP/trt.zip C:\trt
-          $inf = Get-ChildItem -Recurse -Path C:\trt -Filter NvInfer.h | Select-Object -First 1
-          if (-not $inf) { throw "NvInfer.h not found in TRT zip" }
-          "TENSORRT_ROOT=$($inf.Directory.Parent.FullName)" >> $env:GITHUB_ENV
+          $trt = "$env:RUNNER_TEMP\trt"
+          New-Item -ItemType Directory -Force -Path "$trt\include", "$trt\lib", "$trt\bin" | Out-Null
+          if ($env:TRT_ZIP) {
+            # Full SDK zip mirror (preferred when provisioned).
+            Invoke-WebRequest $env:TRT_ZIP -OutFile $env:RUNNER_TEMP/trt.zip
+            Expand-Archive $env:RUNNER_TEMP/trt.zip C:\trt-full
+            $inf = Get-ChildItem -Recurse -Path C:\trt-full -Filter NvInfer.h | Select-Object -First 1
+            if (-not $inf) { throw "NvInfer.h not found in TRT zip" }
+            "TENSORRT_ROOT=$($inf.Directory.Parent.FullName)" >> $env:GITHUB_ENV
+            exit 0
+          }
+          # Automatic path, no login needed:
+          # DLLs from NVIDIA's pip index + headers from GitHub + generated import lib.
+          pip install --extra-index-url https://pypi.nvidia.com "tensorrt-cu13-libs==10.16.1.11"
+          $dllDir = Split-Path (Get-ChildItem -Recurse -Path (python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])") `
+            -Filter nvinfer_10.dll | Select-Object -First 1).FullName
+          if (-not $dllDir) { throw "nvinfer_10.dll not found after pip install" }
+          Copy-Item "$dllDir\*.dll" "$trt\bin\"
+          $tag = "v10.16"
+          foreach ($h in @("NvInfer.h", "NvInferVersion.h", "NvInferImpl.h", "NvInferRuntimeCommon.h", `
+                           "NvInferPluginBase.h", "NvInferRuntimePlugin.h", "NvInferRuntime.h")) {
+            Invoke-WebRequest "https://raw.githubusercontent.com/NVIDIA/TensorRT/$tag/include/$h" `
+              -OutFile "$trt\include\$h"
+          }
+          if (-not (Test-Path "$trt\include\NvInferRuntime.h")) { throw "header download failed" }
+          dumpbin /exports "$trt\bin\nvinfer_10.dll" | Out-String | Set-Content "$trt\nvinfer.txt"
+          $exp = Get-Content "$trt\nvinfer.txt" | Select-String "^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+(\S+)" | ForEach-Object { $_.Matches.Groups[1].Value }
+          "LIBRARY nvinfer_10.dll", "EXPORTS" + ($exp | ForEach-Object { "    $_" }) | Set-Content "$trt\nvinfer.def"
+          lib /def:"$trt\nvinfer.def" /out:"$trt\lib\nvinfer.lib" /machine:x64
+          if (-not (Test-Path "$trt\lib\nvinfer.lib")) { throw "import lib generation failed" }
+          "TENSORRT_ROOT=$trt" >> $env:GITHUB_ENV
 
       - name: Configure and build (all cores)
         run: |
@@ -77,11 +110,6 @@ jobs:
         run: |
           $env:PATH = "build;$env:TENSORRT_ROOT\lib;$env:CUDA_PATH\bin;$env:PATH"
           .\build\regcheck.exe .\build\trt_dit_plugins.dll
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
 
       - name: Python import check (no GPU/torch)
         run: |
