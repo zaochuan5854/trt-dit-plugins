@@ -63,7 +63,9 @@ jobs:
             -Filter nvinfer_10.dll | Select-Object -First 1).FullName
           if (-not $dllDir) { throw "nvinfer_10.dll not found after pip install" }
           Copy-Item "$dllDir\*.dll" "$trt\bin\"
-          $tag = "v10.16"
+          # Pinned commit of v10.16 (10.16.0 headers; API-compatible with the
+          # 10.16.1 runtime. No v10.16.1 tag exists upstream.)
+          $tag = "52399f555c2f80cb690a4a558b604e1a5f227e7c"
           foreach ($h in @("NvInfer.h", "NvInferVersion.h", "NvInferImpl.h", "NvInferRuntimeCommon.h", `
                            "NvInferPluginBase.h", "NvInferRuntimePlugin.h", "NvInferRuntime.h")) {
             Invoke-WebRequest "https://raw.githubusercontent.com/NVIDIA/TensorRT/$tag/include/$h" `
@@ -109,6 +111,19 @@ jobs:
         run: |
           $env:PATH = "build;$env:TENSORRT_ROOT\lib;$env:CUDA_PATH\bin;$env:PATH"
           .\build\regcheck.exe .\build\trt_dit_plugins.dll
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trt-dit-plugins-windows-x86_64
+          retention-days: 30
+          path: |
+            build/ck_kernels.dll
+            build/trt_dit_plugins.dll
+            build/ck_kernels.lib
+            build/trt_dit_plugins.lib
+            LICENSE
+            NOTICE
 
       - name: Python import check (no GPU/torch)
         run: |
