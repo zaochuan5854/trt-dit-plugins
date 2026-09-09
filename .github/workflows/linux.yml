@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+name: linux
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build:
+    # No GPU on hosted runners: compile + CPU-side checks only
+    # (registration via dlopen needs no GPU). GPU E2E stays on self-hosted.
+    runs-on: ubuntu-24.04
+    container:
+      image: nvidia/cuda:13.2.1-devel-ubuntu24.04
+    env:
+      TRT_VER: 10.16.1.11-1+cuda13.2
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            cmake ninja-build ccache g++ python3 python3-pip \
+            libnvinfer10=${TRT_VER} libnvinfer-plugin10=${TRT_VER} \
+            libnvinfer-headers-dev=${TRT_VER} \
+            libnvinfer-headers-plugin-dev=${TRT_VER} \
+            libnvinfer-safe-headers-dev=${TRT_VER} \
+          && rm -rf /var/lib/apt/lists/*
+
+      - name: Configure and build (all cores)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel $(nproc)
+
+      - name: Registration check (no GPU)
+        run: ./build/regcheck ./build/libtrt_dit_plugins.so
+
+      - name: Python import check (no GPU/torch)
+        run: |
+          PYTHONPATH=python python3 -c \
+            "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
+          python3 -m compileall -q python/trt_dit_plugins

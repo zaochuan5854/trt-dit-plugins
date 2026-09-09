@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# Interface derived from ComfyKitchen (Copyright (c) 2025 Comfy Org, Apache-2.0).
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trt-dit-plugins"
+version = "0.1.0"
+description = "TensorRT IPluginV3 wrappers with comfy-kitchen-compatible op names (sm89)"
+readme = "plan.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[project.optional-dependencies]
+torch = ["torch", "tensorrt"]
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+
+[tool.setuptools.package-data]
+trt_dit_plugins = ["lib/*.so", "lib/*.dll", "py.typed"]

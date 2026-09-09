@@ -1,0 +1,46 @@
+TensorRT-DiT-Plugins
+
+This product includes software derived from ComfyKitchen:
+
+--------------------------------------------------------------------------------
+ComfyKitchen
+--------------------------------------------------------------------------------
+Copyright (c) 2025 Comfy Org. All rights reserved.
+License: Apache-2.0
+Website: https://github.com/Comfy-Org/comfy-kitchen
+
+Portions of the TensorRT plugin interfaces in src/ follow the ComfyKitchen
+torch op names, shapes, and call conventions (comfy_kitchen::int8_attention,
+adaln, rms_adaln, apply_rope, stochastic_rounding_fp8). The TRT plugin
+namespace "comfy_kitchen" is used for interface compatibility only; this
+project is independent and is not affiliated with or endorsed by Comfy Org.
+
+Unmodified copies of the following ComfyKitchen CUDA sources are vendored
+under src/kernel/ (Apache-2.0; each file carries a one-line vendoring notice
+on top, otherwise byte-identical, original SPDX headers retained):
+
+- backends/cuda/sage_attention/ (quant_qk_int8.cu, quant_v_int8.cu,
+  sage_attn_launcher.cu and supporting .cuh)
+  Derived in part from SageAttention, Copyright (c) 2024 by SageAttention
+  team (Apache-2.0, https://github.com/thu-ml/SageAttention,
+  commit d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5).
+- backends/cuda/ops/adaln.cu
+- backends/cuda/ops/rms_rope.cu, rope_device.cuh
+- backends/cuda/ops/per_tensor_quantize.cu
+- backends/cuda/{dtype_dispatch.cuh, float_utils.cuh, utils.cuh}
+
+================================================================================
+
+This software uses the following third-party libraries:
+
+--------------------------------------------------------------------------------
+NVIDIA CUDA Runtime (cudart) / TensorRT
+--------------------------------------------------------------------------------
+Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+License: NVIDIA CUDA Toolkit EULA / TensorRT EULA
+Website: https://developer.nvidia.com/cuda-toolkit
+
+================================================================================
+
+For full license texts, see LICENSE (Apache-2.0) and the respective project
+repositories or installation directories.

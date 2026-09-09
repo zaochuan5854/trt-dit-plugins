@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: Apache-2.0
+name: windows
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  # TensorRT Windows zip URL (login-walled on NVIDIA's site: put a reachable
+  # mirror in the TENSORRT_WINDOWS_URL repository variable, e.g. a release
+  # asset of TensorRT-10.16.1.11 Windows CUDA 13.2).
+  TRT_ZIP: ${{ vars.TENSORRT_WINDOWS_URL }}
+
+jobs:
+  build:
+    # No GPU on hosted runners: compile + CPU-side checks only.
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        id: cuda
+        with:
+          cuda: "13.2.1"
+          method: network
+
+      - name: Fetch TensorRT SDK
+        run: |
+          if (-not $env:TRT_ZIP) { throw "Set TENSORRT_WINDOWS_URL repository variable (see workflow file)" }
+          Invoke-WebRequest $env:TRT_ZIP -OutFile $env:RUNNER_TEMP/trt.zip
+          Expand-Archive $env:RUNNER_TEMP/trt.zip C:\trt
+          $inf = Get-ChildItem -Recurse -Path C:\trt -Filter NvInfer.h | Select-Object -First 1
+          if (-not $inf) { throw "NvInfer.h not found in TRT zip" }
+          "TENSORRT_ROOT=$($inf.Directory.Parent.FullName)" >> $env:GITHUB_ENV
+
+      - name: Configure and build (all cores)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_ARCHITECTURES=89
+          cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Registration check (no GPU)
+        run: |
+          $env:PATH = "build;$env:TENSORRT_ROOT\lib;$env:CUDA_PATH\bin;$env:PATH"
+          .\build\regcheck.exe .\build\trt_dit_plugins.dll
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python import check (no GPU/torch)
+        run: |
+          $env:PYTHONPATH = "python"
+          python -c "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
+          python -m compileall -q python/trt_dit_plugins

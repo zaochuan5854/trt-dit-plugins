@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Validation image: base + TRT python bindings + torch (GPU frontend tests).
+# Build: podman build -f Dockerfile.val -t trt-plugins:val .
+FROM localhost/trt-plugins:sm89
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TRT_PY_VER=10.16.1.11-1+cuda13.2
+
+RUN --mount=type=cache,target=/var/cache/apt/archives \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python3-libnvinfer=${TRT_PY_VER} \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --break-system-packages --no-cache-dir torch
+
+RUN python3 -c "import torch, tensorrt; print(torch.__version__, tensorrt.__version__)"

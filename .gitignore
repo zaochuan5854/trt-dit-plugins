@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# build outputs
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.ninja
+.ninja_deps
+.ninja_log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+.pytest_cache/
+
+# bundled shared libs are built, not committed (CI builds them via pack_libs.sh)
+python/trt_dit_plugins/lib/
+
+# local logs / scratch
+*.log
+*.pid
+.ccache/
