@@ -5,6 +5,17 @@ TensorRT `IPluginV3` wrappers around [ComfyKitchen](https://github.com/Comfy-Org
 CUDA kernels, with comfy-kitchen-compatible op names under the `comfy_kitchen`
 plugin namespace. Target: NVIDIA Ada Lovelace (`sm89`), TensorRT 10.16, CUDA 13.2.
 
+GPU architecture support (`CMAKE_CUDA_ARCHITECTURES`,
+default `80-real 86-real 89-real 100-virtual 120-virtual`):
+
+| Arch | GPUs | Status |
+|---|---|---|
+| sm89 | RTX 40 series (e.g. 4070 Ti) | Verified (all E2E green) |
+| sm80/sm86 | A100 / RTX 30 series | Builds, **unverified on hardware** |
+| sm100/sm120 | Blackwell (B100/200, RTX 50) | PTX (driver JIT), **unverified on hardware** |
+
+Unverified targets compile but have never run here — reports welcome.
+
 Version pins (strict — other combinations are untested): TensorRT
 `10.16.1.11-1+cuda13.2`, CUDA toolkit 13.2.x, `CMAKE_CUDA_ARCHITECTURES=89`
 (sm89 only; other architectures are not built).

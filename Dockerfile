@@ -3,8 +3,6 @@
 FROM docker.io/nvidia/cuda:13.2.1-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    CMAKE_CUDA_ARCHITECTURES=89 \
-    CUDAARCHS=89 \
     CC=gcc CXX=g++ \
     CCACHE_DIR=/tmp/ccache \
     TRT_VER=10.16.1.11-1+cuda13.2

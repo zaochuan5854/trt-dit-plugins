@@ -79,8 +79,7 @@ jobs:
 
       - name: Configure and build (all cores)
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_CUDA_ARCHITECTURES=89 2>&1 | Tee-Object build-cmake.log
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release 2>&1 | Tee-Object build-cmake.log
           if ($LASTEXITCODE -ne 0) { exit 1 }
           cmake --build build --parallel $env:NUMBER_OF_PROCESSORS 2>&1 | Tee-Object build-build.log
           if ($LASTEXITCODE -ne 0) { exit 1 }

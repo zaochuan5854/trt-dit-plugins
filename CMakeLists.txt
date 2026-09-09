@@ -5,7 +5,11 @@ project(trt_dit_plugins LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_ARCHITECTURES 89)
+# sm80/86 (Ampere) + sm89 (Ada, verified) as SASS; sm100/120 (Blackwell) as
+# PTX (driver JIT). Override with -DCMAKE_CUDA_ARCHITECTURES=89 for Ada-only.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real 89-real 100-virtual 120-virtual)
+endif()
 
 find_package(CUDAToolkit REQUIRED)
 # TensorRT location: $TENSORRT_ROOT/{include,lib} if set (Windows CI),
