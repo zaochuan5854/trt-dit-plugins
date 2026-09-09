@@ -19,6 +19,9 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: nvidia/cuda:13.2.1-devel-ubuntu24.04
+    defaults:
+      run:
+        shell: bash
     env:
       TRT_VER: 10.16.1.11-1+cuda13.2
       DEBIAN_FRONTEND: noninteractive
@@ -38,12 +41,10 @@ jobs:
 
       - name: Configure
         run: |
-          set -o pipefail
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release 2>&1 | tee /tmp/cmake.log
 
       - name: Build (2 jobs, hosted RAM is 16 GB)
         run: |
-          set -o pipefail
           cmake --build build --parallel 2 2>&1 | tee /tmp/build.log
 
       - name: Report logs to summary on failure
