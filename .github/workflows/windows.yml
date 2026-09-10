@@ -38,6 +38,10 @@ jobs:
 
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          # Pin VS2022 toolset: runners now default to VS18, whose cl crashes
+          # nvcc 12.6's cudafe. 14.44 == VS2022 17.14 (present on the image).
+          toolset: "14.44"
 
       - name: Set up Python
         uses: actions/setup-python@v5

@@ -76,6 +76,8 @@ jobs:
           method: network
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          toolset: "14.44"
       - name: Fetch TensorRT SDK
         uses: ./.github/actions/setup-trt-windows
       - name: Configure and build (all cores)
