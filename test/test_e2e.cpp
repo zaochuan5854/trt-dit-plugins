@@ -45,7 +45,7 @@ int run(int S, int H, int dt) {
     const int esz = dt == 0 ? 4 : 2, osz = 2; // outputs always 16-bit (FP16/BF16)
     auto* reg = getPluginRegistry();
     // .so is expected preloaded (LD_PRELOAD equivalent; caller dlopens)
-    auto* cre = reg->getCreator("int8_attention", "1", "comfy_kitchen");
+    auto* cre = reg->getCreator("int8_attention", "1", "dit-plugins");
     if (!cre) {
         std::fprintf(stderr, "creator not found\n");
         return 1;

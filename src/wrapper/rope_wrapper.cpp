@@ -24,7 +24,7 @@ void launch_apply_rope_kernel(const void* q, const void* k, const void* freqs,
 namespace {
 constexpr char const* kName = "apply_rope";
 constexpr char const* kVersion = "1";
-constexpr char const* kNamespace = "comfy_kitchen";
+constexpr char const* kNamespace = "dit-plugins";
 
 int dtypeCode(nvinfer1::DataType t) {
     if (t == nvinfer1::DataType::kFLOAT)

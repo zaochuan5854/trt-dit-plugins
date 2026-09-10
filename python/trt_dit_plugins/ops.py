@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Interface derived from ComfyKitchen (Copyright (c) 2025 Comfy Org, Apache-2.0).
-"""Torch-friendly ops. All run on CUDA via cached TRT engines.
+"""Torch-friendly DiT ops. All run on CUDA via cached TRT engines.
 
-Conventions mirror comfy-kitchen torch ops (names, dtypes, eps defaults).
-Engines are built once per (op, shapes, fields) and reused.
+Op names/shapes follow the upstream kernel projects (see NOTICE); eps defaults
+match their torch ops. Engines are built once per (op, shapes, fields) and reused.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def _require_cuda(*tensors: Any) -> Any:
 def int8_attention(q, k, v):
     """INT8 Q/K/V attention. q,k,v: BF16/FP16/FP32 CUDA [B,H,S,D], D in (64,128,256).
 
-    Output dtype follows comfy-kitchen: BF16 for FP32 input, else input dtype.
+    Output dtype: BF16 for FP32 input, else input dtype.
     """
     import torch
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Interface derived from ComfyKitchen (Copyright (c) 2025 Comfy Org, Apache-2.0).
-"""TensorRT DiT plugins with comfy-kitchen-compatible names.
+"""TensorRT DiT plugins: existing DiT kernels pluginized for TRT engines.
 
 GPUs only for execution; import itself needs neither GPU nor torch.
 """

@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 PLUGIN_VERSION = "1"
-PLUGIN_NAMESPACE = "comfy_kitchen"
+PLUGIN_NAMESPACE = "dit-plugins"
 
 # name -> (lib file, TRT plugin name). lib resolved at load time.
 PLUGINS = {

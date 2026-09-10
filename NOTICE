@@ -9,11 +9,11 @@ Copyright (c) 2025 Comfy Org. All rights reserved.
 License: Apache-2.0
 Website: https://github.com/Comfy-Org/comfy-kitchen
 
-Portions of the TensorRT plugin interfaces in src/ follow the ComfyKitchen
-torch op names, shapes, and call conventions (comfy_kitchen::int8_attention,
-adaln, rms_adaln, apply_rope, stochastic_rounding_fp8). The TRT plugin
-namespace "comfy_kitchen" is used for interface compatibility only; this
-project is independent and is not affiliated with or endorsed by Comfy Org.
+Portions of the torch op names, shapes, and call conventions follow the
+ComfyKitchen torch ops (int8_attention, adaln, rms_adaln, apply_rope,
+stochastic_rounding_fp8). This project is independent and is not affiliated
+with or endorsed by Comfy Org; compatibility with ComfyKitchen is not a goal —
+existing DiT kernels are pluginized for TRT engines here.
 
 Unmodified copies of the following ComfyKitchen CUDA sources are vendored
 under src/kernel/ (Apache-2.0; each file carries a one-line vendoring notice
@@ -45,9 +45,8 @@ csrc/qattn/{qk_int_sv_f8_cuda_sm89.cuh,attn_utils.cuh,decl.cuh} are unmodified
 copies; upstream's 192 autogen instantiations are replaced by 4 explicit ones
 (src/kernel/sparge/sparge_sm89_inst.cu); the Triton/Python pre-steps are
 rewritten torch-free (src/kernel/sparge/sparge_pre.cu). SpargeAttn descends
-from SageAttention (see above). The plugin is registered under the existing
-"comfy_kitchen" TRT namespace for release unity; the kernel is SpargeAttn's,
-not ComfyKitchen's.
+from SageAttention (see above). The plugin is registered under this project's
+own "dit-plugins" TRT namespace.
 
 ================================================================================
 

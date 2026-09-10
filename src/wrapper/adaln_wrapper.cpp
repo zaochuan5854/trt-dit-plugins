@@ -19,7 +19,7 @@ void launch_adaln_kernel(const void* x, const void* scale, const void* shift,
 }
 
 namespace {
-constexpr char const* kNamespace = "comfy_kitchen";
+constexpr char const* kNamespace = "dit-plugins";
 constexpr int dtypeCode(nvinfer1::DataType t) {
     if (t == nvinfer1::DataType::kFLOAT)
         return 0;

@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
     if (so)
         dlopen(so, RTLD_NOW | RTLD_GLOBAL);
     const int H = 8, D = 128;
-    auto* cre = getPluginRegistry()->getCreator("int8_attention", "1", "comfy_kitchen");
+    auto* cre = getPluginRegistry()->getCreator("int8_attention", "1", "dit-plugins");
     if (!cre)
         return 1;
     nvinfer1::PluginFieldCollection fc{0, nullptr};

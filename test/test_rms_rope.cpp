@@ -33,7 +33,7 @@ int run(int S, int D, int rotArg, float eps, int dt) {
     const int rot = rotArg > 0 ? rotArg : D;
     const int N = B * H * S * D, NF = B * H * S * (rot / 2) * 4;
     auto* cre = getPluginRegistry()->getCreator(
-        "rms_rope_split_half", "1", "comfy_kitchen");
+        "rms_rope_split_half", "1", "dit-plugins");
     if (!cre) {
         std::fprintf(stderr, "creator not found\n");
         return 1;

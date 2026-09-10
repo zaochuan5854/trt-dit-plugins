@@ -32,7 +32,7 @@ int run(int S, int D, int dt) {
     const int B = 1, H = 4, P = D / 2;
     const int N = B * H * S * D, NF = B * H * S * P * 4;
     // dt: 1=FP16, 2=BF16 (shared by q/k inputs and outputs). freqs stay FP32.
-    auto* cre = getPluginRegistry()->getCreator("apply_rope", "1", "comfy_kitchen");
+    auto* cre = getPluginRegistry()->getCreator("apply_rope", "1", "dit-plugins");
     if (!cre) {
         std::fprintf(stderr, "creator not found\n");
         return 1;

@@ -53,7 +53,7 @@ int run(bool rms, int N, int D, float eps, int dt) {
                        : __bfloat162float(static_cast<const __nv_bfloat16*>(p)[i]);
     };
     auto* cre = getPluginRegistry()->getCreator(
-        rms ? "rms_adaln" : "adaln", "1", "comfy_kitchen");
+        rms ? "rms_adaln" : "adaln", "1", "dit-plugins");
     if (!cre) {
         std::fprintf(stderr, "creator not found\n");
         return 1;

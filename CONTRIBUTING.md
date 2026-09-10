@@ -37,6 +37,6 @@ PYTHONPATH=python TRT_DIT_LIBDIR=build python3 python/tests/test_smoke.py
   Never add a cross-origin `-I`; a bare cross-origin `#include` must fail,
   not silently mix.
 - New plugins follow `src/wrapper/*_wrapper.cpp`: BF16-first dtype rules,
-  `comfy_kitchen` namespace, `getTimingCacheID`, and an E2E test in `test/`.
+  `dit-plugins` namespace, `getTimingCacheID`, and an E2E test in `test/`.
 - Every numeric change needs a measured before/after (`cos` + ms).
 - Keep `README.md` in sync with behavior changes.

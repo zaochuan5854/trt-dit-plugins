@@ -109,7 +109,7 @@ uint8_t expectE4M3(float t, int rng) {
 int runOnce(int rngFill, int N, bool useAlias, int dt) {
     int32_t aliasField = useAlias ? 1 : 0;
     auto* cre = getPluginRegistry()->getCreator(
-        "stochastic_round_fp8", "1", "comfy_kitchen");
+        "stochastic_round_fp8", "1", "dit-plugins");
     if (!cre) {
         std::fprintf(stderr, "creator not found\n");
         return 1;

@@ -28,7 +28,7 @@ void launch_block_sparse_sage2_sm89(int8_t* q_i8, int8_t* k_i8, void* v_fp8, voi
 namespace {
 constexpr char const* kName = "block_sparse_sage2_attn";
 constexpr char const* kVersion = "1";
-constexpr char const* kNamespace = "comfy_kitchen";
+constexpr char const* kNamespace = "dit-plugins";
 
 int64_t align16(int64_t x) { return (x + 15) / 16 * 16; }
 

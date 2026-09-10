@@ -22,7 +22,7 @@ void launch_stochastic_round_fp8_kernel(void* rng_and_output, const void* input,
 namespace {
 constexpr char const* kName = "stochastic_round_fp8";
 constexpr char const* kVersion = "1";
-constexpr char const* kNamespace = "comfy_kitchen";
+constexpr char const* kNamespace = "dit-plugins";
 
 int64_t numelOf(nvinfer1::Dims const& d) {
     int64_t n = 1;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Interface derived from ComfyKitchen (Copyright (c) 2025 Comfy Org, Apache-2.0).
 // TRT IPluginV3 for comfy-kitchen's int8_attention (comfy_kitchen::int8_attention).
-// Registration: name="int8_attention", namespace="comfy_kitchen" — ComfyUI-side names.
+// Registration: name="int8_attention", namespace="dit-plugins".
 // Base precision BF16. Inputs Q,K,V: [B,H,S,D] contiguous LINEAR BF16. Output: same shape.
 // Kernels: third_party/sage_attention (quant_qk/quant_v/sage_attn_launcher).
 #include <NvInfer.h>
@@ -34,7 +34,7 @@ void launch_sage_attn_kernel(const void* q, const void* k, const void* v,
 namespace {
 constexpr char const* kName = "int8_attention";
 constexpr char const* kVersion = "1";
-constexpr char const* kNamespace = "comfy_kitchen";
+constexpr char const* kNamespace = "dit-plugins";
 int dtypeCode(nvinfer1::DataType t) {
     if (t == nvinfer1::DataType::kFLOAT)
         return 0;
@@ -251,7 +251,7 @@ private:
 };
 
 // REGISTER_TENSORRT_PLUGIN registers under namespace "", so register manually
-// under comfy_kitchen (matches engine serialize/deserialize name resolution)
+// under dit-plugins (matches engine serialize/deserialize name resolution)
 namespace {
 Int8AttentionCreator* gCreator() {
     static Int8AttentionCreator* c = new Int8AttentionCreator();
