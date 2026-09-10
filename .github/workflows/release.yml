@@ -29,7 +29,7 @@ jobs:
       - name: Install deps
         run: |
           apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --allow-change-held-packages --no-install-recommends \
             ca-certificates cmake ninja-build g++ python3 python3-pip \
             libnccl2 libnccl-dev libcudnn9-cuda-12 libcudnn9-dev-cuda-12
           rm -rf /var/lib/apt/lists/*
