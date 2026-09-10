@@ -14,6 +14,10 @@ on:
 
 env:
   ARCHS: "80-real;86-real;89-real;90-real;90-virtual"
+  # CUDA 12.6's host_config.h allowlist lags the rolling VS2022 minors on
+  # hosted runners. Env var (not CMAKE_CUDA_FLAGS) so CMake's compiler-id
+  # probe also picks it up. MSVC stays ABI-compatible within 19.x.
+  NVCC_APPEND_FLAGS: "-allow-unsupported-compiler"
 
 jobs:
   build:
