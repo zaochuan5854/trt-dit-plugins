@@ -2,7 +2,12 @@
 // Interface derived from ComfyKitchen (Copyright (c) 2025 Comfy Org, Apache-2.0).
 // Registration check: loadLibrary the .so and fetch comfy_kitchen::int8_attention.
 #include <NvInferRuntime.h>
+#ifdef _WIN32
+#include <windows.h>
+static void* dlopen(const char* p, int) { return (void*)LoadLibraryA(p); }
+#else
 #include <dlfcn.h>
+#endif
 #include <cassert>
 #include <cstdio>
 
@@ -10,7 +15,11 @@ int main(int argc, char** argv) {
     assert(argc > 1);
     // loadLibrary returns null when already registered, so confirm
     // directly via dlopen (runs static registration) + getCreator
+#ifdef _WIN32
+    assert(dlopen(argv[1], 0));
+#else
     assert(dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL));
+#endif
     auto* reg = getPluginRegistry();
     auto* c = reg->getCreator("int8_attention", "1", "comfy_kitchen");
     assert(c);

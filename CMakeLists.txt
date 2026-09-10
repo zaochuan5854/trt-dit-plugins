@@ -5,10 +5,19 @@ project(trt_dit_plugins LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
-# sm80/86 (Ampere) + sm89 (Ada, verified) as SASS; sm100/120 (Blackwell) as
+# sm80/86 (Ampere) + sm89 (Ada, verified) + sm90 (Hopper) as SASS; sm90
 # PTX (driver JIT). Override with -DCMAKE_CUDA_ARCHITECTURES=89 for Ada-only.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real 89-real 100-virtual 120-virtual)
+# nvidia/cuda images export CUDAARCHS (e.g. 89), which CMake copies into
+# CMAKE_CUDA_ARCHITECTURES and would silently single-arch the build.
+# Drop env-initialized values so the default below applies; an explicit
+# -D on the command line still wins.
+if(DEFINED CMAKE_CUDA_ARCHITECTURES AND DEFINED ENV{CUDAARCHS}
+   AND CMAKE_CUDA_ARCHITECTURES STREQUAL "$ENV{CUDAARCHS}")
+    unset(CMAKE_CUDA_ARCHITECTURES)
+    unset(CMAKE_CUDA_ARCHITECTURES CACHE)
+endif()
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real 89-real 90-real 90-virtual)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
@@ -56,6 +65,11 @@ target_include_directories(ck_kernels PRIVATE
     src/kernel/sage_attention src/kernel/adaln src/kernel/rope src/kernel/fp8)
 target_link_libraries(ck_kernels PRIVATE CUDA::cudart)
 set_target_properties(ck_kernels PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
+if(WIN32)
+    # extern "C" launchers lack dllexport; auto-export so the import
+    # lib is generated for trt_dit_plugins to link against.
+    set_target_properties(ck_kernels PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
 
 add_library(trt_dit_plugins SHARED
     src/wrapper/int8_attention_wrapper.cpp

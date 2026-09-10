@@ -1,20 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # Interface derived from ComfyKitchen (Copyright (c) 2025 Comfy Org, Apache-2.0).
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=70"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "trt-dit-plugins"
 version = "0.1.0"
-description = "TensorRT IPluginV3 wrappers with comfy-kitchen-compatible op names (sm89)"
-readme = "plan.md"
+description = "TensorRT IPluginV3 wrappers with comfy-kitchen-compatible op names (sm80/86/89 + 100/120 PTX)"
+readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-dependencies = []
+# tensorrt-cu12 lives on https://pypi.nvidia.com; nvidia-cuda-runtime-cu12 is on PyPI.
+#   pip install --extra-index-url https://pypi.nvidia.com trt-dit-plugins
+dependencies = [
+    "torch",
+    "tensorrt-cu12-libs==10.16.*",
+    "nvidia-cuda-runtime-cu12>=12.6",
+]
 
 [project.optional-dependencies]
-torch = ["torch", "tensorrt"]
+dev = ["pytest"]
 
 [tool.setuptools]
 package-dir = { "" = "python" }

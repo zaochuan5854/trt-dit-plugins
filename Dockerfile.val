@@ -4,7 +4,7 @@
 FROM localhost/trt-plugins:sm89
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    TRT_PY_VER=10.16.1.11-1+cuda13.2
+    TRT_PY_VER=10.16.1.11-1+cuda12.9
 
 RUN --mount=type=cache,target=/var/cache/apt/archives \
     apt-get update && apt-get install -y --no-install-recommends \

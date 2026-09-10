@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Interface derived from ComfyKitchen (Copyright (c) 2025 Comfy Org, Apache-2.0).
-"""Locate and load the bundled plugin shared libraries."""
+"""Locate and load the bundled plugin shared libraries.
+
+pip-only install: CUDA runtime and TensorRT come from the
+``nvidia-cuda-runtime-cu12`` and ``tensorrt-cu12`` wheels. They are preloaded
+here by absolute path so no LD_LIBRARY_PATH / PATH setup is needed.
+"""
 from __future__ import annotations
 
 import ctypes
+import importlib.util
 import os
 import sys
 from pathlib import Path
@@ -20,6 +26,11 @@ PLUGINS = {
     "rms_rope_split_half": "rms_rope_split_half",
     "stochastic_round_fp8": "stochastic_round_fp8",
 }
+
+# pip packages searched (first hit wins) for each dependency library.
+_PKG_CANDIDATES = ("nvidia.cuda_runtime", "nvidia.cu12", "tensorrt_libs")
+_LIB_NAMES = ("libcudart.so.12", "libnvinfer.so.10")
+_LIB_NAMES_WIN = ("cudart64_12.dll", "nvinfer_10.dll")
 
 _loaded: dict[str, ctypes.CDLL] = {}
 
@@ -62,10 +73,38 @@ def _load_one(directory: Path, stem: str) -> ctypes.CDLL:
     )
 
 
+def _preload_deps() -> None:
+    """CDLL each pip-provided dependency so ours resolve without PATH setup."""
+    names = _LIB_NAMES_WIN if sys.platform == "win32" else _LIB_NAMES
+    for pkg in _PKG_CANDIDATES:
+        try:
+            spec = importlib.util.find_spec(pkg)
+        except (ImportError, AttributeError, ValueError):
+            continue
+        if spec is None or not spec.submodule_search_locations:
+            continue
+        base = Path(next(iter(spec.submodule_search_locations)))
+        if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+            for sub in (base, base / "bin", base / "lib"):
+                if sub.is_dir():
+                    try:
+                        os.add_dll_directory(str(sub))
+                    except Exception:
+                        pass
+        for name in names:
+            try:
+                hit = next(base.rglob(name))
+            except StopIteration:
+                continue
+            mode = getattr(ctypes, "RTLD_GLOBAL", 0)
+            ctypes.CDLL(str(hit), mode=mode)
+
+
 def ensure_loaded() -> dict[str, ctypes.CDLL]:
-    """dlopen kernels first, then plugins. Idempotent. No GPU needed."""
+    """Preload pip deps, then dlopen kernels, then plugins. Idempotent."""
     global _loaded
     if not _loaded:
+        _preload_deps()
         d = libdir()
         _loaded["ck_kernels"] = _load_one(d, "ck_kernels")
         _loaded["trt_dit_plugins"] = _load_one(d, "trt_dit_plugins")

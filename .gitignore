@@ -20,6 +20,8 @@ dist/
 
 # bundled shared libs are built, not committed (CI builds them via pack_libs.sh)
 python/trt_dit_plugins/lib/
+python/trt_dit_plugins/LICENSE
+python/trt_dit_plugins/NOTICE
 
 # local logs / scratch
 *.log

@@ -3,32 +3,46 @@
 
 TensorRT `IPluginV3` wrappers around [ComfyKitchen](https://github.com/Comfy-Org/comfy-kitchen)
 CUDA kernels, with comfy-kitchen-compatible op names under the `comfy_kitchen`
-plugin namespace. Target: NVIDIA Ada Lovelace (`sm89`), TensorRT 10.16, CUDA 13.2.
+plugin namespace. Target: NVIDIA Ada Lovelace (`sm89`), TensorRT 10.16, CUDA 12.6.
 
 GPU architecture support (`CMAKE_CUDA_ARCHITECTURES`,
-default `80-real 86-real 89-real 100-virtual 120-virtual`):
+default `80-real 86-real 89-real 90-real 90-virtual`):
 
 | Arch | GPUs | Status |
 |---|---|---|
 | sm89 | RTX 40 series (e.g. 4070 Ti) | Verified (all E2E green) |
 | sm80/sm86 | A100 / RTX 30 series | Builds, **unverified on hardware** |
-| sm100/sm120 | Blackwell (B100/200, RTX 50) | PTX (driver JIT), **unverified on hardware** |
+| sm90 | H100 | SASS + PTX, **unverified on hardware** |
 
 Unverified targets compile but have never run here — reports welcome.
+Blackwell (sm100+) needs a CUDA 12.8+ rebuild; this cu126 build does not cover it.
 
 Version pins (strict — other combinations are untested): TensorRT
-`10.16.1.11-1+cuda13.2`, CUDA toolkit 13.2.x, `CMAKE_CUDA_ARCHITECTURES=89`
+`10.16.1.11-1+cuda12.9`, CUDA toolkit 12.6.x, `CMAKE_CUDA_ARCHITECTURES=89`
 (sm89 only; other architectures are not built).
 
-The kernels are vendored unmodified (plus a one-line provenance notice) under
-`src/kernel/`; the handwritten TRT glue lives in `src/wrapper/`. See `NOTICE`
-for rights and attributions.
+The kernels are vendored under `src/kernel/` (plus a minimal CUDA-12.6
+compat patch, documented per-file); the handwritten TRT glue lives in
+`src/wrapper/`. See `NOTICE` for rights and attributions.
 
 ## Requirements
 
-- NVIDIA GPU with `sm89` (e.g. RTX 4070 Ti, verified 2026-09) + driver ≥ 580
-- Linux with `podman` (rootless, `nvidia-container-toolkit` CDI) and ~30 GB free
-- Python path needs `torch` + `tensorrt==10.16.*` only for `python/` frontend tests
+Users (pip install): NVIDIA GPU `sm80`–`sm90`, driver R560+, Python ≥ 3.10.
+No system CUDA or TensorRT — pip brings `torch`, `tensorrt-cu12-libs`,
+`nvidia-cuda-runtime-cu12`.
+
+Developers (building from source): Linux with `podman` (rootless,
+`nvidia-container-toolkit` CDI), ~30 GB free, CUDA 12.6 toolkit + TRT 10.16.
+
+## Install (pip only, no system CUDA/TRT needed)
+
+```bash
+pip install --extra-index-url https://pypi.nvidia.com \
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.1.0-cu12/trt_dit_plugins-0.1.0-py3-none-linux_x86_64.whl   # Linux
+pip install --extra-index-url https://pypi.nvidia.com \
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.1.0-cu12/trt_dit_plugins-0.1.0-py3-none-win_amd64.whl      # Windows
+python -c "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
+```
 
 ## Plugins
 
@@ -46,7 +60,7 @@ one dtype. `UINT8` plugin I/O is unsupported by TRT 10.16.
 Not yet: `FusedGeGLU/SwiGLU` (no upstream kernel exists in comfy-kitchen).
 
 Supported dtypes: inputs FP32/FP16/BF16 (attention outputs FP16/BF16;
-RoPE I/O FP16/BF16; see `plan.md`). Dynamic sequence lengths via one engine
+RoPE I/O FP16/BF16). Dynamic sequence lengths via one engine
 (profiled min/opt/max). No `torch` dependency in the core libraries.
 
 ## Quickstart (Linux, sm89)
@@ -84,9 +98,27 @@ How it works: each call builds one single-plugin engine (strongly typed) on
 first use, caches it by (op, shapes, fields), then enqueues on torch's current
 stream. No extra synchronisation, no copies beyond what the kernels need.
 
-Installable wheel layout lives in `python/` (`pyproject.toml`, `pack_libs.sh`
-copies the two `.so` files into the package). Windows wheels (MSVC + CUDA +
-TRT) are future work; the Python loader already handles DLL directories.
+## Use in your own engine build
+
+```python
+import trt_dit_plugins as tdp
+tdp.ensure_loaded()  # registers comfy_kitchen plugins into the TRT registry
+import tensorrt as trt  # needs the full package: pip install tensorrt-cu12==10.16.*
+reg = trt.get_plugin_registry()
+creator = reg.get_creator("int8_attention", "1", "comfy_kitchen")
+plug = creator.create_plugin("attn0", fc, trt.TensorRTPhase.BUILD)
+layer = network.add_plugin_v3([q, k, v], [], plug)
+```
+
+Field names/types per op: see `python/trt_dit_plugins/_engine.py` (working
+reference). Serialized engines still need the `.so` + TRT runtime at load.
+
+## Build from source (developers)
+
+Installable wheel layout lives in `python/` (`pyproject.toml`; CI copies the
+two libs into the package and tags it `py3-none-<plat>`). The Python loader
+preloads pip-provided cudart/nvinfer by absolute path, so no
+`LD_LIBRARY_PATH`/`PATH` setup is needed on either OS.
 
 ## Layout
 
@@ -117,13 +149,13 @@ Dockerfile.val    validation image (+ torch + TRT python bindings)
 - `UInt8 datatype formats are not supported` at build: use INT32 for byte buffers.
 - `Aliased I/O ... but PreviewFeature not enabled`: set `alias_rng=0` (default)
   or enable `kALIASED_PLUGIN_IO_10_03` on the builder config.
-- `creator not found` in Python: the `.so` wasn't loaded — check
-  `TRT_DIT_LIBDIR` (defaults to `build/`) and load `libck_kernels` first.
+- `creator not found` in Python: the `.so` failed to load — usually a missing
+  pip dependency (`tensorrt-cu12-libs`, `nvidia-cuda-runtime-cu12`); reinstall
+  with `--extra-index-url https://pypi.nvidia.com`.
 
 ## License
 
 Apache-2.0 (`LICENSE`). ComfyKitchen-derived naming, interfaces and vendored
 sources are attributed in `NOTICE` and per-file SPDX headers.
 
-Issues and PRs are welcome; see `CONTRIBUTING.md`, and `plan.md` §8 for the
-remaining roadmap (GeGLU blocker, ONNX replacement).
+Issues and PRs are welcome; see `CONTRIBUTING.md`.

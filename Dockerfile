@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# sm89 / Linux / TRT10.16 — cached cuda devel base, no pull needed
-FROM docker.io/nvidia/cuda:13.2.1-devel-ubuntu24.04
+# sm89 / Linux / TRT10.16 cu12 — cached cuda devel base, no pull needed
+FROM docker.io/nvidia/cuda:12.6.3-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CC=gcc CXX=g++ \
     CCACHE_DIR=/tmp/ccache \
-    TRT_VER=10.16.1.11-1+cuda13.2
+    TRT_VER=10.16.1.11-1+cuda12.9
 
 # Skip -dev (static libs + samples exceed 3GB). Shared libs + headers suffice.
 # Persist debs across rebuilds via cache mount. Never clean (would wipe the cache).

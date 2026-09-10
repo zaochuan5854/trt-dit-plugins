@@ -25,14 +25,15 @@ PYTHONPATH=python TRT_DIT_LIBDIR=build python3 python/tests/test_smoke.py
 
 - `linux.yml`: full compile + regcheck + Python import in CUDA container (no GPU
   on hosted runners; GPU E2E stays self-hosted).
-- `windows.yml`: MSVC + CUDA 13.2 + TRT zip (set the `TENSORRT_WINDOWS_URL`
-  repository variable — NVIDIA's site is login-walled) + regcheck + import.
+- `windows.yml`: MSVC + CUDA 12.6 (Jimver/cuda-toolkit) + TRT via the shared
+  `setup-trt-windows` action (pip DLLs + pinned headers + generated import lib).
 
 ## Rules
 
 - `src/kernel/` is vendored from ComfyKitchen: content changes go upstream,
-  only the one-line vendoring notice may be added here.
+  only the vendoring notice plus the documented CUDA-12.6 compat patch may
+  live here.
 - New plugins follow `src/wrapper/*_wrapper.cpp`: BF16-first dtype rules,
   `comfy_kitchen` namespace, `getTimingCacheID`, and an E2E test in `test/`.
 - Every numeric change needs a measured before/after (`cos` + ms).
-- Keep `plan.md` and `README.md` in sync with behavior changes.
+- Keep `README.md` in sync with behavior changes.

@@ -13,10 +13,7 @@ on:
         default: false
 
 env:
-  # TensorRT Windows zip URL (login-walled on NVIDIA's site: put a reachable
-  # mirror in the TENSORRT_WINDOWS_URL repository variable, e.g. a release
-  # asset of TensorRT-10.16.1.11 Windows CUDA 13.2).
-  TRT_ZIP: ${{ vars.TENSORRT_WINDOWS_URL }}
+  ARCHS: "80-real;86-real;89-real;90-real;90-virtual"
 
 jobs:
   build:
@@ -32,7 +29,7 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda
         with:
-          cuda: "13.2.0"
+          cuda: "12.6.3"
           method: network
 
       - name: Set up MSVC environment
@@ -44,44 +41,11 @@ jobs:
           python-version: "3.12"
 
       - name: Fetch TensorRT SDK
-        run: |
-          $trt = "$env:RUNNER_TEMP\trt"
-          New-Item -ItemType Directory -Force -Path "$trt\include", "$trt\lib", "$trt\bin" | Out-Null
-          if ($env:TRT_ZIP) {
-            # Full SDK zip mirror (preferred when provisioned).
-            Invoke-WebRequest $env:TRT_ZIP -OutFile $env:RUNNER_TEMP/trt.zip
-            Expand-Archive $env:RUNNER_TEMP/trt.zip C:\trt-full
-            $inf = Get-ChildItem -Recurse -Path C:\trt-full -Filter NvInfer.h | Select-Object -First 1
-            if (-not $inf) { throw "NvInfer.h not found in TRT zip" }
-            "TENSORRT_ROOT=$($inf.Directory.Parent.FullName)" >> $env:GITHUB_ENV
-            exit 0
-          }
-          # Automatic path, no login needed:
-          # DLLs from NVIDIA's pip index + headers from GitHub + generated import lib.
-          pip install --extra-index-url https://pypi.nvidia.com "tensorrt-cu13-libs==10.16.1.11"
-          $dllDir = Split-Path (Get-ChildItem -Recurse -Path (python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])") `
-            -Filter nvinfer_10.dll | Select-Object -First 1).FullName
-          if (-not $dllDir) { throw "nvinfer_10.dll not found after pip install" }
-          Copy-Item "$dllDir\*.dll" "$trt\bin\"
-          # Pinned commit of v10.16 (10.16.0 headers; API-compatible with the
-          # 10.16.1 runtime. No v10.16.1 tag exists upstream.)
-          $tag = "52399f555c2f80cb690a4a558b604e1a5f227e7c"
-          foreach ($h in @("NvInfer.h", "NvInferVersion.h", "NvInferImpl.h", "NvInferRuntimeCommon.h", `
-                           "NvInferPluginBase.h", "NvInferRuntimePlugin.h", "NvInferRuntime.h")) {
-            Invoke-WebRequest "https://raw.githubusercontent.com/NVIDIA/TensorRT/$tag/include/$h" `
-              -OutFile "$trt\include\$h"
-          }
-          if (-not (Test-Path "$trt\include\NvInferRuntime.h")) { throw "header download failed" }
-          dumpbin /exports "$trt\bin\nvinfer_10.dll" | Out-String | Set-Content "$trt\nvinfer.txt"
-          $exp = Get-Content "$trt\nvinfer.txt" | Select-String "^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+(\S+)" | ForEach-Object { $_.Matches.Groups[1].Value }
-          "LIBRARY nvinfer_10.dll", "EXPORTS" + ($exp | ForEach-Object { "    $_" }) | Set-Content "$trt\nvinfer.def"
-          lib /def:"$trt\nvinfer.def" /out:"$trt\lib\nvinfer.lib" /machine:x64
-          if (-not (Test-Path "$trt\lib\nvinfer.lib")) { throw "import lib generation failed" }
-          "TENSORRT_ROOT=$trt" >> $env:GITHUB_ENV
+        uses: ./.github/actions/setup-trt-windows
 
       - name: Configure and build (all cores)
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release 2>&1 | Tee-Object build-cmake.log
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="${{ env.ARCHS }}" 2>&1 | Tee-Object build-cmake.log
           if ($LASTEXITCODE -ne 0) { exit 1 }
           cmake --build build --parallel $env:NUMBER_OF_PROCESSORS 2>&1 | Tee-Object build-build.log
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -109,21 +73,8 @@ jobs:
 
       - name: Registration check (no GPU)
         run: |
-          $env:PATH = "build;$env:TENSORRT_ROOT\lib;$env:CUDA_PATH\bin;$env:PATH"
+          $env:PATH = "build;$env:TENSORRT_ROOT\bin;$env:CUDA_PATH\bin;$env:PATH"
           .\build\regcheck.exe .\build\trt_dit_plugins.dll
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: trt-dit-plugins-windows-x86_64
-          retention-days: 30
-          path: |
-            build/ck_kernels.dll
-            build/trt_dit_plugins.dll
-            build/ck_kernels.lib
-            build/trt_dit_plugins.lib
-            LICENSE
-            NOTICE
 
       - name: Python import check (no GPU/torch)
         run: |

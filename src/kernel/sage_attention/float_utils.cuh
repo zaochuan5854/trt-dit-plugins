@@ -1,4 +1,5 @@
-// Vendored from ComfyKitchen (Copyright (c) 2025 Comfy Org, Apache-2.0); only this notice added, see NOTICE.
+// Vendored from ComfyKitchen (Copyright (c) 2025 Comfy Org, Apache-2.0);
+// patched: vectorized loads hoisted out of the CUDA>=12.8 guard (12.6 build).
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -77,16 +78,9 @@ struct FP8LimitsTrait<__nv_fp8_e5m2> {
   static constexpr float max_inverse = 1.0 / max;
 };
 
-#if CUDA_VERSION >= 12080
-// FP4 type traits
-template <typename T>
-struct FP4LimitsTrait;
-
-template <>
-struct FP4LimitsTrait<__nv_fp4x2_storage_t> {
-  static constexpr float max = 6.0f;
-  static constexpr float max_inverse = 1.0 / max;
-};
+// Compat patch (not upstream): vectorized loads need no FP4 types, so they
+// live outside the CUDA>=12.8 guard to allow 12.6 builds. FP4 helpers stay
+// guarded below.
 
 // Vectorized half-precision loads
 #pragma nv_diag_suppress 1056
@@ -116,6 +110,17 @@ template<typename IType>
     return reinterpret_cast<const IType*>(&vals);
 }
 #pragma nv_diag_default 1056
+
+#if CUDA_VERSION >= 12080
+// FP4 type traits
+template <typename T>
+struct FP4LimitsTrait;
+
+template <>
+struct FP4LimitsTrait<__nv_fp4x2_storage_t> {
+  static constexpr float max = 6.0f;
+  static constexpr float max_inverse = 1.0 / max;
+};
 
 // Store 2 FP4 values (1 __nv_fp4x2)
 // hi_first=true: val0 in high nibble, val1 in low nibble (default, matches cuBLAS convention)

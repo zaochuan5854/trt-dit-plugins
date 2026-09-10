@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: Apache-2.0
+# Tag (v*) -> build per-platform wheels -> GitHub Release assets.
+# Install: pip install --extra-index-url https://pypi.nvidia.com \
+#   https://github.com/zaochuan5854/trt-dit-plugins/releases/download/<tag>/<whl>
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ARCHS: "80-real;86-real;89-real;90-real;90-virtual"
+
+jobs:
+  wheel-linux:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/nvidia/cuda:12.6.3-devel-ubuntu24.04
+      options: --security-opt seccomp=unconfined
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            ca-certificates cmake ninja-build g++ python3 python3-pip \
+            libnccl2 libnccl-dev libcudnn9-cuda-12 libcudnn9-dev-cuda-12
+          rm -rf /var/lib/apt/lists/*
+          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          dpkg -i /tmp/keyring.deb && rm /tmp/keyring.deb
+          apt-get update -qq
+          apt-cache policy libnvinfer10 libnvinfer-dev
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --allow-change-held-packages --no-install-recommends \
+            libnvinfer10=10.16.1.11-1+cuda12.9 libnvinfer-dev=10.16.1.11-1+cuda12.9 \
+            libnvinfer-plugin10=10.16.1.11-1+cuda12.9 libnvonnxparsers10=10.16.1.11-1+cuda12.9
+          rm -rf /var/lib/apt/lists/*
+          pip3 install --break-system-packages -U setuptools wheel
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="${{ env.ARCHS }}"
+          cmake --build build --parallel 2
+          ./build/regcheck ./build/libtrt_dit_plugins.so
+      - name: Wheel
+        run: |
+          mkdir -p python/trt_dit_plugins/lib
+          cp build/libck_kernels.so build/libtrt_dit_plugins.so python/trt_dit_plugins/lib/
+          cp LICENSE NOTICE python/trt_dit_plugins/
+          pip3 wheel . -w dist --no-deps --no-build-isolation
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux
+          retention-days: 7
+          path: dist/*.whl
+
+  wheel-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "12.6.3"
+          method: network
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Fetch TensorRT SDK
+        uses: ./.github/actions/setup-trt-windows
+      - name: Configure and build (all cores)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTENSORRT_ROOT="$env:TENSORRT_ROOT" -DCMAKE_CUDA_ARCHITECTURES="${{ env.ARCHS }}"
+          cmake --build build --config Release
+          $env:PATH = "build;$env:TENSORRT_ROOT\bin;$env:CUDA_PATH\bin;$env:PATH"
+          .\build\Release\regcheck.exe .\build\Release\trt_dit_plugins.dll
+      - name: Wheel
+        run: |
+          New-Item -ItemType Directory -Force -Path python\trt_dit_plugins\lib | Out-Null
+          Copy-Item build\Release\ck_kernels.dll, build\Release\trt_dit_plugins.dll python\trt_dit_plugins\lib\
+          Copy-Item LICENSE, NOTICE python\trt_dit_plugins\
+          python -m pip install -U setuptools wheel
+          python -m pip wheel . -w dist --no-deps --no-build-isolation
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows
+          retention-days: 7
+          path: dist/*.whl
+
+  release:
+    needs: [wheel-linux, wheel-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: wheels
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" wheels/*.whl \
+            --title "${{ github.ref_name }}" --generate-notes
