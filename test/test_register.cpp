@@ -39,5 +39,8 @@ int main(int argc, char** argv) {
     auto* rr = reg->getCreator("rms_rope_split_half", "1", "comfy_kitchen");
     assert(rr);
     std::fprintf(stderr, "OK creator: rms_rope_split_half 1 comfy_kitchen\n");
+    auto* bs = reg->getCreator("block_sparse_sage2_attn", "1", "comfy_kitchen");
+    assert(bs);
+    std::fprintf(stderr, "OK creator: block_sparse_sage2_attn 1 comfy_kitchen\n");
     return 0;
 }

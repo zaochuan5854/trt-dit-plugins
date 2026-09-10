@@ -111,3 +111,31 @@ def stochastic_rounding_fp8(x, rng, alias_rng=False):
         {"alias_rng": int(alias_rng)},
     )
     return outs["o"]
+
+
+def block_sparse_sage2_attn(q, k, v, mask, scale=0.0, pvthreshd=50.0, attention_sink=0):
+    """Block-sparse SageAttention2 (sm89). q,k,v: [B,H,S,D] f16/bf16, D in (64,128),
+    S % 128 == 0; mask: int32 [B,H,S//128,S//64] (all-ones = dense).
+
+    scale=0 selects 1/sqrt(D). Returns o with q's shape/dtype.
+    """
+    _require_cuda(q, k, v, mask)
+    import torch
+
+    if q.dim() != 4 or q.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("block_sparse_sage2_attn expects 4D f16/bf16 q/k/v")
+    if not (q.shape == k.shape == v.shape):
+        raise ValueError("q,k,v shapes must match")
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError("q,k,v dtypes must match")
+    B, H, S, D = q.shape
+    if mask.dtype != torch.int32 or tuple(mask.shape) != (B, H, S // 128, S // 64):
+        raise ValueError("mask must be int32 [B,H,S//128,S//64]")
+    outs = E.run_plugin(
+        "block_sparse_sage2_attn",
+        {"q": q, "k": k, "v": v, "m": mask},
+        [("o", q.dtype, tuple(q.shape))],
+        {"scale": float(scale), "pvthreshd": float(pvthreshd),
+         "attention_sink": int(attention_sink)},
+    )
+    return outs["o"]

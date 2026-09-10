@@ -83,7 +83,8 @@ add_library(trt_dit_plugins SHARED
     src/wrapper/adaln_wrapper.cpp
     src/wrapper/rope_wrapper.cpp
     src/wrapper/fp8_wrapper.cpp
-    src/wrapper/rms_rope_wrapper.cpp)
+    src/wrapper/rms_rope_wrapper.cpp
+    src/wrapper/sparge_wrapper.cpp)
 target_include_directories(trt_dit_plugins PRIVATE ${TRT_INCLUDE_DIR})
 target_link_libraries(trt_dit_plugins PRIVATE ck_kernels CUDA::cudart ${NVINFER_LIB})
 set_target_properties(trt_dit_plugins PROPERTIES BUILD_RPATH_USE_ORIGIN ON)

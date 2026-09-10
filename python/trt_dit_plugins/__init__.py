@@ -20,6 +20,7 @@ __all__ = [
     "apply_rope",
     "rms_rope_split_half",
     "stochastic_rounding_fp8",
+    "block_sparse_sage2_attn",
 ]
 
 PLUGIN_VERSION = _lib.PLUGIN_VERSION
@@ -33,6 +34,7 @@ def __getattr__(name: str):
         "apply_rope",
         "rms_rope_split_half",
         "stochastic_rounding_fp8",
+        "block_sparse_sage2_attn",
     ):
         from . import ops as _ops
 

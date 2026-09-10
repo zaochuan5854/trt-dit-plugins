@@ -25,6 +25,7 @@ PLUGINS = {
     "apply_rope": "apply_rope",
     "rms_rope_split_half": "rms_rope_split_half",
     "stochastic_round_fp8": "stochastic_round_fp8",
+    "block_sparse_sage2_attn": "block_sparse_sage2_attn",
 }
 
 # pip packages searched (first hit wins) for each dependency library.
