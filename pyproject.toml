@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trt-dit-plugins"
-version = "0.1.0"
+version = "0.2.0"
 description = "TensorRT IPluginV3 wrappers with comfy-kitchen-compatible op names (sm80/86/89 + 100/120 PTX)"
 readme = "README.md"
 requires-python = ">=3.10"

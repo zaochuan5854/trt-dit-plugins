@@ -8,7 +8,7 @@ GPUs only for execution; import itself needs neither GPU nor torch.
 from . import _lib as _lib
 from ._lib import PLUGINS, ensure_loaded, libdir
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "PLUGIN_VERSION",
     "PLUGINS",
