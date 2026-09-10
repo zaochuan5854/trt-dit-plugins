@@ -5,6 +5,11 @@ project(trt_dit_plugins LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
+if(WIN32)
+    # CUDA 12.6's host_config.h allowlist lags the rolling VS2022 minor
+    # updates on hosted runners; MSVC stays ABI-compatible within 19.x.
+    string(APPEND CMAKE_CUDA_FLAGS " -allow-unsupported-compiler")
+endif()
 # sm80/86 (Ampere) + sm89 (Ada, verified) + sm90 (Hopper) as SASS; sm90
 # PTX (driver JIT). Override with -DCMAKE_CUDA_ARCHITECTURES=89 for Ada-only.
 # nvidia/cuda images export CUDAARCHS (e.g. 89), which CMake copies into
