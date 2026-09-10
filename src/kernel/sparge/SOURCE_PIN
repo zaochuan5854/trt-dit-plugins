@@ -1,0 +1,10 @@
+SpargeAttn @ ae5b629 ("reduce repo size")
+https://github.com/thu-ml/SpargeAttn
+
+Extracted minimum (no whole-repo vendoring, no pybind/torch):
+  csrc/{cp_async,mma,permuted_smem,math,reduction_utils,numeric_conversion}.cuh
+  csrc/qattn/{qk_int_sv_f8_cuda_sm89.cuh,attn_utils.cuh,decl.cuh}
+Upstream autogen instantiations replaced by 4 explicit ones in
+sparge_sm89_inst.cu (hd64/128 x fp16/bf16; CTA128x64, qkg=1, pv_mode=1).
+Pre-steps rewritten torch-free in sparge_pre.cu (mirrors utils.py/core.py).
+License: Apache-2.0 (see NOTICE).

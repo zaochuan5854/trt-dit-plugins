@@ -60,9 +60,16 @@ add_library(ck_kernels SHARED
     src/kernel/sage_attention/sage_attn_launcher.cu
     src/kernel/adaln/adaln.cu
     src/kernel/rope/rms_rope.cu
-    src/kernel/fp8/per_tensor_quantize.cu)
+    src/kernel/fp8/per_tensor_quantize.cu
+    src/kernel/sparge/sparge_pre.cu
+    src/kernel/sparge/sparge_sm89_inst.cu
+    src/kernel/prime.cu)
 target_include_directories(ck_kernels PRIVATE
-    src/kernel/sage_attention src/kernel/adaln src/kernel/rope src/kernel/fp8)
+    src/kernel/sage_attention src/kernel/adaln src/kernel/rope src/kernel/fp8
+    src/kernel/sparge)
+# SpargeAttn sm89 kernel (wgmma): compile this TU for sm89 only; the plugin
+# refuses other architectures at build time (supportsTargetArchitecture).
+set_source_files_properties(src/kernel/sparge/sparge_sm89_inst.cu PROPERTIES CUDA_ARCHITECTURES 89-real)
 target_link_libraries(ck_kernels PRIVATE CUDA::cudart)
 set_target_properties(ck_kernels PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
 if(WIN32)
