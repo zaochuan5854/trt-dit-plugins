@@ -64,9 +64,25 @@ add_library(ck_kernels SHARED
     src/kernel/sparge/sparge_pre.cu
     src/kernel/sparge/sparge_sm89_inst.cu
     src/kernel/prime.cu)
-target_include_directories(ck_kernels PRIVATE
-    src/kernel/sage_attention src/kernel/adaln src/kernel/rope src/kernel/fp8
-    src/kernel/sparge)
+# Origin isolation: same-basename headers exist in both trees (comfy vs
+# sparge: mma/math/cp_async/...). Each TU sees ONLY its own origin dir, so a
+# cross-origin bare #include fails loudly instead of silently mixing.
+# (Quote-includes resolve file-locally first; -I is a backstop.)
+set_source_files_properties(
+    src/kernel/sage_attention/quant_qk_int8.cu src/kernel/sage_attention/quant_v_int8.cu
+    src/kernel/sage_attention/sage_attn_launcher.cu
+    PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sage_attention")
+set_source_files_properties(src/kernel/adaln/adaln.cu
+    PROPERTIES INCLUDE_DIRECTORIES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/adaln;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sage_attention")
+set_source_files_properties(src/kernel/rope/rms_rope.cu
+    PROPERTIES INCLUDE_DIRECTORIES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/rope;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sage_attention")
+set_source_files_properties(src/kernel/fp8/per_tensor_quantize.cu
+    PROPERTIES INCLUDE_DIRECTORIES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/fp8;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sage_attention")
+set_source_files_properties(src/kernel/sparge/sparge_pre.cu src/kernel/sparge/sparge_sm89_inst.cu
+    PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sparge")
 # SpargeAttn sm89 kernel (wgmma): compile this TU for sm89 only; the plugin
 # refuses other architectures at build time (supportsTargetArchitecture).
 set_source_files_properties(src/kernel/sparge/sparge_sm89_inst.cu PROPERTIES CUDA_ARCHITECTURES 89-real)

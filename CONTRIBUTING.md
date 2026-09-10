@@ -30,9 +30,12 @@ PYTHONPATH=python TRT_DIT_LIBDIR=build python3 python/tests/test_smoke.py
 
 ## Rules
 
-- `src/kernel/` is vendored from ComfyKitchen: content changes go upstream,
-  only the vendoring notice plus the documented CUDA-12.6 compat patch may
-  live here.
+- `src/kernel/` is vendored: content changes go upstream, only the vendoring
+  notice plus documented compat patches may live here.
+- Kernel origins are isolated per-TU in CMake (`src/kernel/<origin>/` only):
+  comfy and sparge trees share header basenames (`mma`/`math`/`cp_async`/…).
+  Never add a cross-origin `-I`; a bare cross-origin `#include` must fail,
+  not silently mix.
 - New plugins follow `src/wrapper/*_wrapper.cpp`: BF16-first dtype rules,
   `comfy_kitchen` namespace, `getTimingCacheID`, and an E2E test in `test/`.
 - Every numeric change needs a measured before/after (`cos` + ms).
