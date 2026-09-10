@@ -65,6 +65,15 @@ RoPE I/O FP16/BF16). Dynamic sequence lengths via one engine
 
 ## Quickstart (Linux, sm89)
 
+Prebuilt core (fast path — no compiler needed):
+
+```bash
+pip install --extra-index-url https://pypi.nvidia.com \
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.1.0-cu12/trt_dit_plugins-0.1.0-py3-none-linux_x86_64.whl
+```
+
+Build the core from source (only to modify kernels/wrappers):
+
 ```bash
 # 1. Build the image (uses cached CUDA devel base, pins TRT 10.16.1.11)
 podman build --rm -t trt-plugins:sm89 .
