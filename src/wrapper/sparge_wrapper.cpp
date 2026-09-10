@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // TRT IPluginV3 for SpargeAttn block-sparse SageAttention2 (sm89).
+// Kernel origin: SpargeAttn (thu-ml, Apache-2.0), NOT ComfyKitchen; see NOTICE.
+// Registered under the existing comfy_kitchen namespace for release unity.
 // Registration: comfy_kitchen::block_sparse_sage2_attn.
 // Inputs q,k,v: [B,H,S,D] contiguous LINEAR FP16/BF16 (uniform dtype);
 // mask: INT32 [B,H,QB,KB] 0/1 (static shape, dynamic values; all-ones = dense).

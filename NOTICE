@@ -29,6 +29,26 @@ on top, otherwise byte-identical, original SPDX headers retained):
 - backends/cuda/ops/per_tensor_quantize.cu
 - backends/cuda/{dtype_dispatch.cuh, float_utils.cuh, utils.cuh}
 
+--------------------------------------------------------------------------------
+SpargeAttn
+--------------------------------------------------------------------------------
+Copyright (c) 2025 SpargeAttn team. All rights reserved.
+License: Apache-2.0
+Website: https://github.com/thu-ml/SpargeAttn (pinned: ae5b629, see
+src/kernel/sparge/SOURCE_PIN)
+
+The block_sparse_sage2_attn plugin implements the equivalent of SpargeAttn's
+block_sparse_sage2_attn_cuda (sm89 path). Extracted minimum (no whole-repo
+vendoring, no pybind/torch): csrc/{cp_async,mma,permuted_smem,math,
+reduction_utils,numeric_conversion}.cuh and
+csrc/qattn/{qk_int_sv_f8_cuda_sm89.cuh,attn_utils.cuh,decl.cuh} are unmodified
+copies; upstream's 192 autogen instantiations are replaced by 4 explicit ones
+(src/kernel/sparge/sparge_sm89_inst.cu); the Triton/Python pre-steps are
+rewritten torch-free (src/kernel/sparge/sparge_pre.cu). SpargeAttn descends
+from SageAttention (see above). The plugin is registered under the existing
+"comfy_kitchen" TRT namespace for release unity; the kernel is SpargeAttn's,
+not ComfyKitchen's.
+
 ================================================================================
 
 This software uses the following third-party libraries:

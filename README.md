@@ -53,6 +53,7 @@ python -c "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
 | `apply_rope` | Strided (copy-free) RoPE, D even | f16/bf16 in+out; freqs f32/f16/bf16 | cos=1.0 |
 | `rms_rope_split_half` | Fused RMSNorm + split-half/partial RoPE, D multiple of 32 | f16/bf16 in+out; freqs/scales f32/f16/bf16 | cos=1.0 |
 | `stochastic_round_fp8` | Stochastic rounding to FP8 E4M3 | in f32/f16/bf16, rng INT32 → out FP8 | exact match |
+| `block_sparse_sage2_attn` | Block-sparse SageAttention2, sm89 only (kernel: SpargeAttn, see NOTICE) | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] | cos=0.99953 |
 
 All plugin I/O is `kLINEAR` only. Q/K/V/scale inputs to one plugin must share
 one dtype. `UINT8` plugin I/O is unsupported by TRT 10.16.

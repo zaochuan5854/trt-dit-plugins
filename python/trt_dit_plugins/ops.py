@@ -114,8 +114,9 @@ def stochastic_rounding_fp8(x, rng, alias_rng=False):
 
 
 def block_sparse_sage2_attn(q, k, v, mask, scale=0.0, pvthreshd=50.0, attention_sink=0):
-    """Block-sparse SageAttention2 (sm89). q,k,v: [B,H,S,D] f16/bf16, D in (64,128),
-    S % 128 == 0; mask: int32 [B,H,S//128,S//64] (all-ones = dense).
+    """Block-sparse SageAttention2 (sm89; kernel from SpargeAttn, see NOTICE).
+    q,k,v: [B,H,S,D] f16/bf16, D in (64,128), S % 128 == 0;
+    mask: int32 [B,H,S//128,S//64] (all-ones = dense).
 
     scale=0 selects 1/sqrt(D). Returns o with q's shape/dtype.
     """
