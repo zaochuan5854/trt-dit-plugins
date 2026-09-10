@@ -38,7 +38,7 @@ jobs:
             libnvinfer-headers-plugin-dev=${TRT_VER} \
             libnvinfer-safe-headers-dev=${TRT_VER}
           rm -rf /var/lib/apt/lists/*
-          pip3 install --break-system-packages -U setuptools wheel
+          pip3 install --break-system-packages --ignore-installed -U setuptools wheel
       - name: Build
         run: |
           cmake -S . -B build -G Ninja \
