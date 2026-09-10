@@ -152,6 +152,8 @@ Dockerfile.val    validation image (+ torch + TRT python bindings)
 - `creator not found` in Python: the `.so` failed to load — usually a missing
   pip dependency (`tensorrt-cu12-libs`, `nvidia-cuda-runtime-cu12`); reinstall
   with `--extra-index-url https://pypi.nvidia.com`.
+- Windows: the DLLs need the Visual C++ Redistributable (already required by
+  the `torch`/`tensorrt-cu12-libs` wheels, so no extra step in practice).
 
 ## License
 

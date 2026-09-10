@@ -60,7 +60,9 @@ jobs:
           path: dist/*.whl
 
   wheel-windows:
-    runs-on: windows-latest
+    # Pinned to match windows.yml CI: windows-latest now defaults to VS18,
+    # whose cl crashes nvcc 12.6's cudafe.
+    runs-on: windows-2022
     defaults:
       run:
         shell: pwsh
