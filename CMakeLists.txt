@@ -5,6 +5,11 @@ project(trt_dit_plugins LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
+# CUDA 13's CCCL headers hard-error (C1189) under MSVC's traditional
+# preprocessor; the conforming one is required for .cu host compilation.
+if(MSVC)
+    add_compile_options(/Zc:preprocessor)
+endif()
 # sm80/86 (Ampere) + sm89 (Ada, verified) + sm90 (Hopper) as SASS; sm90
 # PTX (driver JIT). Override with -DCMAKE_CUDA_ARCHITECTURES=89 for Ada-only.
 # nvidia/cuda images export CUDAARCHS (e.g. 89), which CMake copies into
