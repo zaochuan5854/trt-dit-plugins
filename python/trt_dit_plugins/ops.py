@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import _engine as E
+from .select import PluginOp
 
 
 def _require_cuda(*tensors: Any) -> Any:
@@ -40,7 +41,7 @@ def int8_attention(q, k, v):
         raise ValueError("q,k,v shapes must match")
     otype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
     outs = E.run_plugin(
-        "int8_attention",
+        PluginOp.INT8_ATTENTION,
         {"q": q, "k": k, "v": v},
         [("o", otype, tuple(q.shape))],
     )
@@ -72,7 +73,7 @@ def sage_attn(q, k, v, fp8_pv=False):
         raise ValueError("sage_attn Hq must be a multiple of Hkv")
     otype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
     outs = E.run_plugin(
-        "sage_attn",
+        PluginOp.SAGE_ATTN,
         {"q": q, "k": k, "v": v},
         [("o", otype, tuple(q.shape))],
         {"fp8_pv": int(bool(fp8_pv))},
@@ -95,19 +96,19 @@ def _adaln(name, x, scale, shift, eps=1e-6):
 
 def adaln(x, scale, shift, eps=1e-6):
     """Fused LayerNorm AdaLN: layernorm(x) * (1 + scale) + shift."""
-    return _adaln("adaln", x, scale, shift, eps)
+    return _adaln(PluginOp.ADALN, x, scale, shift, eps)
 
 
 def rms_adaln(x, scale, shift, eps=1e-6):
     """Fused RMSNorm AdaLN: rmsnorm(x) * (1 + scale) + shift."""
-    return _adaln("rms_adaln", x, scale, shift, eps)
+    return _adaln(PluginOp.RMS_ADALN, x, scale, shift, eps)
 
 
 def apply_rope(q, k, freqs):
     """Interleaved RoPE. q,k: [B,H,S,D] f16/bf16; freqs: [..,D/2,2,2]."""
     _require_cuda(q, k, freqs)
     outs = E.run_plugin(
-        "apply_rope",
+        PluginOp.APPLY_ROPE,
         {"q": q, "k": k, "f": freqs},
         [("qo", q.dtype, tuple(q.shape)), ("ko", k.dtype, tuple(k.shape))],
     )
@@ -118,7 +119,7 @@ def rms_rope_split_half(q, k, freqs, q_scale, k_scale, epsilon=1e-6, rot_dim=0):
     """RMSNorm (full D) + split-half RoPE (rot_dim prefix, 0 = all)."""
     _require_cuda(q, k, freqs, q_scale, k_scale)
     outs = E.run_plugin(
-        "rms_rope_split_half",
+        PluginOp.RMS_ROPE_SPLIT_HALF,
         {"q": q, "k": k, "f": freqs, "qs": q_scale, "ks": k_scale},
         [("qo", q.dtype, tuple(q.shape)), ("ko", k.dtype, tuple(k.shape))],
         {"epsilon": float(epsilon), "rot_dim": int(rot_dim)},
@@ -138,7 +139,7 @@ def stochastic_rounding_fp8(x, rng, alias_rng=False):
     if rng.dtype != torch.int32 or rng.numel() != x.numel():
         raise ValueError("rng must be int32 with same numel as x")
     outs = E.run_plugin(
-        "stochastic_round_fp8",
+        PluginOp.STOCHASTIC_ROUND_FP8,
         {"x": x, "r": rng},
         [("o", torch.float8_e4m3fn, tuple(x.shape))],
         {"alias_rng": int(alias_rng)},
@@ -166,7 +167,7 @@ def block_sparse_sage2_attn(q, k, v, mask, scale=0.0, pvthreshd=50.0, attention_
     if mask.dtype != torch.int32 or tuple(mask.shape) != (B, H, S // 128, S // 64):
         raise ValueError("mask must be int32 [B,H,S//128,S//64]")
     outs = E.run_plugin(
-        "block_sparse_sage2_attn",
+        PluginOp.BLOCK_SPARSE_SAGE2_ATTN,
         {"q": q, "k": k, "v": v, "m": mask},
         [("o", q.dtype, tuple(q.shape))],
         {"scale": float(scale), "pvthreshd": float(pvthreshd),
@@ -203,7 +204,7 @@ def fused_int8_rope_sage_attn(q_i8, q_scale, k_i8, k_scale, v_i8, v_scale,
     if inv_freq.shape != (64,) or inv_freq.dtype != torch.float32:
         raise ValueError("inv_freq must be fp32 [64]")
     outs = E.run_plugin(
-        "fused_int8_rope_sage_attn",
+        PluginOp.FUSED_INT8_ROPE_SAGE_ATTN,
         {"q": q_i8, "qs": q_scale, "k": k_i8, "ks": k_scale, "v": v_i8,
          "vs": v_scale, "qn": rms_w_q, "kn": rms_w_k, "inv": inv_freq},
         [("o", torch.bfloat16, tuple(q_i8.shape))],

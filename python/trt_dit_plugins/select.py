@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Sequence-length driven plugin selection (pure functions).
 
-Two-axis input model: ``base`` (``f32``/``f16``/``bf16``, always required)
-is the compute dtype; ``quant`` (``None``/``int8``/``fp8``) is the
-quantization riding on top of it with an external scale. ``int8``/``fp8``
+Two-axis input model: ``base`` (:class:`BasePrecision`, always required)
+is the compute dtype; ``quant`` (``None``/:class:`QuantKind`) is the
+quantization riding on top of it with an external scale. Quantized kinds
 always carry a scale, floats never do -- derived, not caller-chosen.
+Public APIs take Enum members only (plain strings raise :class:`TypeError`);
+the ``*_coerce`` helpers remain for string boundaries (CLI).
 
 Quality gating is per loss class (``QUALITY_CLASS``): fusing loses
 accuracy by design, so one absolute bar across classes would either
@@ -60,6 +62,46 @@ class QuantKind(str, Enum):
     FP8 = "fp8"
 
 
+class GemmKind(str, Enum):
+    AUTO = "auto"
+    INT8 = "int8"
+    FP16 = "fp16"
+    FP8 = "fp8"
+
+    __str__ = str.__str__
+
+
+class NormKind(str, Enum):
+    LAYER = "layer"
+    RMS = "rms"
+
+    __str__ = str.__str__
+
+
+class RopeStyle(str, Enum):
+    SPLIT_HALF = "split-half"
+    INTERLEAVED = "interleaved"
+
+    __str__ = str.__str__
+
+
+class PluginOp(str, Enum):
+    """Every plugin op, managed in one place (str-compatible: == "name")."""
+
+    INT8_ATTENTION = "int8_attention"
+    SAGE_ATTN = "sage_attn"
+    ADALN = "adaln"
+    RMS_ADALN = "rms_adaln"
+    APPLY_ROPE = "apply_rope"
+    RMS_ROPE_SPLIT_HALF = "rms_rope_split_half"
+    STOCHASTIC_ROUND_FP8 = "stochastic_round_fp8"
+    BLOCK_SPARSE_SAGE2_ATTN = "block_sparse_sage2_attn"
+    FUSED_INT8_ROPE_SAGE_ATTN = "fused_int8_rope_sage_attn"
+    SAGE_INT8_LEGACY = "SageInt8Attn"
+
+    __str__ = str.__str__
+
+
 _BASE_ALIASES = {
     "f32": "f32", "float32": "f32", "fp32": "f32",
     "f16": "f16", "float16": "f16", "fp16": "f16", "half": "f16",
@@ -74,20 +116,21 @@ _QUANT_ALIASES = {
 # universal truths. Gate lookup uses the exact-S point when present, else
 # the conservative min over known points (see _table_cos).
 KNOWN_COS: dict[str, dict[int, float]] = {
-    "fused_int8_rope_sage_attn": {2048: 0.9977, 4096: 0.99855},
-    "int8_attention": {4096: 0.99990},
-    "sage_attn": {4096: 0.99927},
+    PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: {2048: 0.9977, 4096: 0.99855},
+    PluginOp.INT8_ATTENTION: {4096: 0.99990},
+    PluginOp.SAGE_ATTN: {4096: 0.99927},
     "sage_attn+fp8_pv": {4096: 0.99925},
-    "block_sparse_sage2_attn": {4096: 0.99953},
-    "adaln": {}, "rms_adaln": {}, "apply_rope": {}, "rms_rope_split_half": {},
+    PluginOp.BLOCK_SPARSE_SAGE2_ATTN: {4096: 0.99953},
+    PluginOp.ADALN: {}, PluginOp.RMS_ADALN: {}, PluginOp.APPLY_ROPE: {},
+    PluginOp.RMS_ROPE_SPLIT_HALF: {},
 }
 
 QUALITY_CLASS: dict[str, str] = {
-    "adaln": "exact", "rms_adaln": "exact",
-    "apply_rope": "exact", "rms_rope_split_half": "exact",
-    "int8_attention": "quant", "sage_attn": "quant",
-    "block_sparse_sage2_attn": "quant",
-    "fused_int8_rope_sage_attn": "fused",
+    PluginOp.ADALN: "exact", PluginOp.RMS_ADALN: "exact",
+    PluginOp.APPLY_ROPE: "exact", PluginOp.RMS_ROPE_SPLIT_HALF: "exact",
+    PluginOp.INT8_ATTENTION: "quant", PluginOp.SAGE_ATTN: "quant",
+    PluginOp.BLOCK_SPARSE_SAGE2_ATTN: "quant",
+    PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: "fused",
 }
 # Spec sec 7 floor (vs the separated path): below this the kernel is
 # broken, not lossy. A broken-detector, not a quality bar -- note the
@@ -98,15 +141,40 @@ _FLAG_ORDER = ("FP16", "BF16", "INT8", "FP8")
 _BASE_FLAG = {BasePrecision.F32: (), BasePrecision.F16: ("FP16",),
               BasePrecision.BF16: ("BF16",)}
 _QUANT_FLAG = {QuantKind.INT8: ("INT8",), QuantKind.FP8: ("FP8",)}
-_GEMM_FLAG = {"int8": ("INT8",), "fp16": ("FP16",), "fp8": ("FP8",)}
+_GEMM_ALIASES = {
+    "auto": "auto",
+    "int8": "int8", "i8": "int8",
+    "fp16": "fp16", "f16": "fp16",
+    "fp8": "fp8", "float8": "fp8", "e4m3": "fp8",
+}
+_NORM_ALIASES = {
+    "layer": "layer", "layernorm": "layer", "ln": "layer",
+    "rms": "rms", "rmsnorm": "rms",
+}
+_ROPE_ALIASES = {
+    "split-half": "split-half", "split_half": "split-half", "split": "split-half",
+    "interleaved": "interleaved",
+}
+_GEMM_FLAG = {GemmKind.INT8: ("INT8",), GemmKind.FP16: ("FP16",),
+              GemmKind.FP8: ("FP8",)}
+
+
+def require_enum(name: str, v: Any, cls: type) -> Any:
+    """Public APIs take Enum members only; plain strings raise TypeError."""
+    if isinstance(v, cls):
+        return v
+    raise TypeError(f"{name} must be {cls.__name__} (plain strings rejected), "
+                    f"got {v!r}")
 
 # Static preference when no bench table (or incomplete keys) is given.
-_STATIC_RANK = ("fused_int8_rope_sage_attn", "block_sparse_sage2_attn",
-                "int8_attention", "sage_attn")
+_STATIC_RANK = (PluginOp.FUSED_INT8_ROPE_SAGE_ATTN,
+                PluginOp.BLOCK_SPARSE_SAGE2_ATTN,
+                PluginOp.INT8_ATTENTION, PluginOp.SAGE_ATTN)
 
-_DISCOVERY_OPS = ("Attention", "SageInt8Attn")
-_PLUGIN_ATTN_OPS = ("sage_attn", "int8_attention",
-                    "fused_int8_rope_sage_attn", "block_sparse_sage2_attn")
+_DISCOVERY_OPS = ("Attention", PluginOp.SAGE_INT8_LEGACY)
+_PLUGIN_ATTN_OPS = (PluginOp.SAGE_ATTN, PluginOp.INT8_ATTENTION,
+                    PluginOp.FUSED_INT8_ROPE_SAGE_ATTN,
+                    PluginOp.BLOCK_SPARSE_SAGE2_ATTN)
 _FUSED_MAX_S = 9216  # validated range per fused spec sec 2.1 (validator gates >1024).
 
 # Observed kernel failures. Entries must stay excluded by the gates below;
@@ -117,9 +185,9 @@ _FUSED_MAX_S = 9216  # validated range per fused spec sec 2.1 (validator gates >
 # (configurePlugin/onShapeChange reject), ops.py (pre-launch ValueError),
 # and surgeon.validate_plugin_nodes.
 KNOWN_BAD: tuple[dict[str, Any], ...] = (
-    {"op": "fused_int8_rope_sage_attn", "cond": "S<=1024",
+    {"op": PluginOp.FUSED_INT8_ROPE_SAGE_ATTN, "cond": "S<=1024",
      "failure": "L<=1024 path: cos 0.80 at S=512, illegal memory access at S=1024",
-     "probe": {"base": "bf16", "quant": "int8", "S": 1024, "D": 128,
+     "probe": {"base": BasePrecision.BF16, "quant": QuantKind.INT8, "S": 1024, "D": 128,
                "Hq": 16, "Hkv": 16, "arch": "sm89", "rope_fusable": True}},
 )
 
@@ -142,6 +210,40 @@ def _coerce_quant(v: Any) -> QuantKind:
         raise ValueError(f"unknown quant {v!r} (want None/int8/fp8)") from None
 
 
+def _coerce_gemm(v: Any) -> GemmKind:
+    if isinstance(v, GemmKind):
+        return v
+    try:
+        return GemmKind(_GEMM_ALIASES[str(v).lower()])
+    except KeyError:
+        raise ValueError(f"unknown gemm {v!r} (want auto/int8/fp16/fp8)") from None
+
+
+def _coerce_norm(v: Any) -> NormKind:
+    if isinstance(v, NormKind):
+        return v
+    try:
+        return NormKind(_NORM_ALIASES[str(v).lower()])
+    except KeyError:
+        raise ValueError(f"unknown norm {v!r} (want layer/rms)") from None
+
+
+def _coerce_style(v: Any) -> RopeStyle:
+    if isinstance(v, RopeStyle):
+        return v
+    try:
+        return RopeStyle(_ROPE_ALIASES[str(v).lower()])
+    except KeyError:
+        raise ValueError(f"unknown rope style {v!r} (want split-half/interleaved)") from None
+
+
+def require_opt(name: str, v: Any, cls: type) -> Any:
+    """require_enum that also accepts None (for Optional enum params)."""
+    if v is None:
+        return None
+    return require_enum(name, v, cls)
+
+
 def _parse_arch(arch: Any) -> int | None:
     """'sm89'/89 -> 89; unknown/None -> None (arch-gated paths excluded)."""
     if arch is None:
@@ -158,6 +260,27 @@ def _table_cos(op: str, S: int | None) -> float:
     if S in pts:
         return pts[S]
     return min(pts.values())
+
+
+def fused_static_ok(*, S: int | None, D: int | None) -> tuple[bool, str]:
+    """Static fused gates without samples (S/D/spec-floor only).
+
+    Mirrors the sample-independent half of :func:`select_attention`'s
+    fused branch. The strict path additionally requires upcast-simulation
+    evidence (``compat``); use this only to *report* the experimental
+    no-samples path, never as a strict verdict.
+    """
+    if S is None:
+        return False, "fused: unknown S"
+    if S <= 1024:
+        return False, f"fused: S={S} known-bad (<=1024)"
+    if S > _FUSED_MAX_S:
+        return False, f"fused: S={S} out of validated range (>{_FUSED_MAX_S})"
+    if D is not None and D != 128:
+        return False, f"fused: D={D}, want 128"
+    if _table_cos(PluginOp.FUSED_INT8_ROPE_SAGE_ATTN, S) < FUSED_SPEC_FLOOR:
+        return False, f"fused: below spec floor {FUSED_SPEC_FLOOR}"
+    return True, "static gates pass (compat unverified: experimental)"
 
 
 def _trt_flags(base: BasePrecision, gemm: str,
@@ -232,7 +355,8 @@ def _to_base(arr, base: BasePrecision):
     return rnd.view(np.float32).astype(np.float64)
 
 
-def simulate_upcast_compat(sample, scale, *, base, quant,
+def simulate_upcast_compat(sample, scale, *, base: BasePrecision,
+                           quant: QuantKind,
                            min_cos: float | None = None) -> dict[str, Any]:
     """Quantize a calibration sample, upcast to ``base``, measure fidelity.
 
@@ -245,8 +369,8 @@ def simulate_upcast_compat(sample, scale, *, base, quant,
     """
     import numpy as np
 
-    base = _coerce_base(base)
-    quant = _coerce_quant(quant)
+    base = require_enum("base", base, BasePrecision)
+    quant = require_enum("quant", quant, QuantKind)
     x = np.asarray(sample, dtype=np.float64)
     try:
         s = float(np.asarray(scale, dtype=np.float64).reshape(-1)[0])
@@ -309,12 +433,14 @@ def _bench_ms(bench: dict | None, op: str, S: int | None, D: int | None,
     return float(v) if v is not None else None
 
 
-def select_attention(*, base, quant=None, S: int | None = None,
+def select_attention(*, base: BasePrecision, quant: QuantKind | None = None,
+                     S: int | None = None,
                      D: int | None = None, Hq: int | None = None,
                      Hkv: int | None = None, arch: Any = None,
                      causal: bool = False, has_mask: bool = False,
                      sparse_mask: bool = False, rope_fusable: bool = False,
-                     gemm: str = "auto", min_cos: float | None = None,
+                     gemm: GemmKind = GemmKind.AUTO,
+                     min_cos: float | None = None,
                      compat: dict | None = None,
                      bench: dict | None = None) -> dict[str, Any]:
     """Pick the attention implementation for one site.
@@ -322,9 +448,10 @@ def select_attention(*, base, quant=None, S: int | None = None,
     ``S``/``D``/``H`` accept None (dynamic): S-gated paths are then
     excluded, other unknown dims never reject (build-time resolve, same
     philosophy as ``surgeon.validate_plugin_nodes``). ``gemm`` pins the
-    quantized-GEMM vehicle: ``"int8"`` (INT8-QK family), ``"fp8"`` (FP8
-    vehicle = ``sage_attn`` ``fp8_pv`` tactic, else native+FP8), ``"fp16"``
-    (no quantized GEMM -> native). ``"auto"`` never picks ``fp8_pv``
+    quantized-GEMM vehicle: ``GemmKind.INT8`` (INT8-QK family),
+    ``GemmKind.FP8`` (FP8 vehicle = ``sage_attn`` ``fp8_pv`` tactic, else
+    native+FP8), ``GemmKind.FP16`` (no quantized GEMM -> native).
+    ``GemmKind.AUTO`` never picks ``fp8_pv``
     (measured slower on dense shapes; opt-in only). ``min_cos`` gates
     ``quant``-class static values and the ``compat`` simulation result;
     the ``fused`` class is lossy by design and answers to the spec floor
@@ -339,12 +466,11 @@ def select_attention(*, base, quant=None, S: int | None = None,
     never a substitute for in-plugin tactic benchmarking (see module
     docstring).
     """
-    base = _coerce_base(base)
-    quant = _coerce_quant(quant) if quant is not None else None
+    base = require_enum("base", base, BasePrecision)
+    quant = require_opt("quant", quant, QuantKind)
+    gemm = require_enum("gemm", gemm, GemmKind)
     arch_n = _parse_arch(arch)
     _check_bench_keys(bench)
-    if gemm not in ("auto", "int8", "fp16", "fp8"):
-        raise ValueError(f"gemm must be auto/int8/fp16/fp8, got {gemm!r}")
 
     def native(reason: str) -> dict[str, Any]:
         return {"op": NATIVE_OP, "fields": {}, "reason": reason,
@@ -353,7 +479,7 @@ def select_attention(*, base, quant=None, S: int | None = None,
     notes: list[str] = []
     if causal or (has_mask and not sparse_mask):
         return native("causal-or-dense-mask: no plugin path covers it; plain TRT")
-    if gemm == "fp16":
+    if gemm is GemmKind.FP16:
         return native("GEMM pinned to fp16: plugin set is INT8/FP8-GEMM only; plain TRT")
 
     def quant_cos_ok(op: str) -> bool:
@@ -374,7 +500,7 @@ def select_attention(*, base, quant=None, S: int | None = None,
 
     # Fused INT8 RoPE+Sage: lossy by design; min_cos does not apply to its
     # static value. Guarded by compat evidence + the spec broken-floor.
-    if gemm in ("auto", "int8"):
+    if gemm in (GemmKind.AUTO, GemmKind.INT8):
         if not rope_fusable:
             notes.append("fused: no rope/INT8 path ready")
         elif quant is not QuantKind.INT8:
@@ -398,15 +524,15 @@ def select_attention(*, base, quant=None, S: int | None = None,
                 and compat["cos"] == compat["cos"]
                 and compat["cos"] >= min_cos):
             notes.append(f"fused: sim cos {compat.get('cos')} < min_cos {min_cos}")
-        elif _table_cos("fused_int8_rope_sage_attn", S) < FUSED_SPEC_FLOOR:
+        elif _table_cos(PluginOp.FUSED_INT8_ROPE_SAGE_ATTN, S) < FUSED_SPEC_FLOOR:
             notes.append("fused: below spec floor"
                          f" {FUSED_SPEC_FLOOR} (broken, not lossy)")
         else:
-            qualified.append("fused_int8_rope_sage_attn")
-            fields["fused_int8_rope_sage_attn"] = {}
+            qualified.append(PluginOp.FUSED_INT8_ROPE_SAGE_ATTN)
+            fields[PluginOp.FUSED_INT8_ROPE_SAGE_ATTN] = {}
 
     # Block-sparse (needs a block-form mask, sm89-only, float inputs).
-    if sparse_mask and quant is None and gemm in ("auto", "int8"):
+    if sparse_mask and quant is None and gemm in (GemmKind.AUTO, GemmKind.INT8):
         if arch_n != 89:
             notes.append(f"block-sparse: needs sm89, got {arch!r}")
         elif D is not None and D not in (64, 128):
@@ -415,9 +541,9 @@ def select_attention(*, base, quant=None, S: int | None = None,
             notes.append(f"block-sparse: needs f16/bf16 base, got {base.value}")
         elif S is None or S % 128 != 0:
             notes.append(f"block-sparse: S={S}, want multiple of 128")
-        elif quant_cos_ok("block_sparse_sage2_attn"):
-            qualified.append("block_sparse_sage2_attn")
-            fields["block_sparse_sage2_attn"] = {}
+        elif quant_cos_ok(PluginOp.BLOCK_SPARSE_SAGE2_ATTN):
+            qualified.append(PluginOp.BLOCK_SPARSE_SAGE2_ATTN)
+            fields[PluginOp.BLOCK_SPARSE_SAGE2_ATTN] = {}
     elif sparse_mask and quant is not None:
         notes.append("block-sparse: needs float inputs")
 
@@ -426,7 +552,7 @@ def select_attention(*, base, quant=None, S: int | None = None,
     # accuracy (0.99925 vs 0.99927), and tactic selection is latency-only,
     # so an automatic tactic could silently trade accuracy. The selector
     # keeps this choice explicit and accuracy-visible (see module docstring).
-    if gemm == "fp8" and quant is None:
+    if gemm is GemmKind.FP8 and quant is None:
         if arch_n != 89:
             notes.append(f"fp8_pv: needs sm89, got {arch!r}")
         elif D is not None and D not in (64, 128):
@@ -438,24 +564,24 @@ def select_attention(*, base, quant=None, S: int | None = None,
         elif not gqa_ok:
             notes.append("fp8_pv: GQA mismatch")
         elif quant_cos_ok("sage_attn+fp8_pv"):
-            qualified.append("sage_attn")
-            fields["sage_attn"] = {"fp8_pv": 1}
-    elif gemm == "fp8" and quant is not None:
+            qualified.append(PluginOp.SAGE_ATTN)
+            fields[PluginOp.SAGE_ATTN] = {"fp8_pv": 1}
+    elif gemm is GemmKind.FP8 and quant is not None:
         notes.append("fp8_pv: needs float inputs")
 
     # Dense INT8 / portable paths (float inputs only).
-    if gemm in ("auto", "int8") and quant is None:
+    if gemm in (GemmKind.AUTO, GemmKind.INT8) and quant is None:
         if D is not None and D not in (64, 128, 256):
             notes.append(f"dense: D={D}, want 64/128/256")
         else:
-            if square_h and quant_cos_ok("int8_attention"):
-                qualified.append("int8_attention")
-                fields["int8_attention"] = {}
+            if square_h and quant_cos_ok(PluginOp.INT8_ATTENTION):
+                qualified.append(PluginOp.INT8_ATTENTION)
+                fields[PluginOp.INT8_ATTENTION] = {}
             elif not square_h:
                 notes.append("int8_attention: GQA needs Hq==Hkv")
-            if gqa_ok and quant_cos_ok("sage_attn"):
-                qualified.append("sage_attn")
-                fields["sage_attn"] = {}
+            if gqa_ok and quant_cos_ok(PluginOp.SAGE_ATTN):
+                qualified.append(PluginOp.SAGE_ATTN)
+                fields[PluginOp.SAGE_ATTN] = {}
             elif not gqa_ok:
                 notes.append("sage_attn: Hq must be a multiple of Hkv")
     elif quant is QuantKind.INT8:
@@ -484,19 +610,19 @@ def select_attention(*, base, quant=None, S: int | None = None,
             "cos": _table_cos(key, S), "trt_flags": _plugin_flags()}
 
 
-def select_norm(*, base, quant=None, norm: str,
+def select_norm(*, base: BasePrecision, quant: QuantKind | None = None,
+                norm: NormKind,
                 shape: tuple | None = None, eps: float = 1e-6,
                 min_cos: float | None = None) -> dict[str, Any]:
-    """``norm="layer"`` -> ``adaln`` / ``"rms"`` -> ``rms_adaln`` (or native)."""
-    if norm not in ("layer", "rms"):
-        raise ValueError(f"norm must be layer/rms, got {norm!r}")
-    base = _coerce_base(base)
-    quant = _coerce_quant(quant) if quant is not None else None
-    op = "adaln" if norm == "layer" else "rms_adaln"
+    """``NormKind.LAYER`` -> ``adaln`` / ``NormKind.RMS`` -> ``rms_adaln`` (or native)."""
+    base = require_enum("base", base, BasePrecision)
+    quant = require_opt("quant", quant, QuantKind)
+    norm = require_enum("norm", norm, NormKind)
+    op = PluginOp.ADALN if norm is NormKind.LAYER else PluginOp.RMS_ADALN
 
     def native(reason: str) -> dict[str, Any]:
         return {"op": NATIVE_OP, "fields": {}, "reason": reason,
-                "cos": None, "trt_flags": _trt_flags(base, "auto", quant)}
+                "cos": None, "trt_flags": _trt_flags(base, GemmKind.AUTO, quant)}
 
     if quant is not None:
         return native(f"{op}: no quantized-norm plugin; plain TRT")
@@ -508,35 +634,37 @@ def select_norm(*, base, quant=None, norm: str,
             "cos": 1.0, "trt_flags": _plugin_flags()}
 
 
-def select_rope(*, base, quant=None, style: str = "split-half",
+def select_rope(*, base: BasePrecision, quant: QuantKind | None = None,
+                style: RopeStyle = RopeStyle.SPLIT_HALF,
                 fuse_norm: bool = False, D: int | None = None,
                 has_scales: bool = False, epsilon: float = 1e-6,
                 rot_dim: int = 0) -> dict[str, Any]:
     """RoPE variant selection (or native). Styles don't substitute: a style
     mismatch returns native, never the other plugin."""
-    base = _coerce_base(base)
-    quant = _coerce_quant(quant) if quant is not None else None
+    base = require_enum("base", base, BasePrecision)
+    quant = require_opt("quant", quant, QuantKind)
+    style = require_enum("style", style, RopeStyle)
 
     def native(reason: str) -> dict[str, Any]:
         return {"op": NATIVE_OP, "fields": {}, "reason": reason,
-                "cos": None, "trt_flags": _trt_flags(base, "auto", quant)}
+                "cos": None, "trt_flags": _trt_flags(base, GemmKind.AUTO, quant)}
 
     if quant is not None:
         return native(f"rope: no quantized-rope plugin; plain TRT")
     if base not in (BasePrecision.F16, BasePrecision.BF16):
         return native(f"rope: q/k need f16/bf16 base, got {base.value}; plain TRT")
-    if style == "interleaved" and not fuse_norm:
+    if style is RopeStyle.INTERLEAVED and not fuse_norm:
         if D is not None and D % 2:
             return native(f"apply_rope: D={D} not even; plain TRT")
-        return {"op": "apply_rope", "fields": {},
+        return {"op": PluginOp.APPLY_ROPE, "fields": {},
                 "reason": "apply_rope fits", "cos": 1.0,
                 "trt_flags": _plugin_flags()}
-    if style == "split-half" and fuse_norm:
+    if style is RopeStyle.SPLIT_HALF and fuse_norm:
         if not has_scales:
             return native("rms_rope_split_half: needs norm scales; plain TRT")
         if D is not None and D % 32:
             return native(f"rms_rope_split_half: D={D} not a multiple of 32; plain TRT")
-        return {"op": "rms_rope_split_half",
+        return {"op": PluginOp.RMS_ROPE_SPLIT_HALF,
                 "fields": {"epsilon": float(epsilon), "rot_dim": int(rot_dim)},
                 "reason": "rms_rope_split_half fits", "cos": 1.0,
                 "trt_flags": _plugin_flags()}
@@ -574,10 +702,11 @@ def _block_compat(b: dict[str, Any], scales: dict[str, float],
             "reason": "; ".join(r["reason"] for r in results)}
 
 
-def discover_attention_sites(graph, *, base, quant=None,
+def discover_attention_sites(graph, *, base: BasePrecision,
+                             quant: QuantKind | None = None,
                              scales: dict[str, float] | None = None,
                              samples: dict[str, Any] | None = None,
-                             arch: Any = None, gemm: str = "auto",
+                             arch: Any = None, gemm: GemmKind = GemmKind.AUTO,
                              min_cos: float | None = None,
                              bench: dict | None = None) -> list[dict[str, Any]]:
     """Enumerate every attention site and run the pure selector per site.
@@ -590,8 +719,9 @@ def discover_attention_sites(graph, *, base, quant=None,
     """
     from . import surgeon as _s
 
-    base = _coerce_base(base)
-    quant = _coerce_quant(quant) if quant is not None else None
+    base = require_enum("base", base, BasePrecision)
+    quant = require_opt("quant", quant, QuantKind)
+    gemm = require_enum("gemm", gemm, GemmKind)
     tensors = graph.tensors()
     sites: list[dict[str, Any]] = []
     consumed: set[str] = set()
@@ -663,6 +793,7 @@ def main(argv=None) -> int:
     try:
         base = _coerce_base(args.base)
         quant = _coerce_quant(args.quant) if args.quant is not None else None
+        gemm = _coerce_gemm(args.gemm)
     except ValueError as e:
         ap.error(str(e))
     scales = None
@@ -679,7 +810,7 @@ def main(argv=None) -> int:
     graph = _s.load(args.input)
     for site in discover_attention_sites(
             graph, base=base, quant=quant, scales=scales, samples=samples,
-            arch=args.arch, gemm=args.gemm, min_cos=args.min_cos):
+            arch=args.arch, gemm=gemm, min_cos=args.min_cos):
         print(f"tier{site['tier']} {site['attn']} ({site['attn_op']})"
               f" -> {site['op']} {site['fields']} cos={site['cos']}"
               f" flags={site['trt_flags']['builder']} | {site['reason']}")

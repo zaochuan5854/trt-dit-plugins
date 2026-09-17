@@ -154,7 +154,7 @@ def _build_engine(
 
 
 def run_plugin(
-    name: str,
+    name: Any,
     tensors: dict[str, Any],
     out_specs: Sequence[tuple[str, Any, tuple[int, ...]]],
     fields: dict[str, Any] | None = None,
@@ -165,6 +165,10 @@ def run_plugin(
     order — do NOT sort: positions matter, e.g. q before k).
     out_specs: [(out_name, torch dtype, shape)].
     """
+    from .select import PluginOp
+
+    if not isinstance(name, PluginOp):
+        raise TypeError(f"plugin name must be PluginOp, got {name!r}")
     import torch
 
     fields = fields or {}

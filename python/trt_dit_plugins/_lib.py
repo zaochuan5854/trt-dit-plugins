@@ -18,16 +18,18 @@ PLUGIN_VERSION = "1"
 PLUGIN_NAMESPACE = "dit-plugins"
 
 # name -> (lib file, TRT plugin name). lib resolved at load time.
+from .select import PluginOp
+
 PLUGINS = {
-    "int8_attention": "int8_attention",
-    "sage_attn": "sage_attn",
-    "fused_int8_rope_sage_attn": "fused_int8_rope_sage_attn",
-    "adaln": "adaln",
-    "rms_adaln": "rms_adaln",
-    "apply_rope": "apply_rope",
-    "rms_rope_split_half": "rms_rope_split_half",
-    "stochastic_round_fp8": "stochastic_round_fp8",
-    "block_sparse_sage2_attn": "block_sparse_sage2_attn",
+    PluginOp.INT8_ATTENTION: "int8_attention",
+    PluginOp.SAGE_ATTN: "sage_attn",
+    PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: "fused_int8_rope_sage_attn",
+    PluginOp.ADALN: "adaln",
+    PluginOp.RMS_ADALN: "rms_adaln",
+    PluginOp.APPLY_ROPE: "apply_rope",
+    PluginOp.RMS_ROPE_SPLIT_HALF: "rms_rope_split_half",
+    PluginOp.STOCHASTIC_ROUND_FP8: "stochastic_round_fp8",
+    PluginOp.BLOCK_SPARSE_SAGE2_ATTN: "block_sparse_sage2_attn",
 }
 
 # pip packages searched (first hit wins) for each dependency library.

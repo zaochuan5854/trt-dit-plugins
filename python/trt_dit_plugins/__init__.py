@@ -7,13 +7,20 @@ GPUs only for execution; import itself needs neither GPU nor torch.
 
 from . import _lib as _lib
 from ._lib import PLUGINS, ensure_loaded, libdir
+from .select import BasePrecision, GemmKind, NormKind, PluginOp, QuantKind, RopeStyle
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 __all__ = [
     "PLUGIN_VERSION",
     "PLUGINS",
     "ensure_loaded",
     "libdir",
+    "BasePrecision",
+    "GemmKind",
+    "NormKind",
+    "PluginOp",
+    "QuantKind",
+    "RopeStyle",
     "int8_attention",
     "sage_attn",
     "adaln",

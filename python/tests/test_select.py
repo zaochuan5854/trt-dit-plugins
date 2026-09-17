@@ -5,7 +5,9 @@ import numpy as np
 import pytest
 
 from trt_dit_plugins import select as C
-from trt_dit_plugins.select import BasePrecision, QuantKind
+from trt_dit_plugins.select import (
+    BasePrecision, GemmKind, NormKind, QuantKind, RopeStyle,
+)
 
 gs = pytest.importorskip("onnx_graphsurgeon")
 
@@ -13,34 +15,44 @@ F32 = np.float32
 rng = np.random.default_rng(7)
 
 
-def _compat(x=None, scale=0.02, base="bf16", min_cos=None):
+def _compat(x=None, scale=0.02, base=BasePrecision.BF16, min_cos=None):
     if x is None:
         x = rng.normal(0, 1, size=(4, 64)).astype(F32)
     return C.simulate_upcast_compat(x, scale, base=base,
                                     quant=QuantKind.INT8, min_cos=min_cos)
 
 
-def test_enum_coercion():
-    assert C.select_attention(base="BF16", S=256, D=64)["op"] == "int8_attention"
-    assert C.select_attention(base=BasePrecision.F16, S=256, D=64)["op"] == "int8_attention"
-    with pytest.raises(ValueError, match="base precision"):
+def test_enum_strict_rejects_plain_strings():
+    assert C.select_attention(base=BasePrecision.BF16, S=256, D=64)["op"] == "int8_attention"
+    with pytest.raises(TypeError, match="base must be BasePrecision"):
         C.select_attention(base="fp8", S=256, D=64)
-    with pytest.raises(ValueError, match="quant"):
-        C.select_attention(base="f16", quant="f16", S=256, D=64)
-    with pytest.raises(ValueError, match="norm"):
-        C.select_norm(base="f16", norm="alien")
+    with pytest.raises(TypeError, match="base must be BasePrecision"):
+        C.select_attention(base="BF16", S=256, D=64)
+    with pytest.raises(TypeError, match="quant must be QuantKind"):
+        C.select_attention(base=BasePrecision.F16, quant="f16", S=256, D=64)
+    with pytest.raises(TypeError, match="norm must be NormKind"):
+        C.select_norm(base=BasePrecision.F16, norm="alien")
+    with pytest.raises(TypeError, match="gemm must be GemmKind"):
+        C.select_attention(base=BasePrecision.F16, S=4096, D=128, gemm="int4")
+    with pytest.raises(TypeError, match="style must be RopeStyle"):
+        C.select_rope(base=BasePrecision.F16, style="split_half")
+    # CLI-boundary coercion still accepts strings (ValueError when unknown).
+    assert C._coerce_base("BF16") is BasePrecision.BF16
+    assert C._coerce_gemm("fp8") is GemmKind.FP8
+    with pytest.raises(ValueError, match="unknown gemm"):
+        C._coerce_gemm("int4")
 
 
 def test_fused_needs_compat_evidence():
-    no_evidence = C.select_attention(base="bf16", quant="int8", S=4096, D=128,
+    no_evidence = C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=4096, D=128,
                                      Hq=16, Hkv=16, arch="sm89", rope_fusable=True)
     assert no_evidence["op"] is None and "simulation required" in no_evidence["reason"]
-    ok = C.select_attention(base="bf16", quant="int8", S=4096, D=128,
+    ok = C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=4096, D=128,
                             Hq=16, Hkv=16, arch="sm89", rope_fusable=True,
                             compat=_compat())
     assert ok["op"] == "fused_int8_rope_sage_attn"
     assert ok["trt_flags"] == {"network": ["STRONGLY_TYPED"], "builder": []}
-    bad = C.select_attention(base="bf16", quant="int8", S=4096, D=128,
+    bad = C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=4096, D=128,
                              Hq=16, Hkv=16, arch="sm89", rope_fusable=True,
                              compat={"pass": False, "cos": 0.5, "reason": "x"})
     assert bad["op"] is None
@@ -49,12 +61,12 @@ def test_fused_needs_compat_evidence():
 def test_fused_scope_min_cos_applies_to_sim_not_table():
     # min_cos above the static table value must NOT kill fused (lossy by
     # design); it gates the measured sim cos instead.
-    assert C.select_attention(base="bf16", quant="int8", S=4096, D=128,
+    assert C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=4096, D=128,
                               Hq=16, Hkv=16, arch="sm89", rope_fusable=True,
                               min_cos=0.9995,
                               compat=_compat(min_cos=0.9995))["op"] == \
         "fused_int8_rope_sage_attn"
-    gated = C.select_attention(base="bf16", quant="int8", S=4096, D=128,
+    gated = C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=4096, D=128,
                                Hq=16, Hkv=16, arch="sm89", rope_fusable=True,
                                min_cos=0.99999,
                                compat={"pass": True, "cos": 0.9999,
@@ -63,26 +75,26 @@ def test_fused_scope_min_cos_applies_to_sim_not_table():
 
 
 def test_fused_seq_gates_and_s_bucket():
-    assert C.select_attention(base="bf16", quant="int8", S=1024, D=128,
+    assert C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=1024, D=128,
                               Hq=16, Hkv=16, arch="sm89", rope_fusable=True,
                               compat=_compat())["op"] is None
-    assert C.select_attention(base="bf16", quant="int8", S=None, D=128,
+    assert C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=None, D=128,
                               Hq=16, Hkv=16, arch="sm89", rope_fusable=True,
                               compat=_compat())["op"] is None
-    assert C.select_attention(base="bf16", quant="int8", S=9217, D=128,
+    assert C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=9217, D=128,
                               Hq=16, Hkv=16, arch="sm89", rope_fusable=True,
                               compat=_compat())["op"] is None
-    assert C.select_attention(base="bf16", quant="int8", S=2048, D=64,
+    assert C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=2048, D=64,
                               Hq=16, Hkv=16, arch="sm89", rope_fusable=True,
                               compat=_compat())["op"] is None
     # S-bucket: exact points report their own cos, unmeasured S is conservative.
-    assert C.select_attention(base="bf16", quant="int8", S=4096, D=128,
+    assert C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=4096, D=128,
                               Hq=16, Hkv=16, arch="sm89", rope_fusable=True,
                               compat=_compat())["cos"] == pytest.approx(0.99855)
-    assert C.select_attention(base="bf16", quant="int8", S=2048, D=128,
+    assert C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=2048, D=128,
                               Hq=16, Hkv=16, arch="sm89", rope_fusable=True,
                               compat=_compat())["cos"] == pytest.approx(0.9977)
-    assert C.select_attention(base="bf16", quant="int8", S=3000, D=128,
+    assert C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=3000, D=128,
                               Hq=16, Hkv=16, arch="sm89", rope_fusable=True,
                               compat=_compat())["cos"] == pytest.approx(0.9977)
 
@@ -95,73 +107,73 @@ def test_known_bad_regressions():
 
 
 def test_dense_float_prefers_int8_static():
-    r = C.select_attention(base="f16", S=4096, D=128, Hq=16, Hkv=16, arch="sm89")
+    r = C.select_attention(base=BasePrecision.F16, S=4096, D=128, Hq=16, Hkv=16, arch="sm89")
     assert r["op"] == "int8_attention"
 
 
 def test_gqa_routes_to_sage():
-    r = C.select_attention(base="bf16", S=256, D=128, Hq=4, Hkv=2, arch="sm90")
+    r = C.select_attention(base=BasePrecision.BF16, S=256, D=128, Hq=4, Hkv=2, arch="sm90")
     assert r["op"] == "sage_attn" and r["fields"] == {}
-    bad = C.select_attention(base="bf16", S=256, D=128, Hq=4, Hkv=3, arch="sm90")
+    bad = C.select_attention(base=BasePrecision.BF16, S=256, D=128, Hq=4, Hkv=3, arch="sm90")
     assert bad["op"] is None
 
 
 def test_causal_and_mask_fall_to_native():
-    r = C.select_attention(base="f16", S=4096, D=128, causal=True)
+    r = C.select_attention(base=BasePrecision.F16, S=4096, D=128, causal=True)
     assert r["op"] is None and r["trt_flags"]["builder"] == ["FP16"]
-    m = C.select_attention(base="f16", S=256, D=64, has_mask=True)
+    m = C.select_attention(base=BasePrecision.F16, S=256, D=64, has_mask=True)
     assert m["op"] is None
 
 
 def test_sparse_needs_block_mask_and_sm89():
-    ok = C.select_attention(base="f16", S=4096, D=128, Hq=8, Hkv=8,
+    ok = C.select_attention(base=BasePrecision.F16, S=4096, D=128, Hq=8, Hkv=8,
                             arch="sm89", sparse_mask=True)
     assert ok["op"] == "block_sparse_sage2_attn"
-    off = C.select_attention(base="f16", S=4096, D=128, arch="sm100",
+    off = C.select_attention(base=BasePrecision.F16, S=4096, D=128, arch="sm100",
                              sparse_mask=True)
     assert off["op"] == "int8_attention"
-    odd = C.select_attention(base="f16", S=100, D=128, arch="sm89",
+    odd = C.select_attention(base=BasePrecision.F16, S=100, D=128, arch="sm89",
                              sparse_mask=True)
     assert odd["op"] == "int8_attention"
 
 
 def test_quant_inputs_go_native_with_combined_flags():
-    f = C.select_attention(base="f16", quant="fp8", S=4096, D=128, arch="sm89")
+    f = C.select_attention(base=BasePrecision.F16, quant=QuantKind.FP8, S=4096, D=128, arch="sm89")
     assert f["op"] is None
     assert f["trt_flags"] == {"network": ["STRONGLY_TYPED"],
                               "builder": ["FP16", "FP8"]}
-    i = C.select_attention(base="bf16", quant="int8", S=4096, D=128, arch="sm89")
+    i = C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=4096, D=128, arch="sm89")
     assert i["op"] is None and i["trt_flags"]["builder"] == ["BF16", "INT8"]
 
 
 def test_gemm_pins():
-    pv = C.select_attention(base="f16", S=4096, D=128, Hq=8, Hkv=8,
-                            arch="sm89", gemm="fp8")
+    pv = C.select_attention(base=BasePrecision.F16, S=4096, D=128, Hq=8, Hkv=8,
+                            arch="sm89", gemm=GemmKind.FP8)
     assert pv["op"] == "sage_attn" and pv["fields"] == {"fp8_pv": 1}
-    no_pv = C.select_attention(base="f16", S=4096, D=128, Hq=8, Hkv=8,
-                               arch="sm90", gemm="fp8")
+    no_pv = C.select_attention(base=BasePrecision.F16, S=4096, D=128, Hq=8, Hkv=8,
+                               arch="sm90", gemm=GemmKind.FP8)
     assert no_pv["op"] is None and "FP8" in no_pv["trt_flags"]["builder"]
-    plain = C.select_attention(base="f16", S=4096, D=128, Hq=8, Hkv=8,
-                               arch="sm89", gemm="fp16")
+    plain = C.select_attention(base=BasePrecision.F16, S=4096, D=128, Hq=8, Hkv=8,
+                               arch="sm89", gemm=GemmKind.FP16)
     assert plain["op"] is None and plain["trt_flags"]["builder"] == ["FP16"]
-    with pytest.raises(ValueError, match="gemm"):
-        C.select_attention(base="f16", S=4096, D=128, gemm="int4")
+    with pytest.raises(TypeError, match="gemm must be GemmKind"):
+        C.select_attention(base=BasePrecision.F16, S=4096, D=128, gemm="int4")
 
 
 def test_min_cos_gates_quant_class_only():
-    assert C.select_attention(base="f16", S=4096, D=128, Hq=8, Hkv=8,
+    assert C.select_attention(base=BasePrecision.F16, S=4096, D=128, Hq=8, Hkv=8,
                               arch="sm89", min_cos=0.9995)["op"] == "int8_attention"
-    assert C.select_attention(base="f16", S=4096, D=128, Hq=8, Hkv=8,
+    assert C.select_attention(base=BasePrecision.F16, S=4096, D=128, Hq=8, Hkv=8,
                               arch="sm89", min_cos=0.99995)["op"] is None
 
 
 def test_bench_override_and_incomplete_table():
     full = {("int8_attention", 4096, 128, 8, 8, 89): 0.9,
             ("sage_attn", 4096, 128, 8, 8, 89): 0.5}
-    assert C.select_attention(base="f16", S=4096, D=128, Hq=8, Hkv=8,
+    assert C.select_attention(base=BasePrecision.F16, S=4096, D=128, Hq=8, Hkv=8,
                               arch="sm89", bench=full)["op"] == "sage_attn"
     partial = {("sage_attn", 4096, 128, 8, 8, 89): 0.5}
-    assert C.select_attention(base="f16", S=4096, D=128, Hq=8, Hkv=8,
+    assert C.select_attention(base=BasePrecision.F16, S=4096, D=128, Hq=8, Hkv=8,
                               arch="sm89", bench=partial)["op"] == "int8_attention"
 
 
@@ -169,59 +181,59 @@ def test_bench_key_includes_heads():
     # MHA entry must not leak into a GQA query: miss -> static rank (sage).
     mha_only = {("int8_attention", 4096, 128, 8, 8, 89): 0.9,
                 ("sage_attn", 4096, 128, 8, 8, 89): 0.5}
-    r = C.select_attention(base="f16", S=4096, D=128, Hq=8, Hkv=2,
+    r = C.select_attention(base=BasePrecision.F16, S=4096, D=128, Hq=8, Hkv=2,
                            arch="sm89", bench=mha_only)
     assert r["op"] == "sage_attn" and "static rank" in r["reason"]
     # legacy 4-tuple keys fail fast instead of silently missing.
     with pytest.raises(ValueError, match=r"\(op, S, D, Hq, Hkv, arch\)"):
-        C.select_attention(base="f16", S=4096, D=128, Hq=8, Hkv=8,
+        C.select_attention(base=BasePrecision.F16, S=4096, D=128, Hq=8, Hkv=8,
                            arch="sm89",
                            bench={("sage_attn", 4096, 128, 89): 0.5})
 
 
 def test_arch_optional_defaults_to_unknown():
-    r = C.select_attention(base="bf16", quant="int8", S=4096, D=128,
+    r = C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=4096, D=128,
                            Hq=16, Hkv=16, rope_fusable=True, compat=_compat())
     assert r["op"] == "fused_int8_rope_sage_attn"
-    s = C.select_attention(base="f16", S=4096, D=128, Hq=8, Hkv=8,
+    s = C.select_attention(base=BasePrecision.F16, S=4096, D=128, Hq=8, Hkv=8,
                            sparse_mask=True)
     assert s["op"] == "int8_attention"
 
 
 def test_norm_and_rope():
-    assert C.select_norm(base="f16", norm="rms")["op"] == "rms_adaln"
-    assert C.select_norm(base="bf16", norm="layer")["op"] == "adaln"
-    qn = C.select_norm(base="f16", quant="int8", norm="rms")
+    assert C.select_norm(base=BasePrecision.F16, norm=NormKind.RMS)["op"] == "rms_adaln"
+    assert C.select_norm(base=BasePrecision.BF16, norm=NormKind.LAYER)["op"] == "adaln"
+    qn = C.select_norm(base=BasePrecision.F16, quant=QuantKind.INT8, norm=NormKind.RMS)
     assert qn["op"] is None and qn["trt_flags"]["builder"] == ["FP16", "INT8"]
-    r = C.select_rope(base="f16", style="split-half", fuse_norm=True,
+    r = C.select_rope(base=BasePrecision.F16, style=RopeStyle.SPLIT_HALF, fuse_norm=True,
                       D=128, has_scales=True)
     assert r["op"] == "rms_rope_split_half"
-    assert C.select_rope(base="f16", style="split-half", fuse_norm=True,
+    assert C.select_rope(base=BasePrecision.F16, style=RopeStyle.SPLIT_HALF, fuse_norm=True,
                          D=128)["op"] is None
-    assert C.select_rope(base="bf16", style="interleaved")["op"] == "apply_rope"
-    assert C.select_rope(base="bf16", quant="fp8", style="interleaved")["op"] is None
+    assert C.select_rope(base=BasePrecision.BF16, style=RopeStyle.INTERLEAVED)["op"] == "apply_rope"
+    assert C.select_rope(base=BasePrecision.BF16, quant=QuantKind.FP8, style=RopeStyle.INTERLEAVED)["op"] is None
 
 
 def test_sim_int8_roundtrip():
     x = rng.normal(0, 0.5, size=(8, 128)).astype(F32)
-    r = C.simulate_upcast_compat(x, 0.02, base="bf16", quant="int8")
+    r = C.simulate_upcast_compat(x, 0.02, base=BasePrecision.BF16, quant=QuantKind.INT8)
     assert r["pass"] and r["cos"] > 0.999 and r["saturation"] == 0.0
     # saturation is reported, not fatal without a bar.
     wide = C.simulate_upcast_compat(np.full((4, 8), 10.0, F32), 0.01,
-                                    base="f32", quant="int8")
+                                    base=BasePrecision.F32, quant=QuantKind.INT8)
     assert wide["saturation"] > 0.0 and wide["pass"]
     nan = C.simulate_upcast_compat(np.full((2, 4), np.nan, dtype=F32), 0.02,
-                                   base="f32", quant="int8")
+                                   base=BasePrecision.F32, quant=QuantKind.INT8)
     assert not nan["pass"] and "finite" in nan["reason"]
     with pytest.raises(ValueError, match="positive"):
-        C.simulate_upcast_compat(x, 0.0, base="f32", quant="int8")
+        C.simulate_upcast_compat(x, 0.0, base=BasePrecision.F32, quant=QuantKind.INT8)
     with pytest.raises(ValueError, match="scalar"):
-        C.simulate_upcast_compat(x, [0.02, 0.03], base="f32", quant="int8")
+        C.simulate_upcast_compat(x, [0.02, 0.03], base=BasePrecision.F32, quant=QuantKind.INT8)
 
 
 def test_sim_e4m3_runs():
     x = (rng.normal(0, 0.3, size=(8, 64))).astype(F32)
-    r = C.simulate_upcast_compat(x, 0.05, base="f16", quant="fp8")
+    r = C.simulate_upcast_compat(x, 0.05, base=BasePrecision.F16, quant=QuantKind.FP8)
     assert r["pass"] and r["cos"] > 0.99
     # E4M3 code bounds: max representable is 448.
     q = C._e4m3_nearest(np.array([1000.0, -1000.0, 0.0]))
@@ -277,13 +289,13 @@ def _calib():
 def test_discover_all_tiers():
     sc, sa = _calib()
     sites = {s["attn"]: s for s in C.discover_attention_sites(
-        _site_graph(), base="bf16", arch="sm89", scales=sc, samples=sa)}
+        _site_graph(), base=BasePrecision.BF16, arch="sm89", scales=sc, samples=sa)}
     t1 = next(s for k, s in sites.items() if s["tier"] == 1)
     assert t1["op"] == "fused_int8_rope_sage_attn"
     assert sites["gqa0"]["tier"] == 2 and sites["gqa0"]["op"] == "sage_attn"
     assert sites["done0"]["tier"] == 3 and sites["done0"]["op"] == "int8_attention"
     # samples missing -> Tier1 pair reports native (simulation required).
-    sites2 = C.discover_attention_sites(_site_graph(), base="bf16",
+    sites2 = C.discover_attention_sites(_site_graph(), base=BasePrecision.BF16,
                                         arch="sm89", scales=sc)
     assert all(s["op"] != "fused_int8_rope_sage_attn" for s in sites2)
     t1b = next(s for s in sites2 if s["tier"] == 1)
@@ -311,3 +323,18 @@ def test_cli_dry_run(tmp_path, capsys):
     assert "tier2" in out and "tier3" in out
     # read-only: input untouched (still the 2 pre-existing plugin nodes).
     assert S.summarize(S.load(str(src)))["total"] == 2
+
+
+def test_plugin_op_enum_is_str_compatible():
+    import json
+
+    import trt_dit_plugins as P
+    assert P.PluginOp.SAGE_ATTN == "sage_attn"
+    assert str(P.PluginOp.FUSED_INT8_ROPE_SAGE_ATTN) == "fused_int8_rope_sage_attn"
+    assert f"{P.PluginOp.RMS_ROPE_SPLIT_HALF}" == "rms_rope_split_half"
+    assert json.dumps({"op": P.PluginOp.INT8_ATTENTION}) == '{"op": "int8_attention"}'
+    assert hash(P.PluginOp.SAGE_INT8_LEGACY) == hash("SageInt8Attn")
+    assert {"sage_attn": 1}[P.PluginOp.SAGE_ATTN] == 1
+    from trt_dit_plugins.select import _coerce_base
+    assert _coerce_base("bfloat16") is P.BasePrecision.BF16
+    assert _coerce_base(P.BasePrecision.F16) is P.BasePrecision.F16

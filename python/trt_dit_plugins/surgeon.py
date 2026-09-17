@@ -37,6 +37,8 @@ import itertools
 from collections import deque
 from typing import Any
 
+from .select import BasePrecision, GemmKind, PluginOp, require_enum
+
 PLUGIN_DOMAIN = "dit-plugins"
 PLUGIN_VERSION = "1"
 PLUGIN_NAMESPACE = "dit-plugins"
@@ -48,15 +50,15 @@ _uid = itertools.count()
 # op -> (n_inputs, n_outputs, field names). Ranks/shapes are checked in
 # validate_plugin_nodes where statically known; dtypes resolve at TRT build.
 _SPECS: dict[str, tuple[int, int, frozenset[str]]] = {
-    "int8_attention": (3, 1, frozenset()),
-    "sage_attn": (3, 1, frozenset({"fp8_pv"})),
-    "adaln": (3, 1, frozenset({"eps"})),
-    "rms_adaln": (3, 1, frozenset({"eps"})),
-    "apply_rope": (3, 2, frozenset()),
-    "rms_rope_split_half": (5, 2, frozenset({"epsilon", "rot_dim"})),
-    "stochastic_round_fp8": (2, 1, frozenset({"alias_rng"})),
-    "block_sparse_sage2_attn": (4, 1, frozenset({"scale", "pvthreshd", "attention_sink"})),
-    "fused_int8_rope_sage_attn": (9, 1, frozenset()),
+    PluginOp.INT8_ATTENTION: (3, 1, frozenset()),
+    PluginOp.SAGE_ATTN: (3, 1, frozenset({"fp8_pv"})),
+    PluginOp.ADALN: (3, 1, frozenset({"eps"})),
+    PluginOp.RMS_ADALN: (3, 1, frozenset({"eps"})),
+    PluginOp.APPLY_ROPE: (3, 2, frozenset()),
+    PluginOp.RMS_ROPE_SPLIT_HALF: (5, 2, frozenset({"epsilon", "rot_dim"})),
+    PluginOp.STOCHASTIC_ROUND_FP8: (2, 1, frozenset({"alias_rng"})),
+    PluginOp.BLOCK_SPARSE_SAGE2_ATTN: (4, 1, frozenset({"scale", "pvthreshd", "attention_sink"})),
+    PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: (9, 1, frozenset()),
 }
 
 
@@ -90,7 +92,7 @@ def _plugin_node(graph, op: str, inputs, outputs, fields: dict[str, Any] | None 
 
 def add_int8_attention(graph, q, k, v, name=None):
     """q,k,v: [B,H,S,D] variables. Returns o (same shape/dtype as q)."""
-    return _plugin_node(graph, "int8_attention", [q, k, v], [_like(q)], name=name).outputs[0]
+    return _plugin_node(graph, PluginOp.INT8_ATTENTION, [q, k, v], [_like(q)], name=name).outputs[0]
 
 
 def add_sage_attn(graph, q, k, v, fp8_pv=False, name=None):
@@ -98,7 +100,7 @@ def add_sage_attn(graph, q, k, v, fp8_pv=False, name=None):
     (GQA: Hq % Hkv == 0 allowed). fp8_pv opts into the FP8-PV dense Sage2
     path (sm89-only, validated at build). Returns o (same shape as q)."""
     fields = {"fp8_pv": int(bool(fp8_pv))} if fp8_pv else None
-    return _plugin_node(graph, "sage_attn", [q, k, v], [_like(q)], fields, name=name).outputs[0]
+    return _plugin_node(graph, PluginOp.SAGE_ATTN, [q, k, v], [_like(q)], fields, name=name).outputs[0]
 
 
 def _add_adaln(op, graph, x, scale, shift, eps=1e-6, name=None):
@@ -108,39 +110,39 @@ def _add_adaln(op, graph, x, scale, shift, eps=1e-6, name=None):
 
 def add_adaln(graph, x, scale, shift, eps=1e-6, name=None):
     """Fused LayerNorm AdaLN: layernorm(x) * (1 + scale) + shift."""
-    return _add_adaln("adaln", graph, x, scale, shift, eps, name)
+    return _add_adaln(PluginOp.ADALN, graph, x, scale, shift, eps, name)
 
 
 def add_rms_adaln(graph, x, scale, shift, eps=1e-6, name=None):
     """Fused RMSNorm AdaLN: rmsnorm(x) * (1 + scale) + shift."""
-    return _add_adaln("rms_adaln", graph, x, scale, shift, eps, name)
+    return _add_adaln(PluginOp.RMS_ADALN, graph, x, scale, shift, eps, name)
 
 
 def add_apply_rope(graph, q, k, f, name=None):
     """q,k: [B,H,S,D]; f: [fb,f1,f2,D/2,2,2]. Returns (qo, ko)."""
     outs = [_like(q), _like(k)]
-    _plugin_node(graph, "apply_rope", [q, k, f], outs, name=name)
+    _plugin_node(graph, PluginOp.APPLY_ROPE, [q, k, f], outs, name=name)
     return outs[0], outs[1]
 
 
 def add_rms_rope_split_half(graph, q, k, f, qs, ks, epsilon=1e-6, rot_dim=0, name=None):
     """qs,ks: [D] scales. Returns (qo, ko). rot_dim=0 means full D."""
     outs = [_like(q), _like(k)]
-    _plugin_node(graph, "rms_rope_split_half", [q, k, f, qs, ks], outs,
+    _plugin_node(graph, PluginOp.RMS_ROPE_SPLIT_HALF, [q, k, f, qs, ks], outs,
                  {"epsilon": float(epsilon), "rot_dim": int(rot_dim)}, name=name)
     return outs[0], outs[1]
 
 
 def add_stochastic_round_fp8(graph, x, r, alias_rng=0, name=None):
     """x: any float; r: INT32 same numel. Output dtype resolves to FP8 at TRT build."""
-    return _plugin_node(graph, "stochastic_round_fp8", [x, r], [_like(x)],
+    return _plugin_node(graph, PluginOp.STOCHASTIC_ROUND_FP8, [x, r], [_like(x)],
                         {"alias_rng": int(alias_rng)}, name=name).outputs[0]
 
 
 def add_block_sparse_sage2_attn(graph, q, k, v, m, scale=0.0, pvthreshd=50.0,
                                 attention_sink=0, name=None):
     """m: INT32 [B,H,S//128,S//64]. scale=0 selects 1/sqrt(D)."""
-    return _plugin_node(graph, "block_sparse_sage2_attn", [q, k, v, m], [_like(q)],
+    return _plugin_node(graph, PluginOp.BLOCK_SPARSE_SAGE2_ATTN, [q, k, v, m], [_like(q)],
                         {"scale": float(scale), "pvthreshd": float(pvthreshd),
                          "attention_sink": int(attention_sink)}, name=name).outputs[0]
 
@@ -157,7 +159,7 @@ def add_dit_self_fused_attn(graph, q_i8, q_scale, k_i8, k_scale, v_i8,
     dtype object); default keeps the q_i8 dtype, which mistypes the output
     for ORT/shape-inference (TRT itself takes BF16 from the plugin).
     """
-    return _plugin_node(graph, "fused_int8_rope_sage_attn",
+    return _plugin_node(graph, PluginOp.FUSED_INT8_ROPE_SAGE_ATTN,
                         [q_i8, q_scale, k_i8, k_scale, v_i8, v_scale, rms_w_q,
                          rms_w_k, inv_freq],
                         [_like(q_i8, dtype=out_dtype)], name=name).outputs[0]
@@ -201,7 +203,7 @@ def fuse_dit_self_attn_block(graph, *, q_i8, q_scale, k_i8, k_scale, v_i8,
     if len(prods) != 1:
         raise ValueError(f"{attn_out}: want 1 producer, got {len(prods)}")
     attn = prods[0]
-    if attn.op not in ("SageInt8Attn", "Attention"):
+    if attn.op not in (PluginOp.SAGE_INT8_LEGACY, "Attention"):
         raise ValueError(f"{attn_out}: producer must be SageInt8Attn/Attention, "
                          f"got {attn.op!r}")
     if len(attn.inputs) != 3:
@@ -211,14 +213,15 @@ def fuse_dit_self_attn_block(graph, *, q_i8, q_scale, k_i8, k_scale, v_i8,
     if not rq.inputs or not rk.inputs or rq.inputs[0] is not rk.inputs[0]:
         raise ValueError(f"{attn_out}: Q/K must share one rms_rope_split_half node")
     rope = rq.inputs[0]
-    if rope.op != "rms_rope_split_half":
+    if rope.op != PluginOp.RMS_ROPE_SPLIT_HALF:
         raise ValueError(f"{attn_out}: Q/K producer must be rms_rope_split_half, "
                          f"got {rope.op!r}")
     # out_var itself becomes the plugin output: the tensor name (and any
     # graph.outputs membership / downstream consumers) is preserved, so
-    # I/O bindings by name keep working. Detach the old producer; cleanup
-    # prunes the now-unreachable attn/rope chain consistently.
-    node = _plugin_node(graph, "fused_int8_rope_sage_attn", anchor_vars,
+    # I/O bindings by name keep working. Detach the old producer; the
+    # caller prunes afterwards (per-fuse cleanup would delete other
+    # blocks' not-yet-consumed anchors, breaking multi-block fusion).
+    node = _plugin_node(graph, PluginOp.FUSED_INT8_ROPE_SAGE_ATTN, anchor_vars,
                         [out_var], name=name or f"fused_{attn_out}")
     if node not in out_var.inputs:
         out_var.inputs.append(node)
@@ -226,7 +229,6 @@ def fuse_dit_self_attn_block(graph, *, q_i8, q_scale, k_i8, k_scale, v_i8,
         out_var.inputs.remove(attn)
     if out_var in attn.outputs:
         attn.outputs.remove(out_var)
-    graph.cleanup().toposort()
     return node
 
 
@@ -237,8 +239,8 @@ def fuse_dit_self_attn_block(graph, *, q_i8, q_scale, k_i8, k_scale, v_i8,
 # from baked freqs, create QuantizeLinear anchors from calibrated scales,
 # then delegate the fusion itself to fuse_dit_self_attn_block.
 
-_ROPE_OP = "rms_rope_split_half"
-_LEGACY_ATTN_OPS = ("SageInt8Attn", "Attention")
+_ROPE_OP = PluginOp.RMS_ROPE_SPLIT_HALF
+_LEGACY_ATTN_OPS = (PluginOp.SAGE_INT8_LEGACY, "Attention")
 # Truth: the fused kernel only implements the L>1024 path (validator gate).
 _FUSED_MIN_S = 1024
 
@@ -417,14 +419,13 @@ def quantize_dit_self_anchors(graph, scales: dict[str, float]) -> dict[str, Any]
     :func:`discover_dit_self_blocks`) to the per-tensor FP32 INT8 scale.
     Per anchored block this appends three ``QuantizeLinear`` nodes (INT8,
     symmetric, no zero-point) plus FP32 scalar scale constants, and creates
-    one shared ``[64]`` ``inv_freq`` constant derived from the first
-    anchored block's baked freqs (blocks in practice share one capture; a
+    one shared ``[64]`` ``    inv_freq`` constant derived from the first anchored block's baked freqs (blocks in practice share one capture; a
     differing block would silently reuse the first vector).
 
     The shared inv constant is born orphan (invisible to ``tensors()``), so
     a transient carrier ``Identity`` is appended to make it discoverable;
-    :func:`fuse_dit_self_attn_block`'s cleanup prunes the carrier while the
-    fused node keeps the constant. Do not run a standalone cleanup between
+    the caller's post-fusion cleanup prunes the carrier while the fused
+    node keeps the constant. Do not run a standalone cleanup between
     this function and the fusion.
 
     Anchor names follow :func:`fuse_dit_self_attn_block` kwargs verbatim.
@@ -496,6 +497,8 @@ def apply_dit_self_fused(graph, scales: dict[str, float]) -> dict[str, Any]:
     for attn_out, a in q["anchors"].items():
         fuse_dit_self_attn_block(graph, attn_out=attn_out, **a)
     applied = len(q["anchors"])
+    if applied:
+        graph.cleanup().toposort()
     return {"applied": applied, "skipped": len(blocks) - applied,
             "by_reason": by_reason}
 
@@ -589,7 +592,7 @@ def fuse_rope_blocks(graph, fq, epsilon: float = 1e-6, rot_dim: int = 0) -> int:
     return n_done
 
 
-def apply_sage_attention(graph) -> int:
+def apply_sage_attention(graph, only: set[str] | None = None) -> int:
     """Replace ``Attention`` nodes with ``SageInt8Attn`` in place.
 
     This targets the legacy ``sage_attn_plugin.so`` op (empty namespace),
@@ -599,11 +602,15 @@ def apply_sage_attention(graph) -> int:
     and reads head counts from Q/K/V shapes; the only semantic variant
     (causal mask) is rejected below, so default-scale non-causal
     ``Attention`` is a numerical drop-in. Guards: exactly 3 inputs,
-    1 output, non-causal. Returns the converted count; raises on zero.
+    1 output, non-causal. ``only`` restricts conversion to named nodes
+    (the unified entry uses it for per-site verdicts). Returns the
+    converted count; raises on zero.
     """
     n = 0
     for node in graph.nodes:
         if node.op != "Attention":
+            continue
+        if only is not None and node.name not in only:
             continue
         if len(node.inputs) != 3:
             raise ValueError(f"sage surgery: Attention {node.name} has "
@@ -613,14 +620,204 @@ def apply_sage_attention(graph) -> int:
                              f"{len(node.outputs)} outputs")
         if int(node.attrs.get("is_causal", 0)) != 0:
             raise RuntimeError("sage surgery: causal mask unsupported")
-        node.op = "SageInt8Attn"
+        node.op = PluginOp.SAGE_INT8_LEGACY
         node.attrs.clear()
         if node.name:
             node.name += "_sage"
         n += 1
     if n == 0:
-        raise RuntimeError("sage surgery matched 0 Attention nodes")
+        scope = f" of {len(only)} requested" if only is not None else ""
+        raise RuntimeError(f"sage surgery matched 0 Attention nodes{scope}")
     return n
+
+
+# New-lib ``sage_attn`` is not yet E2E-proven as a SageInt8Attn drop-in and
+# no ``int8_attention`` creator ships in the lib yet: selector verdicts for
+# either emit the legacy op until validation lands (one-line change here).
+_SAGE_PIN = (PluginOp.SAGE_INT8_LEGACY, "pinned: new-lib sage_attn/int8_attention "
+             "await E2E validation")
+
+
+def _infer_base(graph) -> BasePrecision:
+    """First Attention Q dtype; BasePrecision.BF16 when unknown."""
+    for node in graph.nodes:
+        if node.op == "Attention" and node.inputs:
+            s = str(getattr(node.inputs[0], "dtype", "")).lower()
+            if "float16" in s:
+                return BasePrecision.F16
+            if "float32" in s and "bfloat" not in s:
+                return BasePrecision.F32
+            return BasePrecision.BF16
+    return BasePrecision.BF16
+
+
+def _local_arch() -> str | None:
+    """'smXY' of the local GPU; None without torch/CUDA (arch gates stay shut)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            return f"sm{major}{minor}"
+    except Exception:
+        pass
+    return None
+
+
+def apply_attention_plugins(graph, *, base: BasePrecision | None = None,
+                            scales: dict[str, float] | None = None,
+                            samples: dict[str, Any] | None = None,
+                            arch: str | None = None,
+                            gemm: GemmKind = GemmKind.AUTO,
+                            dry_run: bool = False) -> dict[str, Any]:
+    """Unified attention-plugin entry: decide per site, rewrite, report.
+
+    This owns the kernel choice (fused vs sage vs native); callers only
+    switch attention plugins on/off and pass calibration data. Per site:
+
+    - Tier1 (rope-fused DiT-self block, scales cover q/k/v): strict
+      selector verdict with ``samples`` evidence, else the experimental
+      no-samples path (static S/D/spec-floor gates, reported as such).
+    - Tier2 (plain ``Attention``): selector verdict mapped through
+      :data:`_SAGE_PIN`; already-converted ``SageInt8Attn`` is kept.
+    - Tier3 (``dit-plugins`` nodes) and native verdicts: untouched.
+
+    Never raises on zero matches (check ``applied``); per-site structural
+    errors (mask inputs, causal) still raise. ``dry_run`` decides without
+    mutating. ``base``/``gemm`` take Enum members only (plain strings raise
+    ``TypeError``); ``base`` is inferred from the graph when omitted.
+    Returns ``{"applied": {op: n}, "native": n, "sites": [...],
+    "base": ..., "arch": ..., "dry_run": bool}``.
+    """
+    from . import select as _sel
+    scales = dict(scales or {})
+    samples = dict(samples or {})
+    if base is None:
+        base = _infer_base(graph)
+    else:
+        base = require_enum("base", base, BasePrecision)
+    gemm = require_enum("gemm", gemm, GemmKind)
+    if arch is None:
+        arch = _local_arch()
+    sites = _sel.discover_attention_sites(
+        graph, base=base, scales=scales or None,
+        samples=samples or None, arch=arch, gemm=gemm)
+    by_attn = {s["attn"]: s for s in sites}
+    applied: dict[str, int] = {}
+    out_sites: list[dict[str, Any]] = []
+    fused_blocks: list[dict[str, Any]] = []
+    sage_only: set[str] = set()
+    tier1_seen: set[str] = set()
+    # Per-site fused opt-out reasons (structural N/A + Tier1 rejects) travel
+    # into Tier2 entries: the old by_reason visibility, now per site.
+    no_fuse = {b["attn"]: f"fused N/A ({b['reason']})"
+               for b in discover_dit_self_blocks(graph)
+               if not b.get("eligible") and b.get("attn")}
+
+    tensors = graph.tensors()
+    for b in discover_dit_self_blocks(graph):
+        if not b["eligible"] or not _block_scales_ok(b, scales):
+            continue
+        tier1_seen.add(b["attn"])
+        s = by_attn.get(b["attn"])
+        verdict = (s or {}).get("op")
+        if verdict == PluginOp.FUSED_INT8_ROPE_SAGE_ATTN:
+            fused_blocks.append(b)
+            out_sites.append({"attn": b["attn"], "tier": 1,
+                              "selected": verdict, "emitted": verdict,
+                              "reason": (s or {}).get("reason", "")})
+            continue
+        dims = _dims(tensors.get(b["q"]))
+        ok, why = _sel.fused_static_ok(
+            S=dims[2] if dims else None, D=dims[3] if dims else None)
+        if ok and gemm in (GemmKind.AUTO, GemmKind.INT8):
+            fused_blocks.append(b)
+            out_sites.append({"attn": b["attn"], "tier": 1,
+                              "selected": PluginOp.FUSED_INT8_ROPE_SAGE_ATTN,
+                              "emitted": PluginOp.FUSED_INT8_ROPE_SAGE_ATTN,
+                              "reason": f"experimental no-samples: {why}"})
+        else:
+            # Native for the fused verdict; the node stays a Tier2
+            # candidate below, which owns the report entry (the fused
+            # rejection reason travels along for debuggability).
+            rej = (s or {}).get("reason", "") if samples \
+                else f"experimental: {why}"
+            no_fuse[b["attn"]] = f"fused rejected ({rej})"
+            continue
+
+    fused_attn = {b["attn"] for b in fused_blocks}
+
+    def _note(attn: str, reason: str) -> str:
+        extra = no_fuse.get(attn)
+        return f"{reason} [{extra}]" if extra else reason
+
+    for node in graph.nodes:
+        if node.op == PluginOp.SAGE_INT8_LEGACY and node.name not in fused_attn:
+            out_sites.append({"attn": node.name, "tier": 2,
+                              "selected": PluginOp.SAGE_INT8_LEGACY,
+                              "emitted": PluginOp.SAGE_INT8_LEGACY,
+                              "reason": _note(node.name,
+                                              "already converted: keep")})
+            continue
+        if node.op != "Attention" or node.name in fused_attn:
+            continue
+        if node.name in tier1_seen:
+            # Tier1-consumed but unfused: fresh Tier2-view select (float
+            # inputs), not the Tier1 INT8 verdict.
+            ins = node.inputs
+            q = ins[0] if len(ins) > 0 else None
+            k = ins[1] if len(ins) > 1 else None
+            qd = _dims(q)
+            kd = _dims(k)
+            s = _sel.select_attention(
+                base=base, S=qd[2] if qd else None, D=qd[3] if qd else None,
+                Hq=qd[1] if qd else None, Hkv=kd[1] if kd else None,
+                arch=arch,
+                causal=bool(int((node.attrs or {}).get("is_causal", 0))),
+                has_mask=len(ins) > 3, gemm=gemm)
+        else:
+            s = by_attn.get(node.name, {})
+        verdict = s.get("op")
+        if verdict in (PluginOp.SAGE_ATTN, PluginOp.INT8_ATTENTION):
+            sage_only.add(node.name)
+            out_sites.append({"attn": node.name, "tier": 2,
+                              "selected": verdict,
+                              "emitted": _SAGE_PIN[0],
+                              "reason": _note(node.name,
+                                              f"{s.get('reason', '')} "
+                                              f"[{_SAGE_PIN[1]}]")})
+        else:
+            out_sites.append({"attn": node.name, "tier": 2,
+                              "selected": verdict, "emitted": None,
+                              "reason": _note(node.name,
+                                              s.get("reason", "native"))})
+
+    for s in sites:
+        if s["tier"] == 3:
+            out_sites.append({"attn": s["attn"], "tier": 3,
+                              "selected": s["op"], "emitted": s["op"],
+                              "reason": s["reason"]})
+
+    if not dry_run:
+        if fused_blocks:
+            sub = {e: scales[e] for b in fused_blocks
+                   for e in (b["q"], b["k"], b["v"])}
+            q = quantize_dit_self_anchors(graph, sub)
+            for attn_out, a in q["anchors"].items():
+                fuse_dit_self_attn_block(graph, attn_out=attn_out, **a)
+            applied["fused_int8_rope_sage_attn"] = len(q["anchors"])
+            graph.cleanup().toposort()
+        if sage_only:
+            applied[_SAGE_PIN[0]] = apply_sage_attention(graph, only=sage_only)
+    else:
+        if fused_blocks:
+            applied[PluginOp.FUSED_INT8_ROPE_SAGE_ATTN] = len(fused_blocks)
+        if sage_only:
+            applied[_SAGE_PIN[0]] = len(sage_only)
+    native = sum(1 for s in out_sites if s["emitted"] is None
+                 and not any(o["attn"] == s["attn"] and o["emitted"]
+                             for o in out_sites))
+    return {"applied": applied, "native": native, "sites": out_sites,
+            "base": base, "arch": arch, "dry_run": dry_run}
 
 
 # --- explicit fusion + retarget ---
@@ -633,15 +830,17 @@ def _last_dim(t):
 
 
 def fuse_norm_affine(graph, *, norm: str, scale: str, shift: str, out: str,
-                     plugin: str = "adaln", eps: float = 1e-6):
+                     plugin: str | PluginOp = PluginOp.ADALN,
+                     eps: float = 1e-6):
     """Replace ``norm*(1+scale)+shift`` ending at tensor ``out`` with one plugin node.
 
     ``norm`` may come from any norm lowering (LayerNorm node, decomposed RMS,
     ...); only the 4 anchor tensor names matter. Dead producers are pruned by
     cleanup unless shared with other live tensors. Returns the plugin node.
     """
-    if plugin not in ("adaln", "rms_adaln"):
-        raise ValueError(f"plugin must be adaln/rms_adaln, got {plugin!r}")
+    if not isinstance(plugin, PluginOp) or plugin not in (
+            PluginOp.ADALN, PluginOp.RMS_ADALN):
+        raise TypeError(f"plugin must be PluginOp.ADALN/RMS_ADALN, got {plugin!r}")
     tensors = graph.tensors()
     for n in (norm, scale, shift, out):
         if n not in tensors:
@@ -661,13 +860,17 @@ def fuse_norm_affine(graph, *, norm: str, scale: str, shift: str, out: str,
     return node
 
 
-def retarget_nodes(graph, mapping: dict[str, str]) -> int:
-    """Rename custom ops to plugin ops in place: ``{"MyAttn": "int8_attention"}``.
+def retarget_nodes(graph, mapping: dict[str, PluginOp]) -> int:
+    """Rename custom ops to plugin ops in place: ``{"MyAttn": PluginOp.INT8_ATTENTION}``.
 
     Sets domain + plugin_version/namespace; attrs outside the target spec
     are stripped (stale exporter attrs would trip ``unknown fields`` and
     the TRT parser). Returns the number of nodes touched.
     """
+    for src, dst in mapping.items():
+        if not isinstance(dst, PluginOp):
+            raise TypeError(
+                f"retarget target must be PluginOp, got {dst!r} for {src!r}")
     n = 0
     for node in graph.nodes:
         if node.op in mapping and node.domain != PLUGIN_DOMAIN:
@@ -714,11 +917,11 @@ def validate_plugin_nodes(graph) -> list[str]:
         extra = set(node.attrs) - {"plugin_version", "plugin_namespace"} - fields
         if extra:
             errs.append(f"{node.name or node.op}: unknown fields {sorted(extra)}")
-        if node.op == "int8_attention" and node.inputs:
+        if node.op == PluginOp.INT8_ATTENTION and node.inputs:
             d = _shape_of(node.inputs[0], 3)
             if d is not None and d not in (64, 128, 256):
                 errs.append(f"{node.name or node.op}: D={d}, want 64/128/256")
-        if node.op == "sage_attn" and len(node.inputs) == 3:
+        if node.op == PluginOp.SAGE_ATTN and len(node.inputs) == 3:
             d = _shape_of(node.inputs[0], 3)
             if d is not None and d not in (64, 128, 256):
                 errs.append(f"{node.name or node.op}: D={d}, want 64/128/256")
@@ -727,14 +930,14 @@ def validate_plugin_nodes(graph) -> list[str]:
             if hq is not None and hkv is not None:
                 if hkv == 0 or hq % hkv != 0:
                     errs.append(f"{node.name or node.op}: Hq={hq} must be a multiple of Hkv={hkv}")
-        if node.op == "block_sparse_sage2_attn" and node.inputs:
+        if node.op == PluginOp.BLOCK_SPARSE_SAGE2_ATTN and node.inputs:
             d = _shape_of(node.inputs[0], 3)
             s = _shape_of(node.inputs[0], 2)
             if d is not None and d not in (64, 128):
                 errs.append(f"{node.name or node.op}: D={d}, want 64/128")
             if s is not None and s % 128 != 0:
                 errs.append(f"{node.name or node.op}: S={s}, want multiple of 128")
-        if node.op == "fused_int8_rope_sage_attn" and node.inputs:
+        if node.op == PluginOp.FUSED_INT8_ROPE_SAGE_ATTN and node.inputs:
             d = _shape_of(node.inputs[0], 3)
             s = _shape_of(node.inputs[0], 2)
             if d is not None and d != 128:
@@ -852,11 +1055,11 @@ def main(argv=None) -> int:
         print(f"retarget {src} -> {dst}: {retarget_nodes(graph, {src: dst})}")
     for spec in args.fuse_adaln:
         n, s, sh, o, eps = _fuse_spec(spec)
-        fuse_norm_affine(graph, norm=n, scale=s, shift=sh, out=o, plugin="adaln", eps=eps)
+        fuse_norm_affine(graph, norm=n, scale=s, shift=sh, out=o, plugin=PluginOp.ADALN, eps=eps)
         print(f"fused adaln -> {o}")
     for spec in args.fuse_rms_adaln:
         n, s, sh, o, eps = _fuse_spec(spec)
-        fuse_norm_affine(graph, norm=n, scale=s, shift=sh, out=o, plugin="rms_adaln", eps=eps)
+        fuse_norm_affine(graph, norm=n, scale=s, shift=sh, out=o, plugin=PluginOp.RMS_ADALN, eps=eps)
         print(f"fused rms_adaln -> {o}")
     for spec in args.fuse_dit_self_attn:
         qi, qs, ki, ks, vi, vs, wq, wk, inv, ao, name = _dit_self_attn_spec(spec)
@@ -865,6 +1068,8 @@ def main(argv=None) -> int:
                                  rms_w_q=wq, rms_w_k=wk, inv_freq=inv,
                                  attn_out=ao, name=name)
         print(f"fused fused_int8_rope_sage_attn -> {ao}")
+    if args.fuse_dit_self_attn:
+        graph.cleanup().toposort()
 
     print(summarize(graph))
     errs = validate_plugin_nodes(graph)

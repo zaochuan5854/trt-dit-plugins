@@ -8,6 +8,7 @@ onnx = pytest.importorskip("onnx")
 gs = pytest.importorskip("onnx_graphsurgeon")
 
 from trt_dit_plugins import surgeon as S
+from trt_dit_plugins.select import PluginOp
 
 F32 = np.float32
 
@@ -73,7 +74,7 @@ def test_fuse_norm_affine_explicit_anchors():
     g.outputs = [o]
 
     S.fuse_norm_affine(g, norm="norm", scale="sc", shift="sh", out="o",
-                       plugin="rms_adaln", eps=1e-6)
+                       plugin=PluginOp.RMS_ADALN, eps=1e-6)
     assert [n.op for n in g.nodes if n.domain == S.PLUGIN_DOMAIN] == ["rms_adaln"]
     assert not [n for n in g.nodes if n.op in ("Mul", "Add")]
     assert S.summarize(g)["total"] == 1
@@ -85,7 +86,7 @@ def test_retarget_and_validate_catches_arity():
     o = gs.Variable("o", dtype=F32, shape=[1, 2, 8, 64])
     g = gs.Graph(nodes=[gs.Node("MyAttn", inputs=[x, x, x], outputs=[o])],
                  inputs=[x], outputs=[o])
-    assert S.retarget_nodes(g, {"MyAttn": "int8_attention"}) == 1
+    assert S.retarget_nodes(g, {"MyAttn": PluginOp.INT8_ATTENTION}) == 1
     node = g.nodes[0]
     assert (node.op, node.domain) == ("int8_attention", "dit-plugins")
     assert S.validate_plugin_nodes(g) == []
@@ -136,7 +137,7 @@ def test_retarget_strips_stale_attrs():
     g = gs.Graph(nodes=[gs.Node("MyAttn", inputs=[x, x, x], outputs=[o],
                                 attrs={"legacy_flag": 1})],
                  inputs=[x], outputs=[o])
-    assert S.retarget_nodes(g, {"MyAttn": "int8_attention"}) == 1
+    assert S.retarget_nodes(g, {"MyAttn": PluginOp.INT8_ATTENTION}) == 1
     node = g.nodes[0]
     assert node.attrs.get("legacy_flag") is None
     assert S.validate_plugin_nodes(g) == []
@@ -179,6 +180,7 @@ def test_fuse_dit_self_attn_block():
     node = S.fuse_dit_self_attn_block(
         g, q_i8="qi", q_scale="qs", k_i8="ki", k_scale="ks", v_i8="vi",
         v_scale="vs", rms_w_q="qn", rms_w_k="kn", inv_freq="inv", attn_out="ao")
+    g.cleanup().toposort()  # caller prunes (fuse leaves dead nodes for multi-block safety)
     assert node.op == "fused_int8_rope_sage_attn"
     assert [i.name for i in node.inputs] == [
         "qi", "qs", "ki", "ks", "vi", "vs", "qn", "kn", "inv"]
@@ -199,6 +201,7 @@ def test_fuse_dit_self_attn_block_keeps_graph_output_name():
     S.fuse_dit_self_attn_block(
         g, q_i8="qi", q_scale="qs", k_i8="ki", k_scale="ks", v_i8="vi",
         v_scale="vs", rms_w_q="qn", rms_w_k="kn", inv_freq="inv", attn_out="ao")
+    g.cleanup().toposort()
     assert [o.name for o in g.outputs] == ["ao"]
     _check_ok(g)
 
@@ -234,6 +237,7 @@ def test_fuse_output_dtype_follows_attn_out():
     S.fuse_dit_self_attn_block(
         g, q_i8="qi", q_scale="qs", k_i8="ki", k_scale="ks", v_i8="vi",
         v_scale="vs", rms_w_q="qn", rms_w_k="kn", inv_freq="inv", attn_out="ao")
+    g.cleanup().toposort()
     node = next(n for n in g.nodes if n.op == "fused_int8_rope_sage_attn")
     # qi is INT8 but the plugin emits BF16: output must follow attn_out (F32
     # here), never the INT8 anchor dtype.
@@ -451,7 +455,7 @@ def test_quantize_dit_self_anchors():
     assert all(n.attrs["output_dtype"] == 3 for n in qls)
     got = next(t for t in g.tensors().values() if t.name == "fused_shared_inv_freq")
     assert np.allclose(got.values, inv, atol=1e-6)
-    # carrier present pre-fusion (transient, pruned by fuse cleanup)
+    # carrier present pre-fusion (transient, pruned by post-fusion cleanup)
     assert any("carrier" in n.name for n in g.nodes)
 
 
@@ -616,7 +620,7 @@ def test_fuse_norm_affine_bf16():
                                gs.Node("Add", inputs=[a, sh], outputs=[o])],
                         inputs=[x, sc, sh], outputs=[o])
 
-    for plugin in ("adaln", "rms_adaln"):
+    for plugin in (PluginOp.ADALN, PluginOp.RMS_ADALN):
         g = mkgraph()
         S.fuse_norm_affine(g, norm="norm", scale="sc", shift="sh", out="o",
                            plugin=plugin)
@@ -683,3 +687,180 @@ def test_discover_cache_invalidated_by_mutation():
         rope.inputs[i].shape = [1, 2, 512, 128]
     after = S.discover_dit_self_blocks(g)
     assert not after[0]["eligible"] and after[0]["reason"] == "S-512"
+
+
+def _rope_fused_self(Sv=256):
+    B, Hd, D = 1, 2, 128
+    q = gs.Variable("q", dtype=F32, shape=[B, Sv, Hd, D])
+    k = gs.Variable("k", dtype=F32, shape=[B, Sv, Hd, D])
+    v = gs.Variable("v", dtype=F32, shape=[B, Sv, Hd, D])
+    qs = gs.Variable("qs", dtype=F32, shape=[D])
+    ks = gs.Variable("ks", dtype=F32, shape=[D])
+    nq = gs.Variable("nq", dtype=F32, shape=[B, Sv, Hd, D])
+    nk = gs.Variable("nk", dtype=F32, shape=[B, Sv, Hd, D])
+    c1 = gs.Constant("c1", values=np.ones((1,), dtype=F32))
+    mq = gs.Variable("mq", dtype=F32, shape=[B, Sv, Hd, D])
+    mk = gs.Variable("mk", dtype=F32, shape=[B, Sv, Hd, D])
+    ao = gs.Variable("ao", dtype=F32, shape=[B, Sv, Hd, D])
+    out = gs.Variable("out", dtype=F32, shape=[B, Sv, Hd, D])
+    g = gs.Graph(nodes=[
+        gs.Node("RMSNormalization", inputs=[q, qs], outputs=[nq]),
+        gs.Node("RMSNormalization", inputs=[k, ks], outputs=[nk]),
+        gs.Node("Mul", inputs=[nq, c1], outputs=[mq]),
+        gs.Node("Mul", inputs=[nk, c1], outputs=[mk]),
+        gs.Node("Attention", inputs=[mq, mk, v], outputs=[ao], name="attn"),
+        gs.Node("Relu", inputs=[ao], outputs=[out]),
+    ], inputs=[q, k, v, qs, ks], outputs=[out])
+    g.opset = 23
+    rng = np.random.default_rng(11)
+    inv = (rng.random(64).astype(F32) * 0.5 + 0.001)
+    assert S.fuse_rope_blocks(g, _baked_freqs(inv, Sv)) == 1
+    return g
+
+
+def test_apply_attention_plugins_tier2_sage_pin():
+    B, H, Sv, D = 1, 2, 256, 128
+    q = gs.Variable("q", dtype=F32, shape=[B, H, Sv, D])
+    k = gs.Variable("k", dtype=F32, shape=[B, H, Sv, D])
+    v = gs.Variable("v", dtype=F32, shape=[B, H, Sv, D])
+    o = gs.Variable("o", dtype=F32, shape=[B, H, Sv, D])
+    g = gs.Graph(nodes=[gs.Node("Attention", inputs=[q, k, v], outputs=[o],
+                                name="attn0")],
+                 inputs=[q, k, v], outputs=[o])
+    dry = S.apply_attention_plugins(g, dry_run=True)
+    assert dry["applied"] == {"SageInt8Attn": 1} and dry["native"] == 0
+    assert [n.op for n in g.nodes] == ["Attention"]  # dry-run never mutates
+    rep = S.apply_attention_plugins(g)
+    assert rep["applied"] == {"SageInt8Attn": 1}
+    assert g.nodes[0].op == "SageInt8Attn"
+    site = rep["sites"][0]
+    assert site["tier"] == 2 and site["emitted"] == "SageInt8Attn"
+    assert site["selected"] in ("sage_attn", "int8_attention")
+    rep2 = S.apply_attention_plugins(g)
+    assert rep2["applied"] == {} and rep2["native"] == 0
+    assert sum(n.op == "SageInt8Attn" for n in g.nodes) == 1
+
+
+def test_apply_attention_plugins_tier1_experimental_fused():
+    g, _ = _quantizable_graph()
+    sc = {"qt": 0.02, "kt": 0.03, "vi": 0.04}
+    dry = S.apply_attention_plugins(g, scales=sc, dry_run=True)
+    assert dry["applied"] == {"fused_int8_rope_sage_attn": 1}
+    assert S.summarize(g)["plugin_nodes"] == {"rms_rope_split_half": 1}
+    rep = S.apply_attention_plugins(g, scales=sc)
+    assert rep["applied"] == {"fused_int8_rope_sage_attn": 1}
+    assert "experimental" in rep["sites"][0]["reason"]
+    assert S.summarize(g)["plugin_nodes"] == {"fused_int8_rope_sage_attn": 1}
+    assert S.validate_plugin_nodes(g) == []
+    _check_ok(g)
+    rep2 = S.apply_attention_plugins(g, scales=sc, dry_run=True)
+    assert rep2["applied"] == {} and rep2["sites"][0]["tier"] == 3
+
+
+def test_apply_attention_plugins_tier1_strict_with_samples():
+    g, _ = _quantizable_graph()
+    sc = {"qt": 0.02, "kt": 0.03, "vi": 0.04}
+    rng = np.random.default_rng(7)
+    samples = {k: (rng.random((1, 2, 2048, 128)).astype(F32) - 0.5) * 0.2
+               for k in ("qt", "kt", "vi")}
+    rep = S.apply_attention_plugins(g, scales=sc, samples=samples)
+    assert rep["applied"] == {"fused_int8_rope_sage_attn": 1}
+    assert "experimental" not in rep["sites"][0]["reason"]
+    assert S.validate_plugin_nodes(g) == []
+
+
+def test_apply_attention_plugins_small_s_falls_back_to_sage():
+    g = _rope_fused_self(256)
+    b = S.discover_dit_self_blocks(g)[0]
+    assert not b["eligible"] and b["reason"] == "S-256"
+    sc = {b["q"]: 0.05, b["k"]: 0.05, b["v"]: 0.05}
+    rep = S.apply_attention_plugins(g, scales=sc)
+    assert rep["applied"] == {"SageInt8Attn": 1}
+    assert "fused N/A (S-256)" in rep["sites"][0]["reason"]
+
+
+def test_apply_sage_attention_only_subset():
+    B, H, Sv, D = 1, 2, 256, 128
+    g = gs.Graph(nodes=[
+        gs.Node("Attention",
+                inputs=[gs.Variable(f"a{i}", dtype=F32, shape=[B, H, Sv, D])
+                        for i in range(3)],
+                outputs=[gs.Variable("oa", dtype=F32, shape=[B, H, Sv, D])],
+                name="a"),
+        gs.Node("Attention",
+                inputs=[gs.Variable(f"b{i}", dtype=F32, shape=[B, H, Sv, D])
+                        for i in range(3)],
+                outputs=[gs.Variable("ob", dtype=F32, shape=[B, H, Sv, D])],
+                name="b"),
+    ], inputs=[], outputs=[])
+    assert S.apply_sage_attention(g, only={"b"}) == 1
+    assert {n.name: n.op for n in g.nodes} == \
+        {"a": "Attention", "b_sage": "SageInt8Attn"}
+
+
+def _two_block_graph():
+    rng = np.random.default_rng(21)
+    inv = (rng.random(64).astype(F32) * 0.5 + 0.001)
+    nodes, inputs, outputs = [], [], []
+    for p in ("a", "b"):
+        qt = gs.Variable(f"{p}qt", dtype=np.int8, shape=[1, 2, 2048, 128])
+        kt = gs.Variable(f"{p}kt", dtype=np.int8, shape=[1, 2, 2048, 128])
+        vi = gs.Variable(f"{p}vi", dtype=np.int8, shape=[1, 2, 2048, 128])
+        fq = gs.Constant(f"{p}fq", values=_baked_freqs(inv, 2048))
+        qsc = gs.Variable(f"{p}qsc", dtype=F32, shape=[128])
+        ksc = gs.Variable(f"{p}ksc", dtype=F32, shape=[128])
+        rq = gs.Variable(f"{p}rq", dtype=F32, shape=[1, 2, 2048, 128])
+        rk = gs.Variable(f"{p}rk", dtype=F32, shape=[1, 2, 2048, 128])
+        ao = gs.Variable(f"{p}ao", dtype=F32, shape=[1, 2, 2048, 128])
+        out = gs.Variable(f"{p}out", dtype=F32, shape=[1, 2, 2048, 128])
+        nodes += [
+            gs.Node("rms_rope_split_half", inputs=[qt, kt, fq, qsc, ksc],
+                    outputs=[rq, rk], domain="dit-plugins"),
+            gs.Node("SageInt8Attn", inputs=[rq, rk, vi], outputs=[ao]),
+            gs.Node("Relu", inputs=[ao], outputs=[out]),
+        ]
+        inputs += [qt, kt, vi, qsc, ksc]
+        outputs.append(out)
+    g = gs.Graph(nodes=nodes, inputs=inputs, outputs=outputs)
+    g.opset = 23
+    return g
+
+
+def test_apply_dit_self_fused_multi_block():
+    # Regression: quantize-all-then-fuse must not prune block b's anchors
+    # while fusing block a (per-fuse cleanup did exactly that).
+    g = _two_block_graph()
+    sc = {"aqt": 0.02, "akt": 0.03, "avi": 0.04,
+          "bqt": 0.05, "bkt": 0.06, "bvi": 0.07}
+    rep = S.apply_dit_self_fused(g, sc)
+    assert rep["applied"] == 2 and rep["by_reason"] == {"ok": 2}
+    assert S.summarize(g)["plugin_nodes"] == {"fused_int8_rope_sage_attn": 2}
+    assert S.validate_plugin_nodes(g) == []
+    _check_ok(g)
+
+
+def test_apply_attention_plugins_multi_block_fused():
+    g = _two_block_graph()
+    sc = {"aqt": 0.02, "akt": 0.03, "avi": 0.04,
+          "bqt": 0.05, "bkt": 0.06, "bvi": 0.07}
+    rep = S.apply_attention_plugins(g, scales=sc)
+    assert rep["applied"] == {"fused_int8_rope_sage_attn": 2}
+    assert S.summarize(g)["plugin_nodes"] == {"fused_int8_rope_sage_attn": 2}
+    assert S.validate_plugin_nodes(g) == []
+    _check_ok(g)
+
+
+def test_apply_attention_plugins_fp8_vehicle_excludes_fused():
+    # FP8 exports must not emit INT8 anchors (TRT11 rejects INT8+FP8
+    # mixed graphs pre-Blackwell): fused is out, sage stays.
+    from trt_dit_plugins.select import BasePrecision, GemmKind
+    g, _ = _quantizable_graph()
+    for n in g.nodes:
+        if n.op == "SageInt8Attn":
+            n.op = "Attention"  # unconverted site: Tier2 must sage it
+    sc = {"qt": 0.02, "kt": 0.03, "vi": 0.04}
+    rep = S.apply_attention_plugins(g, scales=sc, gemm=GemmKind.FP8,
+                                    base=BasePrecision.BF16, arch="sm89")
+    assert rep["applied"] == {"SageInt8Attn": 1}
+    assert not [n for n in g.nodes if n.op == "fused_int8_rope_sage_attn"]
+    assert not [n for n in g.nodes if n.op == "QuantizeLinear"]
