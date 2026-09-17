@@ -1,52 +1,66 @@
 // SPDX-License-Identifier: Apache-2.0
 // Interface derived from ComfyKitchen (Copyright (c) 2025 Comfy Org, Apache-2.0).
-// Registration check: loadLibrary the .so and fetch dit-plugins::int8_attention.
+// Registration check: dlopen the plugin lib and fetch every dit-plugins
+// creator. Explicit return codes (no assert: NDEBUG in Release builds would
+// compile them out and the check would pass vacuously).
 #include <NvInferRuntime.h>
 #ifdef _WIN32
 #include <windows.h>
-static void* dlopen(const char* p, int) { return (void*)LoadLibraryA(p); }
 #else
 #include <dlfcn.h>
 #endif
-#include <cassert>
 #include <cstdio>
 
+namespace {
+const char* kNames[] = {
+    "int8_attention",
+    "sage_attn",
+    "adaln",
+    "rms_adaln",
+    "apply_rope",
+    "rms_rope_split_half",
+    "stochastic_round_fp8",
+    "block_sparse_sage2_attn",
+    "fused_int8_rope_sage_attn",
+};
+} // namespace
+
 int main(int argc, char** argv) {
-    assert(argc > 1);
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: regcheck <plugin-lib>\n");
+        return 2;
+    }
     // loadLibrary returns null when already registered, so confirm
     // directly via dlopen (runs static registration) + getCreator
 #ifdef _WIN32
-    assert(dlopen(argv[1], 0));
+    void* handle = static_cast<void*>(LoadLibraryA(argv[1]));
+    if (!handle) {
+        std::fprintf(stderr, "FAIL load %s winerr=%lu\n", argv[1],
+                     static_cast<unsigned long>(GetLastError()));
+        return 1;
+    }
 #else
-    assert(dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL));
+    void* handle = dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) {
+        std::fprintf(stderr, "FAIL load %s: %s\n", argv[1], dlerror());
+        return 1;
+    }
+    (void)handle;
 #endif
     auto* reg = getPluginRegistry();
-    auto* c = reg->getCreator("int8_attention", "1", "dit-plugins");
-    assert(c);
-    std::fprintf(stderr, "OK creator: int8_attention 1 dit-plugins\n");
-    auto* a = reg->getCreator("adaln", "1", "dit-plugins");
-    assert(a);
-    std::fprintf(stderr, "OK creator: adaln 1 dit-plugins\n");
-    auto* r = reg->getCreator("rms_adaln", "1", "dit-plugins");
-    assert(r);
-    std::fprintf(stderr, "OK creator: rms_adaln 1 dit-plugins\n");
-    auto* ro = reg->getCreator("apply_rope", "1", "dit-plugins");
-    assert(ro);
-    std::fprintf(stderr, "OK creator: apply_rope 1 dit-plugins\n");
-    auto* fp = reg->getCreator("stochastic_round_fp8", "1", "dit-plugins");
-    assert(fp);
-    std::fprintf(stderr, "OK creator: stochastic_round_fp8 1 dit-plugins\n");
-    auto* rr = reg->getCreator("rms_rope_split_half", "1", "dit-plugins");
-    assert(rr);
-    std::fprintf(stderr, "OK creator: rms_rope_split_half 1 dit-plugins\n");
-    auto* bs = reg->getCreator("block_sparse_sage2_attn", "1", "dit-plugins");
-    assert(bs);
-    std::fprintf(stderr, "OK creator: block_sparse_sage2_attn 1 dit-plugins\n");
-    auto* sa = reg->getCreator("sage_attn", "1", "dit-plugins");
-    assert(sa);
-    std::fprintf(stderr, "OK creator: sage_attn 1 dit-plugins\n");
-    auto* fu = reg->getCreator("fused_int8_rope_sage_attn", "1", "dit-plugins");
-    assert(fu);
-    std::fprintf(stderr, "OK creator: fused_int8_rope_sage_attn 1 dit-plugins\n");
-    return 0;
+    if (!reg) {
+        std::fprintf(stderr, "FAIL getPluginRegistry\n");
+        return 1;
+    }
+    int rc = 0;
+    for (const char* name : kNames) {
+        auto* creator = reg->getCreator(name, "1", "dit-plugins");
+        if (!creator) {
+            std::fprintf(stderr, "FAIL creator: %s 1 dit-plugins\n", name);
+            rc = 1;
+            continue;
+        }
+        std::fprintf(stderr, "OK creator: %s 1 dit-plugins\n", name);
+    }
+    return rc;
 }
