@@ -21,7 +21,11 @@ The fused DiT-self attention op (``fused_int8_rope_sage_attn``, 9 inputs,
 1 output) collapses a post-rope-surgery self-attention block
 (``rms_rope_split_half`` + ``SageInt8Attn``/``Attention``) into one node.
 Same CLI surface: ``--fuse-dit-self-attn
-Q_I8,Q_S,K_I8,K_S,V_I8,V_S,QN,KN,INV,ATTN_OUT[,NAME]``.
+Q_I8,Q_SCALE,K_I8,K_SCALE,V_I8,V_SCALE,RMS_W_Q,RMS_W_K,INV_FREQ,ATTN_OUT[,NAME]``.
+
+The ``discover_*``/``apply_*``/``fuse_rope_blocks`` helpers below close the
+loop for exporters (auto-discovery, inv_freq derivation, QuantizeLinear
+anchor creation); the explicit-anchor APIs above remain the stable core.
 
 Needs ``pip install trt-dit-plugins[onnx]``. Importing this module is cheap;
 ``onnx`` / ``onnx-graphsurgeon`` are imported lazily and only fail when used.
@@ -30,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+from collections import deque
 from typing import Any
 
 PLUGIN_DOMAIN = "dit-plugins"
@@ -209,27 +214,402 @@ def fuse_dit_self_attn_block(graph, *, q_i8, q_scale, k_i8, k_scale, v_i8,
     if rope.op != "rms_rope_split_half":
         raise ValueError(f"{attn_out}: Q/K producer must be rms_rope_split_half, "
                          f"got {rope.op!r}")
-    fused_out = _like(out_var, attn_out + "_fused")
+    # out_var itself becomes the plugin output: the tensor name (and any
+    # graph.outputs membership / downstream consumers) is preserved, so
+    # I/O bindings by name keep working. Detach the old producer; cleanup
+    # prunes the now-unreachable attn/rope chain consistently.
     node = _plugin_node(graph, "fused_int8_rope_sage_attn", anchor_vars,
-                        [fused_out], name=name or f"fused_{attn_out}")
-    for consumer in list(out_var.outputs):
-        consumer.inputs = [fused_out if i is out_var else i
-                           for i in consumer.inputs]
-        if consumer not in fused_out.outputs:
-            fused_out.outputs.append(consumer)
-    out_var.outputs.clear()
-    if attn_out in [o.name for o in graph.outputs]:
-        graph.outputs = [fused_out if o is out_var else o
-                         for o in graph.outputs]
-    for i in attn.inputs:
-        if attn in i.outputs:
-            i.outputs.remove(attn)
-    for dead in (attn, rope):
-        dead.outputs = [o for o in dead.outputs if o.outputs]
-        if not dead.outputs and dead in graph.nodes:
-            graph.nodes.remove(dead)
+                        [out_var], name=name or f"fused_{attn_out}")
+    if node not in out_var.inputs:
+        out_var.inputs.append(node)
+    if attn in out_var.inputs:
+        out_var.inputs.remove(attn)
+    if out_var in attn.outputs:
+        attn.outputs.remove(out_var)
     graph.cleanup().toposort()
     return node
+
+
+# --- auto discovery + anchor creation (DiT-self fused) ---
+#
+# The explicit APIs above take caller-provided anchors. The helpers below
+# close the loop for exporters: find rope+attention pairs, derive inv_freq
+# from baked freqs, create QuantizeLinear anchors from calibrated scales,
+# then delegate the fusion itself to fuse_dit_self_attn_block.
+
+_ROPE_OP = "rms_rope_split_half"
+_LEGACY_ATTN_OPS = ("SageInt8Attn", "Attention")
+# Truth: the fused kernel only implements the L>1024 path (validator gate).
+_FUSED_MIN_S = 1024
+
+# Same-input result cache for graph queries. Keyed by structural
+# fingerprint (not object identity): equal graphs share results, and any
+# mutation that a query can observe (ops, domains, names, connectivity,
+# shapes) changes the key, so stale hits are impossible by construction.
+# Bounded FIFO; results are plain data, copied per call so callers can
+# mutate them freely.
+_QUERY_CACHE: dict[tuple, Any] = {}
+_QUERY_CACHE_MAX = 32
+
+
+def _graph_fingerprint(graph) -> tuple:
+    """Hashable snapshot of everything the cached queries read."""
+    nodes = tuple(
+        (n.op, getattr(n, "domain", ""), n.name,
+         tuple(i.name for i in n.inputs), tuple(o.name for o in n.outputs))
+        for n in graph.nodes
+    )
+    shapes = tuple(
+        (name, None if t.shape is None else tuple(
+            d if isinstance(d, (int, str)) else repr(d) for d in t.shape))
+        for name, t in sorted(graph.tensors().items())
+    )
+    return nodes, shapes
+
+
+def _cached_query(graph, kind: str, compute):
+    key = (kind, _graph_fingerprint(graph))
+    hit = _QUERY_CACHE.get(key)
+    if hit is not None:
+        return [dict(b) for b in hit]
+    res = compute()
+    if len(_QUERY_CACHE) >= _QUERY_CACHE_MAX:
+        _QUERY_CACHE.pop(next(iter(_QUERY_CACHE)))
+    _QUERY_CACHE[key] = res
+    return [dict(b) for b in res]
+
+
+def _dims(t):
+    """Static shape as tuple (non-int dims -> None); None if unknown."""
+    if t is None or t.shape is None:
+        return None
+    return tuple(d if isinstance(d, int) else None for d in t.shape)
+
+
+def _single_prod(t):
+    """Sole producer node of a tensor, else None (graph input / fan-in)."""
+    ps = t.inputs
+    return ps[0] if len(ps) == 1 else None
+
+
+def _walk_up(edge, *, stop=None, skip=()):
+    """Yield producer nodes BFS from a tensor; stop at tensor name, skip node ops."""
+    seen: set[str] = set()
+    dq: deque = deque([edge])
+    while dq:
+        t = dq.popleft()
+        if t.name in seen or t.name == stop:
+            continue
+        seen.add(t.name)
+        for p in t.inputs:
+            yield p
+            if p.op not in skip:
+                dq.extend(p.inputs)
+
+
+def _checked_baked_freqs(fq):
+    """Validate ``[1,1,S,r,2,2]`` baked freqs layout; return as array."""
+    import numpy as np
+    fq = np.asarray(fq)
+    if fq.ndim != 6 or fq.shape[0] != 1 or fq.shape[1] != 1 or fq.shape[4:] != (2, 2):
+        raise ValueError(f"baked freqs must be [1,1,S,r,2,2], got {tuple(fq.shape)}")
+    return fq
+
+
+def discover_dit_self_blocks(graph) -> list[dict[str, Any]]:
+    """Find rope+attention pairs; classify fused eligibility per block.
+
+    A block is eligible when Q/K come from the SAME ``rms_rope_split_half``
+    node (this rejects cross-attn) and no statically-known shape violates
+    the plugin contract (D=128, rank-4 Q/K/V, S>1024, ``[1,1,S,64,2,2]``
+    freqs, ``[128]`` norms). Unknown (dynamic/profile) dims never reject:
+    TRT resolves them at build. Returns one dict per candidate with
+    ``eligible`` + ``reason``; source names (``q``/``k``/``freqs``/
+    ``rms_w_q``/``rms_w_k``/``v``/``attn_out``) are always populated for
+    well-formed pairs. Key names follow :func:`fuse_dit_self_attn_block`
+    wherever they coincide (``rms_w_q``/``rms_w_k``); ``q``/``k``/``v``
+    are the pre-quant float edges that quantize into ``q_i8``/``k_i8``/
+    ``v_i8``.
+
+    Same input -> cached result (structural fingerprint; e.g. the second
+    discovery inside :func:`apply_dit_self_fused` is a cache hit).
+    """
+    return _cached_query(graph, "discover",
+                         lambda: _discover_dit_self_blocks_uncached(graph))
+
+
+def _discover_dit_self_blocks_uncached(graph) -> list[dict[str, Any]]:
+    tensors = graph.tensors()
+    blocks: list[dict[str, Any]] = []
+    for attn in graph.nodes:
+        if attn.op not in _LEGACY_ATTN_OPS:
+            continue
+        if len(attn.inputs) < 3 or not attn.outputs:
+            blocks.append({"attn": attn.name, "attn_op": attn.op,
+                           "attn_out": attn.outputs[0].name if attn.outputs else None,
+                           "eligible": False, "reason": "malformed-attn"})
+            continue
+        base: dict[str, Any] = {"attn": attn.name, "attn_op": attn.op,
+                                "attn_out": attn.outputs[0].name}
+        nq = _single_prod(attn.inputs[0])
+        nk = _single_prod(attn.inputs[1])
+        if (nq is None or nk is None or nq is not nk
+                or nq.op != _ROPE_OP or getattr(nq, "domain", "") != PLUGIN_DOMAIN
+                or len(nq.inputs) != 5 or len(nq.outputs) != 2):
+            blocks.append({**base, "eligible": False, "reason": "cross-or-unpaired-qk"})
+            continue
+        base.update({"rope": nq.name, "q": nq.inputs[0].name,
+                     "k": nq.inputs[1].name, "freqs": nq.inputs[2].name,
+                     "rms_w_q": nq.inputs[3].name, "rms_w_k": nq.inputs[4].name,
+                     "v": attn.inputs[2].name})
+        base.update(_check_dit_self_block(base, tensors))
+        blocks.append(base)
+    return blocks
+
+
+def _check_dit_self_block(b: dict[str, Any], tensors: dict[str, Any]) -> dict[str, Any]:
+    """Static contract check; ``{"eligible": bool, "reason": str}``."""
+    for key in ("q", "k", "v"):
+        dims = _dims(tensors.get(b[key]))
+        if dims is not None:
+            if len(dims) != 4:
+                return {"eligible": False, "reason": f"{key}-rank-{len(dims)}"}
+            if dims[3] is not None and dims[3] != 128:
+                return {"eligible": False, "reason": f"D-{dims[3]}"}
+            if key != "v" and dims[2] is not None and dims[2] <= _FUSED_MIN_S:
+                return {"eligible": False, "reason": f"S-{dims[2]}"}
+    dims = _dims(tensors.get(b["freqs"]))
+    if dims is not None and (len(dims) != 6 or dims[3] != 64):
+        return {"eligible": False, "reason": f"bad-freqs-{dims}"}
+    for key in ("rms_w_q", "rms_w_k"):
+        dims = _dims(tensors.get(b[key]))
+        if dims is not None and tuple(dims) != (128,):
+            return {"eligible": False, "reason": f"bad-norm-{key}"}
+    return {"eligible": True, "reason": "ok"}
+
+
+def inv_freq_from_baked_freqs(fq) -> Any:
+    """Derive the fused kernel's ``inv_freq[64]`` from baked rope freqs.
+
+    ``fq`` is the ``[1,1,S,r,2,2]`` ``[[cos,-sin],[sin,cos]]`` baked capture
+    (full D=128 split-half => ``r == 64``). Angles at position 1 equal
+    ``inv_freq`` itself, so ``inv_freq = atan2(sin, cos)`` on the ``pos=1``
+    row recovers it exactly. Returns FP32 ``[64]``.
+    """
+    import numpy as np
+    fq = _checked_baked_freqs(np.asarray(fq, dtype=np.float64))
+    if fq.shape[3] != 64:
+        raise ValueError(f"fused path needs full-D split-half r=64, got {fq.shape[3]}")
+    if fq.shape[2] < 2:
+        raise ValueError(f"baked freqs need S>=2 for the pos=1 row, got {fq.shape[2]}")
+    return np.arctan2(fq[0, 0, 1, :, 1, 0], fq[0, 0, 1, :, 0, 0]).astype(np.float32)
+
+
+def _block_scales_ok(b: dict[str, Any], scales: dict[str, float]) -> bool:
+    need = (b.get("q"), b.get("k"), b.get("v"))
+    return all(k in scales and scales[k] > 0 for k in need)
+
+
+def quantize_dit_self_anchors(graph, scales: dict[str, float]) -> dict[str, Any]:
+    """Insert ``QuantizeLinear`` anchors for fused blocks from calibrated scales.
+
+    ``scales`` maps ONNX tensor name (``q``/``k``/``v`` as reported by
+    :func:`discover_dit_self_blocks`) to the per-tensor FP32 INT8 scale.
+    Per anchored block this appends three ``QuantizeLinear`` nodes (INT8,
+    symmetric, no zero-point) plus FP32 scalar scale constants, and creates
+    one shared ``[64]`` ``inv_freq`` constant derived from the first
+    anchored block's baked freqs (blocks in practice share one capture; a
+    differing block would silently reuse the first vector).
+
+    The shared inv constant is born orphan (invisible to ``tensors()``), so
+    a transient carrier ``Identity`` is appended to make it discoverable;
+    :func:`fuse_dit_self_attn_block`'s cleanup prunes the carrier while the
+    fused node keeps the constant. Do not run a standalone cleanup between
+    this function and the fusion.
+
+    Anchor names follow :func:`fuse_dit_self_attn_block` kwargs verbatim.
+    Returns ``{"applied": n, "skipped": m, "anchors": {attn_out: kwargs},
+    "inv_freq": name | None}``.
+    """
+    import numpy as np
+    from onnx import TensorProto
+    gs = _gs()
+    tensors = graph.tensors()
+    inv_name: str | None = None
+    skipped = 0
+    anchors: dict[str, dict[str, str]] = {}
+    for b in discover_dit_self_blocks(graph):
+        if not b["eligible"] or not _block_scales_ok(b, scales):
+            skipped += 1
+            continue
+        a: dict[str, str] = {}
+        for stem, edge in (("q", b["q"]), ("k", b["k"]), ("v", b["v"])):
+            edge_var = tensors[edge]
+            sname = f"{b['attn_out']}_fused_{stem}s"
+            sconst = gs.Constant(sname, values=np.asarray(scales[edge], dtype=np.float32))
+            qi = gs.Variable(f"{b['attn_out']}_fused_{stem}i", dtype=np.int8,
+                             shape=list(edge_var.shape) if edge_var.shape is not None else None)
+            graph.nodes.append(gs.Node("QuantizeLinear", inputs=[edge_var, sconst],
+                                       outputs=[qi], attrs={"output_dtype": int(TensorProto.INT8)},
+                                       name=qi.name))  # type: ignore[arg-type]
+            tensors[qi.name] = qi
+            a[f"{stem}_i8"], a[f"{stem}_scale"] = qi.name, sname
+        if inv_name is None:
+            fvar = tensors[b["freqs"]]
+            if not isinstance(fvar, gs.Constant) or fvar.values is None:
+                raise ValueError(f"baked freqs {b['freqs']!r} have no values; "
+                                 f"expected an initializer-backed constant")
+            inv_name = "fused_shared_inv_freq"
+            inv_const = gs.Constant(inv_name, values=np.ascontiguousarray(
+                inv_freq_from_baked_freqs(fvar.values), dtype=np.float32))
+            carrier = gs.Variable(inv_name + "_carrier", dtype=np.float32, shape=[64])
+            graph.nodes.append(gs.Node("Identity", inputs=[inv_const],  # type: ignore[arg-type]
+                                       outputs=[carrier], name=carrier.name))
+        a.update({"rms_w_q": b["rms_w_q"], "rms_w_k": b["rms_w_k"],
+                  "inv_freq": inv_name})
+        anchors[b["attn_out"]] = a
+    return {"applied": len(anchors), "skipped": skipped, "anchors": anchors,
+            "inv_freq": inv_name}
+
+
+def apply_dit_self_fused(graph, scales: dict[str, float]) -> dict[str, Any]:
+    """Discover + quantize + fuse every eligible DiT-self block.
+
+    ``scales`` maps ONNX tensor name to per-tensor FP32 INT8 scale (see
+    :func:`quantize_dit_self_anchors`). Returns ``{"applied": n,
+    "skipped": m, "by_reason": {reason: count}}`` with ``missing-scales``
+    counted separately from structural rejects. Raises nothing on zero
+    matches (check ``applied``); per-block fusion errors propagate from
+    :func:`fuse_dit_self_attn_block`.
+    """
+    blocks = discover_dit_self_blocks(graph)
+    by_reason: dict[str, int] = {}
+    for b in blocks:
+        reason = b["reason"] if b["eligible"] and _block_scales_ok(b, scales) \
+            else ("missing-scales" if b["eligible"] else b["reason"])
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    q = quantize_dit_self_anchors(graph, scales)
+    for attn_out, a in q["anchors"].items():
+        fuse_dit_self_attn_block(graph, attn_out=attn_out, **a)
+    applied = len(q["anchors"])
+    return {"applied": applied, "skipped": len(blocks) - applied,
+            "by_reason": by_reason}
+
+
+# --- rope/sage traversal surgeries ---
+#
+# Unlike the constructors above, these find eligible subgraphs themselves:
+# rope blocks via upstream RMSNormalization + Mul (rope math) anchors, and
+# plain Attention nodes for the legacy SageInt8Attn rewrite. Cross-attn
+# (norm feeding attention directly, no rope math) is skipped, never fused.
+
+def _gs_norm_anchor(edge):
+    """First RMSNormalization producer upstream of a tensor (the q/k norm)."""
+    return next((p for p in _walk_up(edge) if p.op == "RMSNormalization"), None)
+
+
+def _gs_has_rope_math(edge, norm_out: str) -> bool:
+    """True if a Mul sits between edge and norm_out (rope math present)."""
+    return any(p.op == "Mul"
+               for p in _walk_up(edge, stop=norm_out, skip=("RMSNormalization",)))
+
+
+def _transpose_bhsd(graph, edge, out_name: str):
+    """[B,S,H,d] -> [B,H,S,d] view for rope plugin inputs."""
+    gs = _gs()
+    shape = None
+    dims = _dims(edge)
+    if dims is not None and len(dims) == 4:
+        b, s, h, d = dims
+        shape = [b, h, s, d]
+    out = gs.Variable(out_name, dtype=edge.dtype, shape=shape)
+    graph.nodes.append(gs.Node("Transpose", inputs=[edge], outputs=[out],
+                               attrs={"perm": [0, 2, 1, 3]}, name=out_name))
+    return out
+
+
+def fuse_rope_blocks(graph, fq, epsilon: float = 1e-6, rot_dim: int = 0) -> int:
+    """Replace self-block norm+rope regions with ``rms_rope_split_half`` nodes.
+
+    ``fq`` is the baked freqs array in ``[1,1,S,r,2,2]`` layout (one shared
+    constant for all blocks; grid-dependent, so callers must fuse only at a
+    fixed resolution profile). The plugin fuses RMSNorm itself, so it takes
+    the PRE-norm tensors plus the norm scales (feeding norm outputs would
+    normalize twice). Q/K arrive ``[B,S,H,d]`` and are transposed to
+    ``[B,H,S,d]`` views around the plugin. Blocks without rope math
+    (cross-attn) are skipped. Returns the fused block count; raises on zero
+    matches or malformed attention/norm nodes.
+    """
+    import numpy as np
+    gs = _gs()
+    fq = np.ascontiguousarray(_checked_baked_freqs(fq), dtype=np.float32)
+    plans: list[tuple] = []
+    for attn in graph.nodes:
+        if attn.op not in _LEGACY_ATTN_OPS:
+            continue
+        if len(attn.inputs) < 3 or not attn.outputs:
+            raise ValueError(f"rope surgery: {attn.op} {attn.name} has "
+                             f"malformed inputs/outputs")
+        nq = _gs_norm_anchor(attn.inputs[0])
+        nk = _gs_norm_anchor(attn.inputs[1])
+        if nq is None or nk is None:
+            continue
+        if not (_gs_has_rope_math(attn.inputs[0], nq.outputs[0].name) and
+                _gs_has_rope_math(attn.inputs[1], nk.outputs[0].name)):
+            continue  # cross-attn (norm feeds attention directly)
+        if len(nq.inputs) < 2 or len(nk.inputs) < 2:
+            raise ValueError("rope surgery: RMSNormalization node missing scale input")
+        plans.append((attn, nq.inputs[0], nk.inputs[0], nq.inputs[1], nk.inputs[1]))
+    if not plans:
+        raise RuntimeError("rope surgery matched 0 blocks")
+    fconst = gs.Constant("dit_rope_freqs", values=fq)
+    n_done = 0
+    for attn, q_in, k_in, qsc, ksc in plans:
+        base = attn.name or attn.outputs[0].name
+        qt = _transpose_bhsd(graph, q_in, base + "_toBHSD_q")
+        kt = _transpose_bhsd(graph, k_in, base + "_toBHSD_k")
+        qo, ko = add_rms_rope_split_half(graph, qt, kt, fconst, qsc, ksc,
+                                         epsilon=epsilon, rot_dim=rot_dim,
+                                         name=base + "_rmsrope")
+        attn.inputs[0] = qo
+        attn.inputs[1] = ko
+        n_done += 1
+    graph.cleanup().toposort()
+    return n_done
+
+
+def apply_sage_attention(graph) -> int:
+    """Replace ``Attention`` nodes with ``SageInt8Attn`` in place.
+
+    This targets the legacy ``sage_attn_plugin.so`` op (empty namespace),
+    NOT the ``dit-plugins`` ``sage_attn`` op: no domain is set and all
+    ``Attention`` attributes are dropped. The drop is safe because the
+    legacy creator registers zero fields, hardcodes ``sm_scale=1/sqrt(D)``
+    and reads head counts from Q/K/V shapes; the only semantic variant
+    (causal mask) is rejected below, so default-scale non-causal
+    ``Attention`` is a numerical drop-in. Guards: exactly 3 inputs,
+    1 output, non-causal. Returns the converted count; raises on zero.
+    """
+    n = 0
+    for node in graph.nodes:
+        if node.op != "Attention":
+            continue
+        if len(node.inputs) != 3:
+            raise ValueError(f"sage surgery: Attention {node.name} has "
+                             f"{len(node.inputs)} inputs (mask unsupported)")
+        if len(node.outputs) != 1:
+            raise ValueError(f"sage surgery: Attention {node.name} has "
+                             f"{len(node.outputs)} outputs")
+        if int(node.attrs.get("is_causal", 0)) != 0:
+            raise RuntimeError("sage surgery: causal mask unsupported")
+        node.op = "SageInt8Attn"
+        node.attrs.clear()
+        if node.name:
+            node.name += "_sage"
+        n += 1
+    if n == 0:
+        raise RuntimeError("sage surgery matched 0 Attention nodes")
+    return n
 
 
 # --- explicit fusion + retarget ---
@@ -273,16 +653,23 @@ def fuse_norm_affine(graph, *, norm: str, scale: str, shift: str, out: str,
 def retarget_nodes(graph, mapping: dict[str, str]) -> int:
     """Rename custom ops to plugin ops in place: ``{"MyAttn": "int8_attention"}``.
 
-    Sets domain + plugin_version/namespace; other attrs are forwarded as plugin
-    fields by the TRT parser. Returns the number of nodes touched.
+    Sets domain + plugin_version/namespace; attrs outside the target spec
+    are stripped (stale exporter attrs would trip ``unknown fields`` and
+    the TRT parser). Returns the number of nodes touched.
     """
     n = 0
     for node in graph.nodes:
         if node.op in mapping and node.domain != PLUGIN_DOMAIN:
-            node.op = mapping[node.op]
+            target = mapping[node.op]
+            node.op = target
             node.domain = PLUGIN_DOMAIN
             node.attrs.setdefault("plugin_version", PLUGIN_VERSION)
             node.attrs.setdefault("plugin_namespace", PLUGIN_NAMESPACE)
+            if target in _SPECS:
+                allowed = _SPECS[target][2] | {"plugin_version", "plugin_namespace"}
+                for k in list(node.attrs):
+                    if k not in allowed:
+                        del node.attrs[k]
             n += 1
     if n:
         graph.toposort()
@@ -344,13 +731,17 @@ def validate_plugin_nodes(graph) -> list[str]:
             if s is not None and s <= 1024:
                 errs.append(f"{node.name or node.op}: S={s}, want >1024")
             if len(node.inputs) == 9:
-                # DiT-self contract: q/k/v identical shapes when static.
-                shapes = []
+                # DiT-self contract: q/k/v identical shapes, fully-static only
+                # (dynamic dims/symbols never reject; TRT resolves at build).
+                # Pairwise over the static subset: any two known-static
+                # shapes must agree, so one dynamic input can't mask a real
+                # static mismatch between the other two.
+                static_shapes = []
                 for t in (node.inputs[0], node.inputs[2], node.inputs[4]):
-                    shapes.append(tuple(t.shape) if t.shape is not None else None)
-                known = [sh for sh in shapes if sh is not None]
-                if len(known) == 3 and not (known[0] == known[1] == known[2]):
-                    errs.append(f"{node.name or node.op}: q/k/v shapes differ: {known}")
+                    if t.shape is not None and all(isinstance(x, int) for x in t.shape):
+                        static_shapes.append(tuple(t.shape))
+                if any(a != b for a, b in itertools.combinations(static_shapes, 2)):
+                    errs.append(f"{node.name or node.op}: q/k/v shapes differ: {static_shapes}")
                 # Per-tensor input scales: single element when static.
                 for idx in (1, 3, 5):
                     t = node.inputs[idx]
@@ -387,6 +778,7 @@ def load(path: str):
 
 
 def save(graph, path: str) -> None:
+    import os
     import warnings
 
     import onnx
@@ -396,7 +788,15 @@ def save(graph, path: str) -> None:
             f"lowering ir_version {model.ir_version} -> {TRT_MAX_IR_VERSION} "
             f"for TRT parser compatibility")
         model.ir_version = TRT_MAX_IR_VERSION
-    onnx.save(model, path)
+    try:
+        onnx.save(model, path)
+    except Exception:
+        # DiT models routinely exceed the 2GB protobuf limit; retry with
+        # external data (location is basename-relative, never absolute).
+        warnings.warn(f"standard save failed; retrying with external data: {path}")
+        onnx.save(model, path, save_as_external_data=True,
+                  all_tensors_to_one_file=True,
+                  location=os.path.basename(path) + ".data")
 
 
 def _fuse_spec(s: str):
@@ -459,11 +859,14 @@ def main(argv=None) -> int:
     errs = validate_plugin_nodes(graph)
     for e in errs:
         print(f"ERROR: {e}")
+    # Never persist an invalid graph; dry-run only reports.
+    if errs:
+        return 1
     if args.dry_run:
-        return 1 if errs else 0
+        return 0
     save(graph, args.output)
     print(f"wrote {args.output}")
-    return 1 if errs else 0
+    return 0
 
 
 if __name__ == "__main__":
