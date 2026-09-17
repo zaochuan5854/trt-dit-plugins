@@ -6,9 +6,15 @@ project(trt_dit_plugins LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 # CUDA 13's CCCL headers hard-error (C1189) under MSVC's traditional
-# preprocessor; the conforming one is required for .cu host compilation.
+# preprocessor; the conforming one is required for host compilation.
+# NOTE: bare /Zc:preprocessor must NOT reach nvcc: nvcc counts a
+# slash-prefixed token as a second input file and dies with
+# "A single input file is required ... when an outputfile is specified".
+# Route it through -Xcompiler= for the CUDA language so only cl sees it
+# (cudafe++ is EDG-based and unaffected either way).
 if(MSVC)
-    add_compile_options(/Zc:preprocessor)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+                        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
 endif()
 # sm80/86 (Ampere) + sm89 (Ada, verified) + sm90 (Hopper) as SASS; sm90
 # PTX (driver JIT). Override with -DCMAKE_CUDA_ARCHITECTURES=89 for Ada-only.

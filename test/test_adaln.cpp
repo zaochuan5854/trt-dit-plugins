@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -32,7 +33,7 @@ float frand() {
     return std::sqrt(-2.0f * std::log(u1)) * std::cos(6.2831853f * u2);
 }
 
-int run(bool rms, int N, int D, float eps, int dt) {
+int run(bool rms, int N, int D, float eps, int dt, bool use_native) {
     const int M = N * D;
     // dt: 0=FP32, 1=FP16, 2=BF16 (shared by inputs and outputs)
     auto dtype = dt == 0 ? nvinfer1::DataType::kFLOAT
@@ -52,26 +53,81 @@ int run(bool rms, int N, int D, float eps, int dt) {
              : dt == 1 ? __half2float(static_cast<const __half*>(p)[i])
                        : __bfloat162float(static_cast<const __nv_bfloat16*>(p)[i]);
     };
-    auto* cre = getPluginRegistry()->getCreator(
-        rms ? "rms_adaln" : "adaln", "1", "dit-plugins");
-    if (!cre) {
-        std::fprintf(stderr, "creator not found\n");
-        return 1;
-    }
-    nvinfer1::PluginField f{"eps", &eps, nvinfer1::PluginFieldType::kFLOAT32, 1};
-    nvinfer1::PluginFieldCollection fc{1, &f};
-    nvinfer1::IPluginV3* plug = static_cast<nvinfer1::IPluginCreatorV3One*>(cre)->createPlugin(
-        "t", &fc, nvinfer1::TensorRTPhase::kBUILD);
     nvinfer1::IBuilder* b = nvinfer1::createInferBuilder(gLogger);
     auto* net = b->createNetworkV2(
         1U << (int)nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
     auto* x = net->addInput("x", dtype, nvinfer1::Dims2{N, D});
     auto* sc = net->addInput("sc", dtype, nvinfer1::Dims2{N, D});
     auto* sh = net->addInput("sh", dtype, nvinfer1::Dims2{N, D});
-    nvinfer1::ITensor* ins[3]{x, sc, sh};
-    auto* layer = net->addPluginV3(ins, 3, nullptr, 0, *plug);
-    layer->getOutput(0)->setName("o");
-    net->markOutput(*layer->getOutput(0));
+    nvinfer1::ITensor* out = nullptr;
+    std::vector<uint8_t> hOne, hEps; // kept alive through build
+    if (!use_native) {
+        auto* cre = getPluginRegistry()->getCreator(
+            rms ? "rms_adaln" : "adaln", "1", "dit-plugins");
+        if (!cre) {
+            std::fprintf(stderr, "creator not found\n");
+            return 1;
+        }
+        nvinfer1::PluginField f{"eps", &eps, nvinfer1::PluginFieldType::kFLOAT32, 1};
+        nvinfer1::PluginFieldCollection fc{1, &f};
+        nvinfer1::IPluginV3* plug = static_cast<nvinfer1::IPluginCreatorV3One*>(cre)->createPlugin(
+            "t", &fc, nvinfer1::TensorRTPhase::kBUILD);
+        nvinfer1::ITensor* ins[3]{x, sc, sh};
+        auto* layer = net->addPluginV3(ins, 3, nullptr, 0, *plug);
+        out = layer->getOutput(0);
+        out->setName("o");
+        net->markOutput(*out);
+    } else {
+        // Native baseline with matching traffic ([N,D] scale/shift inputs,
+        // no host-side math fusion). adaln replicates norm*(1+scale)+shift
+        // as n1*sc + n1 + sh around a unit-scale LayerNorm layer.
+        hOne.assign(M * esz, 0);
+        hEps.assign(esz, 0);
+        for (int i = 0; i < M; ++i)
+            toDev(1.0f, i, hOne.data());
+        toDev(eps, 0, hEps.data());
+        auto* oneFull = net->addConstant(nvinfer1::Dims2{N, D},
+            nvinfer1::Weights{dtype, hOne.data(), M});
+        auto* epsT = net->addConstant(nvinfer1::Dims2{1, 1},
+            nvinfer1::Weights{dtype, hEps.data(), 1});
+        nvinfer1::ITensor* y = nullptr;
+        // Native baseline from primitives (what an exporter emits):
+        // xc = x - mean(x) for LayerNorm, xc = x for RMS.
+        nvinfer1::ITensor* xc = x;
+        if (!rms) {
+            auto* m0 = net->addReduce(*x, nvinfer1::ReduceOperation::kAVG,
+                                      1U << 1, true);
+            auto* sub = net->addElementWise(*x, *m0->getOutput(0),
+                nvinfer1::ElementWiseOperation::kSUB);
+            xc = sub->getOutput(0);
+        }
+        {
+            auto* sq = net->addElementWise(
+                *xc, *xc, nvinfer1::ElementWiseOperation::kPROD);
+            auto* mean = net->addReduce(
+                *sq->getOutput(0), nvinfer1::ReduceOperation::kAVG, 1U << 1, true);
+            auto* me = net->addElementWise(
+                *mean->getOutput(0), *epsT->getOutput(0),
+                nvinfer1::ElementWiseOperation::kSUM);
+            auto* rt = net->addUnary(
+                *me->getOutput(0), nvinfer1::UnaryOperation::kSQRT);
+            auto* rs = net->addElementWise(
+                *oneFull->getOutput(0), *rt->getOutput(0),
+                nvinfer1::ElementWiseOperation::kDIV);
+            auto* xn = net->addElementWise(
+                *xc, *rs->getOutput(0), nvinfer1::ElementWiseOperation::kPROD);
+            auto* t1 = net->addElementWise(
+                *xn->getOutput(0), *sc, nvinfer1::ElementWiseOperation::kPROD);
+            auto* t2 = net->addElementWise(
+                *t1->getOutput(0), *xn->getOutput(0),
+                nvinfer1::ElementWiseOperation::kSUM);
+            auto* t3 = net->addElementWise(
+                *t2->getOutput(0), *sh, nvinfer1::ElementWiseOperation::kSUM);
+            y = t3->getOutput(0);
+        }
+        y->setName("o");
+        net->markOutput(*y);
+    }
     auto* cfg = b->createBuilderConfig();
     cfg->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 1U << 30);
     auto* ser = b->buildSerializedNetwork(*net, *cfg);
@@ -142,12 +198,31 @@ int run(bool rms, int N, int D, float eps, int dt) {
         }
     }
     double cos = dot / std::sqrt(no * nr);
-    std::fprintf(stderr, "%s N=%d D=%d dt=%d cos=%.5f\n", rms ? "rms_adaln" : "adaln", N, D, dt,
-        cos);
-    if (!(cos >= 0.999)) { // also rejects NaN
+    std::fprintf(stderr, "%s%s N=%d D=%d dt=%d cos=%.5f\n", use_native ? "native" : "",
+        rms ? "rms_adaln" : "adaln", N, D, dt, cos);
+    // Native BF16 decomposition rounds at every stage; gate it looser.
+    double gate = (use_native && rms && dt != 0) ? 0.99 : 0.999;
+    if (!(cos >= gate)) { // also rejects NaN
         std::fprintf(stderr, "COS FAIL\n");
         return 1;
     }
+    // bench (spec sec 7: warmup100/iter500; sub-ms needs the iters)
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    for (int i = 0; i < 100; ++i)
+        ctx->enqueueV3(stream);
+    cudaEventRecord(e0, stream);
+    for (int i = 0; i < 500; ++i)
+        ctx->enqueueV3(stream);
+    cudaEventRecord(e1, stream);
+    cudaEventSynchronize(e1);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, e0, e1);
+    ms /= 500;
+    double gbps = 4.0 * M * esz / ms / 1e6; // 3 reads + 1 write
+    std::fprintf(stderr, "%sBENCH rms=%d N=%d D=%d dt=%d ms_per_iter=%.4f gbps=%.1f\n",
+        use_native ? "NATIVE_" : "ADALN_", rms ? 1 : 0, N, D, dt, ms, gbps);
     std::fprintf(stderr, "ADALN_DONE\n");
     return 0;
 }
@@ -155,13 +230,16 @@ int run(bool rms, int N, int D, float eps, int dt) {
 
 int main(int argc, char** argv) {
     const char* so = nullptr;
+    bool native = false;
     int pos[4] = {0, 256, 128, 2}, np = 0;
     for (int i = 1; i < argc; ++i)
         if (argv[i][0] == '/')
             so = argv[i];
+        else if (!std::strcmp(argv[i], "native"))
+            native = true;
         else if (np < 4)
             pos[np++] = std::atoi(argv[i]);
     if (so)
         dlopen(so, RTLD_NOW | RTLD_GLOBAL);
-    return run(pos[0] != 0, pos[1], pos[2], 1e-6f, pos[3]);
+    return run(pos[0] != 0, pos[1], pos[2], 1e-6f, pos[3], native);
 }
