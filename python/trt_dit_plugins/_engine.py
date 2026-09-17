@@ -35,6 +35,7 @@ def torch_dtype_to_trt(dtype) -> Any:
             str(torch.float32): trt.DataType.FLOAT,
             str(torch.float16): trt.DataType.HALF,
             str(torch.bfloat16): trt.DataType.BF16,
+            str(torch.int8): trt.DataType.INT8,
             str(torch.int32): trt.DataType.INT32,
             str(torch.float8_e4m3fn): trt.DataType.FP8,
         }

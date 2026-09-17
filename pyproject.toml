@@ -6,21 +6,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trt-dit-plugins"
-version = "0.2.0"
+version = "0.4.0"
 description = "TensorRT IPluginV3 wrappers with comfy-kitchen-compatible op names (sm80/86/89 + 100/120 PTX)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-# tensorrt-cu12 lives on https://pypi.nvidia.com; nvidia-cuda-runtime-cu12 is on PyPI.
+# tensorrt-cu13 lives on https://pypi.nvidia.com; nvidia-cuda-runtime is on PyPI.
 #   pip install --extra-index-url https://pypi.nvidia.com trt-dit-plugins
 dependencies = [
     "torch",
-    "tensorrt-cu12-libs==10.16.*",
-    "nvidia-cuda-runtime-cu12>=12.6",
+    "tensorrt-cu13-libs==11.3.0.99",
+    "nvidia-cuda-runtime>=13",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+onnx = ["onnx>=1.20", "onnx-graphsurgeon>=0.3"]
 
 [tool.setuptools]
 package-dir = { "" = "python" }

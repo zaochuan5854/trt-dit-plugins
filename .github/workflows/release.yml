@@ -23,23 +23,38 @@ jobs:
   wheel-linux:
     runs-on: ubuntu-latest
     container:
-      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
+      image: nvidia/cuda:13.0.3-devel-ubuntu24.04
     env:
-      TRT_VER: 10.16.1.11-1+cuda12.9
+      TRT_VER: 11.3.0.99
+      TRT_HEADERS_TAG: v11.2
+      TENSORRT_ROOT: /tmp/trt
       DEBIAN_FRONTEND: noninteractive
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
         run: |
           apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --allow-change-held-packages --no-install-recommends \
-            ca-certificates cmake ninja-build g++ python3 python3-pip \
-            libnvinfer10=${TRT_VER} libnvinfer-plugin10=${TRT_VER} \
-            libnvinfer-headers-dev=${TRT_VER} \
-            libnvinfer-headers-plugin-dev=${TRT_VER} \
-            libnvinfer-safe-headers-dev=${TRT_VER}
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            ca-certificates curl cmake ninja-build g++ python3 python3-pip
           rm -rf /var/lib/apt/lists/*
+          pip3 install --break-system-packages -q \
+            "tensorrt-cu13-libs==${TRT_VER}" \
+            --extra-index-url https://pypi.nvidia.com
           pip3 install --break-system-packages --ignore-installed -U setuptools wheel
+          # No cuda13.0 TRT debs exist: link against the pip libs, fetch
+          # headers from GitHub (v11.2 headers + 11.3 runtime).
+          TRT_LIB=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")/tensorrt_libs
+          test -f "$TRT_LIB/libnvinfer.so.11"
+          mkdir -p /tmp/trt/include /tmp/trt/lib
+          for h in NvInfer.h NvInferImpl.h \
+              NvInferLegacyDims.h NvInferPlugin.h NvInferPluginBase.h \
+              NvInferPluginUtils.h NvInferRuntime.h NvInferRuntimeBase.h \
+              NvInferRuntimeCommon.h NvInferRuntimePlugin.h NvInferVersion.h; do
+            curl -fsSL "https://raw.githubusercontent.com/NVIDIA/TensorRT/${TRT_HEADERS_TAG}/include/$h" \
+              -o "/tmp/trt/include/$h"
+          done
+          ln -sf "$TRT_LIB/libnvinfer.so.11" /tmp/trt/lib/libnvinfer.so
+          echo "LD_LIBRARY_PATH=$TRT_LIB:$LD_LIBRARY_PATH" >> $GITHUB_ENV
       - name: Build
         run: |
           cmake -S . -B build -G Ninja \
@@ -60,8 +75,8 @@ jobs:
           path: dist/*.whl
 
   wheel-windows:
-    # Pinned to match windows.yml CI: windows-latest now defaults to VS18,
-    # whose cl crashes nvcc 12.6's cudafe.
+    # Pinned to match windows.yml CI: newer cl majors have crashed cudafe
+    # in the past.
     runs-on: windows-2022
     defaults:
       run:
@@ -74,7 +89,7 @@ jobs:
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: "12.6.3"
+          cuda: "13.2.0"
           method: network
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1

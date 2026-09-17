@@ -47,6 +47,39 @@ def int8_attention(q, k, v):
     return outs["o"]
 
 
+def sage_attn(q, k, v, fp8_pv=False):
+    """Plain dense SageAttention. q: BF16/FP16/FP32 CUDA [B,Hq,Sq,D];
+    k,v: same dtype, [B,Hkv,Sk,D] with Hq % Hkv == 0 (GQA ok), D in
+    (64,128,256). FP8 inputs are rejected (no kernel consumes them natively).
+
+    Tactic: portable FP16-PV path everywhere (sm80/86/89/90/100/120).
+    fp8_pv=True opts into the FP8-PV dense SageAttention2 path, valid only
+    on sm89 with D in (64,128), square S % 128 == 0 and FP16/BF16 inputs
+    (measured slower than tactic0 for dense shapes; opt-in for experiments).
+    Output dtype: BF16 for FP32 input, else input dtype.
+    """
+    import torch
+
+    _require_cuda(q, k, v)
+    for t in (q, k, v):
+        if t.dim() != 4 or t.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            raise ValueError("sage_attn expects 4D f32/f16/bf16 tensors")
+    if not (q.shape[0] == k.shape[0] == v.shape[0] and q.shape[3] == k.shape[3] == v.shape[3]):
+        raise ValueError("sage_attn q/k/v must share B and D")
+    if not (k.shape[1] == v.shape[1] and k.shape[2] == v.shape[2]):
+        raise ValueError("sage_attn k/v shapes must match")
+    if q.shape[1] % k.shape[1] != 0:
+        raise ValueError("sage_attn Hq must be a multiple of Hkv")
+    otype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
+    outs = E.run_plugin(
+        "sage_attn",
+        {"q": q, "k": k, "v": v},
+        [("o", otype, tuple(q.shape))],
+        {"fp8_pv": int(bool(fp8_pv))},
+    )
+    return outs["o"]
+
+
 def _adaln(name, x, scale, shift, eps=1e-6):
     _require_cuda(x, scale, shift)
     if not (x.dim() == 2 and scale.dim() == 2 and shift.dim() == 2):
@@ -138,5 +171,41 @@ def block_sparse_sage2_attn(q, k, v, mask, scale=0.0, pvthreshd=50.0, attention_
         [("o", q.dtype, tuple(q.shape))],
         {"scale": float(scale), "pvthreshd": float(pvthreshd),
          "attention_sink": int(attention_sink)},
+    )
+    return outs["o"]
+
+
+def fused_int8_rope_sage_attn(q_i8, q_scale, k_i8, k_scale, v_i8, v_scale,
+                               rms_w_q, rms_w_k, inv_freq):
+    """INT8-input RoPE+SageAttn fused DiT-self (D=128 only, S>1024).
+
+    q_i8/k_i8/v_i8: int8 CUDA [B,H,S,128] (identical shapes required).
+    q_scale/k_scale/v_scale: per-tensor fp32 scalar (single-element CUDA tensors).
+    rms_w_q/rms_w_k: fp32/bf16 CUDA [128] (same dtype). inv_freq: fp32 CUDA [64].
+    Returns bf16 [B,H,S,128].
+    """
+    _require_cuda(q_i8, q_scale, k_i8, k_scale, v_i8, v_scale, rms_w_q, rms_w_k,
+                  inv_freq)
+    import torch
+
+    for t in (q_i8, k_i8, v_i8):
+        if t.dim() != 4 or t.dtype != torch.int8 or t.shape[-1] != 128:
+            raise ValueError("fused q/k/v must be 4D int8 with D=128")
+    if not (q_i8.shape == k_i8.shape == v_i8.shape):
+        raise ValueError("q,k,v shapes must match (DiT-self)")
+    if q_i8.shape[2] <= 1024:
+        raise ValueError("fused q/k/v need S>1024 (L<=1024 path unsupported)")
+    for t in (q_scale, k_scale, v_scale):
+        if t.dtype != torch.float32 or t.numel() != 1:
+            raise ValueError("input scales must be single-element fp32")
+    if rms_w_q.shape != (128,) or rms_w_k.shape != (128,) or rms_w_q.dtype != rms_w_k.dtype:
+        raise ValueError("norm scales must be [128] with matching dtype")
+    if inv_freq.shape != (64,) or inv_freq.dtype != torch.float32:
+        raise ValueError("inv_freq must be fp32 [64]")
+    outs = E.run_plugin(
+        "fused_int8_rope_sage_attn",
+        {"q": q_i8, "qs": q_scale, "k": k_i8, "ks": k_scale, "v": v_i8,
+         "vs": v_scale, "qn": rms_w_q, "kn": rms_w_k, "inv": inv_freq},
+        [("o", torch.bfloat16, tuple(q_i8.shape))],
     )
     return outs["o"]

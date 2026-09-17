@@ -3,7 +3,7 @@
 """Locate and load the bundled plugin shared libraries.
 
 pip-only install: CUDA runtime and TensorRT come from the
-``nvidia-cuda-runtime-cu12`` and ``tensorrt-cu12`` wheels. They are preloaded
+``nvidia-cuda-runtime`` and ``tensorrt-cu13`` wheels. They are preloaded
 here by absolute path so no LD_LIBRARY_PATH / PATH setup is needed.
 """
 from __future__ import annotations
@@ -20,6 +20,8 @@ PLUGIN_NAMESPACE = "dit-plugins"
 # name -> (lib file, TRT plugin name). lib resolved at load time.
 PLUGINS = {
     "int8_attention": "int8_attention",
+    "sage_attn": "sage_attn",
+    "fused_int8_rope_sage_attn": "fused_int8_rope_sage_attn",
     "adaln": "adaln",
     "rms_adaln": "rms_adaln",
     "apply_rope": "apply_rope",
@@ -29,9 +31,9 @@ PLUGINS = {
 }
 
 # pip packages searched (first hit wins) for each dependency library.
-_PKG_CANDIDATES = ("nvidia.cuda_runtime", "nvidia.cu12", "tensorrt_libs")
-_LIB_NAMES = ("libcudart.so.12", "libnvinfer.so.10")
-_LIB_NAMES_WIN = ("cudart64_12.dll", "nvinfer_10.dll")
+_PKG_CANDIDATES = ("nvidia.cu13", "tensorrt_libs")
+_LIB_NAMES = ("libcudart.so.13", "libnvinfer.so.11")
+_LIB_NAMES_WIN = ("cudart64_13.dll", "nvinfer_11.dll")
 
 _loaded: dict[str, ctypes.CDLL] = {}
 

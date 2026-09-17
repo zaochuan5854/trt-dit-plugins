@@ -14,9 +14,9 @@ on:
 
 env:
   ARCHS: "80-real;86-real;89-real;90-real;90-virtual"
-  # CUDA 12.6's host_config.h allowlist lags the rolling VS2022 minors on
-  # hosted runners. Env var (not CMAKE_CUDA_FLAGS) so CMake's compiler-id
-  # probe also picks it up. MSVC stays ABI-compatible within 19.x.
+  # CUDA 13's host_config.h allowlist lags the rolling VS minors on hosted
+  # runners. Env var (not CMAKE_CUDA_FLAGS) so CMake's compiler-id probe
+  # also picks it up. MSVC stays ABI-compatible within 19.x.
   NVCC_APPEND_FLAGS: "-allow-unsupported-compiler"
 
 jobs:
@@ -33,14 +33,14 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda
         with:
-          cuda: "12.6.3"
+          cuda: "13.2.0"
           method: network
 
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          # Pin VS2022 toolset: runners now default to VS18, whose cl crashes
-          # nvcc 12.6's cudafe. 14.44 == VS2022 17.14 (present on the image).
+          # Pin toolset: newer cl majors have crashed cudafe in the past.
+          # 14.44 == VS2022 17.14 (present on the image).
           toolset: "14.44"
 
       - name: Set up Python
@@ -89,6 +89,13 @@ jobs:
           $env:PYTHONPATH = "python"
           python -c "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
           python -m compileall -q python/trt_dit_plugins
+
+      - name: ONNX surgery tests (CPU-only)
+        run: |
+          python -m pip install -q pytest "onnx>=1.20" "onnx-graphsurgeon>=0.3"
+          $env:PYTHONPATH = "python"
+          python -m pytest python/tests/test_surgeon.py -q
+          # test_rpn.py needs torch: runs in the GPU/self-hosted env, not here.
 
       - name: Debug session (tmate)
         if: failure() && inputs.debug

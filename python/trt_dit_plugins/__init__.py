@@ -8,19 +8,21 @@ GPUs only for execution; import itself needs neither GPU nor torch.
 from . import _lib as _lib
 from ._lib import PLUGINS, ensure_loaded, libdir
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
 __all__ = [
     "PLUGIN_VERSION",
     "PLUGINS",
     "ensure_loaded",
     "libdir",
     "int8_attention",
+    "sage_attn",
     "adaln",
     "rms_adaln",
     "apply_rope",
     "rms_rope_split_half",
     "stochastic_rounding_fp8",
     "block_sparse_sage2_attn",
+    "fused_int8_rope_sage_attn",
 ]
 
 PLUGIN_VERSION = _lib.PLUGIN_VERSION
@@ -29,12 +31,14 @@ PLUGIN_VERSION = _lib.PLUGIN_VERSION
 def __getattr__(name: str):
     if name in (
         "int8_attention",
+        "sage_attn",
         "adaln",
         "rms_adaln",
         "apply_rope",
         "rms_rope_split_half",
         "stochastic_rounding_fp8",
         "block_sparse_sage2_attn",
+        "fused_int8_rope_sage_attn",
     ):
         from . import ops as _ops
 

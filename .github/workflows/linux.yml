@@ -18,28 +18,44 @@ jobs:
     # (registration via dlopen needs no GPU). GPU E2E stays on self-hosted.
     runs-on: ubuntu-24.04
     container:
-      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
+      image: nvidia/cuda:13.0.3-devel-ubuntu24.04
     defaults:
       run:
         shell: bash
     env:
-      TRT_VER: 10.16.1.11-1+cuda12.9
+      TRT_VER: 11.3.0.99
+      TRT_HEADERS_TAG: v11.2
       ARCHS: "80-real;86-real;89-real;90-real;90-virtual"
       DEBIAN_FRONTEND: noninteractive
+      TENSORRT_ROOT: /tmp/trt
     steps:
       - uses: actions/checkout@v4
 
       - name: Install deps
         run: |
           apt-get update
-          apt-cache policy libnvinfer10 libnvinfer-headers-dev
-          apt-get install -y --allow-change-held-packages --no-install-recommends \
-            cmake ninja-build ccache g++ python3 python3-pip \
-            libnvinfer10=${TRT_VER} libnvinfer-plugin10=${TRT_VER} \
-            libnvinfer-headers-dev=${TRT_VER} \
-            libnvinfer-headers-plugin-dev=${TRT_VER} \
-            libnvinfer-safe-headers-dev=${TRT_VER} \
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl cmake ninja-build ccache g++ python3 python3-pip \
           && apt-get clean && rm -rf /var/lib/apt/lists/*
+          pip3 install --break-system-packages -q \
+            "tensorrt-cu13-libs==${TRT_VER}" \
+            --extra-index-url https://pypi.nvidia.com
+          pip3 install --break-system-packages --ignore-installed -U setuptools wheel
+          # No cuda13.0 TRT debs exist: link against the pip libs, fetch
+          # headers from GitHub (v11.2 headers + 11.3 runtime: same pattern
+          # as the Windows action already used for 10.16).
+          TRT_LIB=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")/tensorrt_libs
+          test -f "$TRT_LIB/libnvinfer.so.11"
+          mkdir -p /tmp/trt/include /tmp/trt/lib
+          for h in NvInfer.h NvInferImpl.h \
+              NvInferLegacyDims.h NvInferPlugin.h NvInferPluginBase.h \
+              NvInferPluginUtils.h NvInferRuntime.h NvInferRuntimeBase.h \
+              NvInferRuntimeCommon.h NvInferRuntimePlugin.h NvInferVersion.h; do
+            curl -fsSL "https://raw.githubusercontent.com/NVIDIA/TensorRT/${TRT_HEADERS_TAG}/include/$h" \
+              -o "/tmp/trt/include/$h"
+          done
+          ln -sf "$TRT_LIB/libnvinfer.so.11" /tmp/trt/lib/libnvinfer.so
+          echo "LD_LIBRARY_PATH=$TRT_LIB:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       - name: Configure
         run: |
@@ -88,6 +104,12 @@ jobs:
           PYTHONPATH=python python3 -c \
             "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
           python3 -m compileall -q python/trt_dit_plugins
+
+      - name: ONNX surgery tests (CPU-only)
+        run: |
+          pip3 install --break-system-packages -q pytest "onnx>=1.20" "onnx-graphsurgeon>=0.3"
+          PYTHONPATH=python python3 -m pytest python/tests/test_surgeon.py -q
+          # test_rpn.py needs torch: runs in the GPU/self-hosted env, not here.
 
       - name: Debug session (tmate)
         if: failure() && inputs.debug

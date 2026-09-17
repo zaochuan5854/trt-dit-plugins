@@ -56,6 +56,7 @@ endif()
 # Runtime overhead is 3 PLT-routed launch calls only (ns-scale, unmeasurable).
 add_library(ck_kernels SHARED
     src/kernel/sage_attention/quant_qk_int8.cu
+    src/kernel/own/fused_qk_rope_requant.cu
     src/kernel/sage_attention/quant_v_int8.cu
     src/kernel/sage_attention/sage_attn_launcher.cu
     src/kernel/adaln/adaln.cu
@@ -72,6 +73,11 @@ set_source_files_properties(
     src/kernel/sage_attention/quant_qk_int8.cu src/kernel/sage_attention/quant_v_int8.cu
     src/kernel/sage_attention/sage_attn_launcher.cu
     PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sage_attention")
+# Own implementation (not vendored): sees its own dir plus the vendored
+# sage_attention helpers it builds on (same pattern as adaln/rope above).
+set_source_files_properties(src/kernel/own/fused_qk_rope_requant.cu
+    PROPERTIES INCLUDE_DIRECTORIES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/own;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sage_attention")
 set_source_files_properties(src/kernel/adaln/adaln.cu
     PROPERTIES INCLUDE_DIRECTORIES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/adaln;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sage_attention")
@@ -86,6 +92,10 @@ set_source_files_properties(src/kernel/sparge/sparge_pre.cu src/kernel/sparge/sp
 # SpargeAttn sm89 kernel (wgmma): compile this TU for sm89 only; the plugin
 # refuses other architectures at build time (supportsTargetArchitecture).
 set_source_files_properties(src/kernel/sparge/sparge_sm89_inst.cu PROPERTIES CUDA_ARCHITECTURES 89-real)
+# fast-math ONLY for our own fused rope TU (vendored TUs untouched):
+# the numerics gate passes with it, so it stays scoped here.
+set_source_files_properties(src/kernel/own/fused_qk_rope_requant.cu
+    PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 target_link_libraries(ck_kernels PRIVATE CUDA::cudart)
 set_target_properties(ck_kernels PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
 if(WIN32)
@@ -96,9 +106,11 @@ endif()
 
 add_library(trt_dit_plugins SHARED
     src/wrapper/int8_attention_wrapper.cpp
+    src/wrapper/sage_attn_wrapper.cpp
     src/wrapper/adaln_wrapper.cpp
     src/wrapper/rope_wrapper.cpp
     src/wrapper/fp8_wrapper.cpp
+    src/wrapper/fused_int8_rope_sage_wrapper.cpp
     src/wrapper/rms_rope_wrapper.cpp
     src/wrapper/sparge_wrapper.cpp)
 target_include_directories(trt_dit_plugins PRIVATE ${TRT_INCLUDE_DIR})

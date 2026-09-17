@@ -42,5 +42,11 @@ int main(int argc, char** argv) {
     auto* bs = reg->getCreator("block_sparse_sage2_attn", "1", "dit-plugins");
     assert(bs);
     std::fprintf(stderr, "OK creator: block_sparse_sage2_attn 1 dit-plugins\n");
+    auto* sa = reg->getCreator("sage_attn", "1", "dit-plugins");
+    assert(sa);
+    std::fprintf(stderr, "OK creator: sage_attn 1 dit-plugins\n");
+    auto* fu = reg->getCreator("fused_int8_rope_sage_attn", "1", "dit-plugins");
+    assert(fu);
+    std::fprintf(stderr, "OK creator: fused_int8_rope_sage_attn 1 dit-plugins\n");
     return 0;
 }
