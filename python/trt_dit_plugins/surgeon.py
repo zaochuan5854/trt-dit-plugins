@@ -428,6 +428,10 @@ def quantize_dit_self_anchors(graph, scales: dict[str, float]) -> dict[str, Any]
     this function and the fusion.
 
     Anchor names follow :func:`fuse_dit_self_attn_block` kwargs verbatim.
+    Not idempotent: a second run without an intervening fusion would reuse
+    the ``{attn_out}_fused_*`` names and create duplicates. In the normal
+    flow (:func:`apply_dit_self_fused`, or fuse right after) this cannot
+    happen — fused blocks are no longer discovered as candidates.
     Returns ``{"applied": n, "skipped": m, "anchors": {attn_out: kwargs},
     "inv_freq": name | None}``.
     """
@@ -517,9 +521,11 @@ def _gs_has_rope_math(edge, norm_out: str) -> bool:
 def _transpose_bhsd(graph, edge, out_name: str):
     """[B,S,H,d] -> [B,H,S,d] view for rope plugin inputs."""
     gs = _gs()
+    # Shape only when fully static; a None entry would poison export on
+    # dynamic graphs (unknown dims stay unknown, TRT resolves at build).
     shape = None
     dims = _dims(edge)
-    if dims is not None and len(dims) == 4:
+    if dims is not None and len(dims) == 4 and all(isinstance(x, int) for x in dims):
         b, s, h, d = dims
         shape = [b, h, s, d]
     out = gs.Variable(out_name, dtype=edge.dtype, shape=shape)
@@ -550,6 +556,11 @@ def fuse_rope_blocks(graph, fq, epsilon: float = 1e-6, rot_dim: int = 0) -> int:
         if len(attn.inputs) < 3 or not attn.outputs:
             raise ValueError(f"rope surgery: {attn.op} {attn.name} has "
                              f"malformed inputs/outputs")
+        # Idempotency: skip blocks already fed by a rope node so a second
+        # run neither double-fuses nor collides on generated tensor names.
+        if any(getattr(p, "op", "") == _ROPE_OP
+               for t in attn.inputs[:2] for p in t.inputs):
+            continue
         nq = _gs_norm_anchor(attn.inputs[0])
         nk = _gs_norm_anchor(attn.inputs[1])
         if nq is None or nk is None:

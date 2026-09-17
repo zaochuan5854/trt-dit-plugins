@@ -542,6 +542,29 @@ def test_fuse_rope_blocks_rejects():
         S.fuse_rope_blocks(bad, np.zeros((1, 1, 8, 64, 2, 2), F32))
 
 
+def test_fuse_rope_blocks_idempotent():
+    rng = np.random.default_rng(3)
+    g = _pre_rope_graph()
+    fq = _baked_freqs(rng.random(64).astype(F32) * 0.1 + 0.01, 256)
+    assert S.fuse_rope_blocks(g, fq) == 1
+    # second run: self block already rope-fed, cross still cross -> 0 blocks
+    with pytest.raises(RuntimeError, match="0 blocks"):
+        S.fuse_rope_blocks(g, fq)
+    assert S.summarize(g)["plugin_nodes"] == {"rms_rope_split_half": 1}
+
+
+def test_fuse_rope_blocks_dynamic_shape():
+    g = _pre_rope_graph()
+    for name in ("q", "k"):
+        t = next(t for t in g.tensors().values() if t.name == name)
+        t.shape = [1, "S", 2, 128]
+    rng = np.random.default_rng(4)
+    assert S.fuse_rope_blocks(g, _baked_freqs(rng.random(64).astype(F32) * 0.1 + 0.01, 256)) == 1
+    rope = next(n for n in g.nodes if n.op == "rms_rope_split_half")
+    assert rope.inputs[0].shape is None  # unknown dims stay unknown
+    _check_ok(g)
+
+
 def test_apply_sage_attention():
     B, H, Sv, D = 1, 2, 256, 128
     q = gs.Variable("q", dtype=F32, shape=[B, H, Sv, D])
