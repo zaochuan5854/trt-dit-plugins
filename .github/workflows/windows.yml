@@ -53,10 +53,17 @@ jobs:
 
       - name: Configure and build (all cores)
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="${{ env.ARCHS }}" 2>&1 | Tee-Object build-cmake.log
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          cmake --build build --parallel $env:NUMBER_OF_PROCESSORS 2>&1 | Tee-Object build-build.log
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # NOTE: capture first, Tee second. `$LASTEXITCODE` after
+          # `... | Tee-Object` is Tee's own (always 0) and would mask a
+          # build failure, sending a half-built tree into regcheck.
+          $out = cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="${{ env.ARCHS }}" 2>&1
+          $rc = $LASTEXITCODE
+          $out | Tee-Object build-cmake.log
+          if ($rc -ne 0) { exit $rc }
+          $out = cmake --build build --parallel $env:NUMBER_OF_PROCESSORS 2>&1
+          $rc = $LASTEXITCODE
+          $out | Tee-Object build-build.log
+          if ($rc -ne 0) { exit $rc }
 
       - name: Report logs to summary on failure
         if: failure()
@@ -81,6 +88,7 @@ jobs:
 
       - name: Registration check (no GPU)
         run: |
+          if (-not (Test-Path .\build\regcheck.exe)) { Write-Error "regcheck.exe missing: build step failed?"; exit 1 }
           $env:PATH = "build;$env:TENSORRT_ROOT\bin;$env:CUDA_PATH\bin;$env:PATH"
           .\build\regcheck.exe .\build\trt_dit_plugins.dll
 

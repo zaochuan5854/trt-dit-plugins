@@ -100,7 +100,10 @@ jobs:
       - name: Configure and build (all cores)
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DTENSORRT_ROOT="$env:TENSORRT_ROOT" -DCMAKE_CUDA_ARCHITECTURES="${{ env.ARCHS }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path .\build\regcheck.exe)) { Write-Error "regcheck.exe missing: build step failed?"; exit 1 }
           $env:PATH = "build;$env:TENSORRT_ROOT\bin;$env:CUDA_PATH\bin;$env:PATH"
           .\build\regcheck.exe .\build\trt_dit_plugins.dll
       - name: Wheel

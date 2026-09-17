@@ -59,11 +59,15 @@ jobs:
 
       - name: Configure
         run: |
+          # pipefail: without it, `| tee` masks a cmake failure (tee exits 0)
+          # and a half-configured tree slides into the build.
+          set -o pipefail
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_ARCHITECTURES="${{ env.ARCHS }}" 2>&1 | tee /tmp/cmake.log
 
       - name: Build (2 jobs, hosted RAM is 16 GB)
         run: |
+          set -o pipefail
           cmake --build build --parallel 2 2>&1 | tee /tmp/build.log
 
       - name: Report logs to summary on failure
@@ -97,7 +101,9 @@ jobs:
         run: echo "::notice title=ci-log-tail::${CI_LOG_TAIL}"
 
       - name: Registration check (no GPU)
-        run: ./build/regcheck ./build/libtrt_dit_plugins.so
+        run: |
+          test -x ./build/regcheck || { echo "regcheck missing: build step failed?"; exit 1; }
+          ./build/regcheck ./build/libtrt_dit_plugins.so
 
       - name: Python import check (no GPU/torch)
         run: |
