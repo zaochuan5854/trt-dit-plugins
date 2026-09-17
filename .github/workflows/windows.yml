@@ -105,6 +105,21 @@ jobs:
           python -m pytest python/tests/test_surgeon.py -q
           # test_rpn.py needs torch: runs in the GPU/self-hosted env, not here.
 
+      - name: Build Wheel
+        run: |
+          New-Item -ItemType Directory -Force -Path python\trt_dit_plugins\lib | Out-Null
+          Copy-Item build\ck_kernels.dll, build\trt_dit_plugins.dll python\trt_dit_plugins\lib\
+          Copy-Item LICENSE, NOTICE python\trt_dit_plugins\
+          python -m pip install -U setuptools wheel
+          python -m pip wheel . -w dist --no-deps --no-build-isolation
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows
+          retention-days: 7
+          path: dist/*.whl
+
       - name: Debug session (tmate)
         if: failure() && inputs.debug
         uses: mxschmitt/action-tmate@v3

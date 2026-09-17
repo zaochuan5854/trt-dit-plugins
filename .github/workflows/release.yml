@@ -7,9 +7,15 @@ name: release
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag name"
+        required: true
 
 permissions:
   contents: write
+  actions: read
 
 defaults:
   run:
@@ -20,7 +26,51 @@ env:
   NVCC_APPEND_FLAGS: "-allow-unsupported-compiler"
 
 jobs:
+  fast-release:
+    runs-on: ubuntu-latest
+    outputs:
+      reused: ${{ steps.check.outputs.reused }}
+    steps:
+      - name: Check and reuse CI wheels
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag_name }}
+        run: |
+          set -e
+          echo "Checking CI artifacts for release: $TAG"
+          # Resolve target commit SHA of the release tag
+          TARGET_SHA=$(gh api "repos/${{ github.repository }}/commits/${TAG}" --jq .sha 2>/dev/null || echo "${{ github.sha }}")
+          echo "Target commit SHA: $TARGET_SHA"
+
+          # Search for successful runs of linux.yml and windows.yml on the same commit
+          LINUX_RUN_ID=$(gh run list --repo "${{ github.repository }}" --commit "$TARGET_SHA" --workflow "linux.yml" --status success --json databaseId --jq '.[0].databaseId')
+          WIN_RUN_ID=$(gh run list --repo "${{ github.repository }}" --commit "$TARGET_SHA" --workflow "windows.yml" --status success --json databaseId --jq '.[0].databaseId')
+
+          echo "Linux CI Run ID: $LINUX_RUN_ID"
+          echo "Windows CI Run ID: $WIN_RUN_ID"
+
+          if [ -n "$LINUX_RUN_ID" ] && [ "$LINUX_RUN_ID" != "null" ] && [ -n "$WIN_RUN_ID" ] && [ "$WIN_RUN_ID" != "null" ]; then
+            mkdir -p wheels
+            echo "Downloading CI wheel artifacts..."
+            if gh run download "$LINUX_RUN_ID" --repo "${{ github.repository }}" -n wheel-linux -D wheels && \
+               gh run download "$WIN_RUN_ID" --repo "${{ github.repository }}" -n wheel-windows -D wheels; then
+              echo "Both CI wheels downloaded successfully."
+              ls -la wheels/
+              echo "Uploading wheels to GitHub Release $TAG..."
+              gh release upload "$TAG" wheels/*.whl --repo "${{ github.repository }}" --clobber
+              echo "Successfully published CI wheels to release!"
+              echo "reused=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "CI wheel artifacts not found or incomplete. Falling back to full build."
+          echo "reused=false" >> "$GITHUB_OUTPUT"
+
   wheel-linux:
+    needs: [fast-release]
+    if: needs.fast-release.outputs.reused != 'true'
     runs-on: ubuntu-latest
     container:
       image: nvidia/cuda:13.0.3-devel-ubuntu24.04
@@ -75,6 +125,8 @@ jobs:
           path: dist/*.whl
 
   wheel-windows:
+    needs: [fast-release]
+    if: needs.fast-release.outputs.reused != 'true'
     # Pinned to match windows.yml CI: newer cl majors have crashed cudafe
     # in the past.
     runs-on: windows-2022
@@ -120,7 +172,8 @@ jobs:
           path: dist/*.whl
 
   release:
-    needs: [wheel-linux, wheel-windows]
+    needs: [fast-release, wheel-linux, wheel-windows]
+    if: needs.fast-release.outputs.reused != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -132,5 +185,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${{ github.event.release.tag_name }}" wheels/*.whl \
+          gh release upload "${{ github.event.release.tag_name || inputs.tag_name }}" wheels/*.whl \
             --clobber
