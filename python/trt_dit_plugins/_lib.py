@@ -34,10 +34,22 @@ PLUGINS = {
 
 # pip packages searched (first hit wins) for each dependency library.
 _PKG_CANDIDATES = ("nvidia.cu13", "tensorrt_libs")
-_LIB_NAMES = ("libcudart.so.13", "libnvinfer.so.11")
-_LIB_NAMES_WIN = ("cudart64_13.dll", "nvinfer_11.dll")
+_LIB_NAMES = (
+    "libcudart.so.13",
+    "libnvinfer.so.11",
+    "libnvonnxparser.so.11",
+    "libnvinfer_plugin.so.11",
+)
+_LIB_NAMES_WIN = (
+    "cudart64_13.dll",
+    "nvinfer_11.dll",
+    "nvonnxparser_11.dll",
+    "nvinfer_plugin_11.dll",
+)
 
 _loaded: dict[str, ctypes.CDLL] = {}
+_preloaded_deps: list[ctypes.CDLL] = []
+_deps_preloaded: bool = False
 
 
 def libdir() -> Path:
@@ -80,6 +92,9 @@ def _load_one(directory: Path, stem: str) -> ctypes.CDLL:
 
 def _preload_deps() -> None:
     """CDLL each pip-provided dependency so ours resolve without PATH setup."""
+    global _deps_preloaded
+    if _deps_preloaded:
+        return
     names = _LIB_NAMES_WIN if sys.platform == "win32" else _LIB_NAMES
     for pkg in _PKG_CANDIDATES:
         try:
@@ -102,7 +117,12 @@ def _preload_deps() -> None:
             except StopIteration:
                 continue
             mode = getattr(ctypes, "RTLD_GLOBAL", 0)
-            ctypes.CDLL(str(hit), mode=mode)
+            try:
+                lib = ctypes.CDLL(str(hit), mode=mode)
+                _preloaded_deps.append(lib)
+            except OSError:
+                pass
+    _deps_preloaded = True
 
 
 def ensure_loaded() -> dict[str, ctypes.CDLL]:

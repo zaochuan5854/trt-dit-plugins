@@ -9,7 +9,13 @@ from . import _lib as _lib
 from ._lib import PLUGINS, ensure_loaded, libdir
 from .select import BasePrecision, GemmKind, NormKind, PluginOp, QuantKind, RopeStyle
 
-__version__ = "0.4.1"
+# Preload pip-provided CUDA / TensorRT shared libraries into the process
+# global namespace so subsequent `import tensorrt` or ONNX parser calls succeed
+# without requiring LD_LIBRARY_PATH configuration.
+# (Plugin libraries themselves remain lazily loaded via ensure_loaded()).
+_lib._preload_deps()
+
+__version__ = "0.4.2"
 __all__ = [
     "PLUGIN_VERSION",
     "PLUGINS",
