@@ -55,9 +55,9 @@ out = tdp.stochastic_rounding_fp8(x, rng)  # rng: int32, same numel
 
 ```bash
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.4.0-cu13/trt_dit_plugins-0.4.0-py3-none-linux_x86_64.whl   # Linux
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.4.3-cu13/trt_dit_plugins-0.4.3-py3-none-linux_x86_64.whl   # Linux
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.4.0-cu13/trt_dit_plugins-0.4.0-py3-none-win_amd64.whl      # Windows
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.4.3-cu13/trt_dit_plugins-0.4.3-py3-none-win_amd64.whl      # Windows
 ```
 
 ## Quick Start
@@ -71,13 +71,13 @@ python -c "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
 | TRT name (`dit-plugins::*`) | Op | I/O dtypes | Status |
 |---|---|---|---|
 | `int8_attention` | INT8 Q/K/V attention (SageAttention), D ∈ {64,128,256} | in f32/f16/bf16 → out f16/bf16 (f32→bf16) | cos=0.99990, 0.910 ms/layer @ S=4096,H=16,D=128 (RTX 4070 Ti) |
-| `sage_attn` | Plain dense SageAttention, GQA ok, D ∈ {64,128,256} (new in 0.4.0) | in f32/f16/bf16 (FP8 inputs rejected) → out f16/bf16 (f32→bf16) | sm89+D∈{64,128}+S%128==0: FP8-PV Sage2 tactic (cos=0.99925, opt-in via `fp8_pv=1`); else portable FP16-PV (cos=0.99927) |
+| `sage_attn` | Plain dense SageAttention, GQA ok, D ∈ {64,128,256} (new in 0.4.3) | in f32/f16/bf16 (FP8 inputs rejected) → out f16/bf16 (f32→bf16) | sm89+D∈{64,128}+S%128==0: FP8-PV Sage2 tactic (cos=0.99925, opt-in via `fp8_pv=1`); else portable FP16-PV (cos=0.99927) |
 | `adaln` / `rms_adaln` | Fused LayerNorm/RMSNorm AdaLN | f32/f16/bf16 in+out (uniform) | cos=1.0 |
 | `apply_rope` | Strided (copy-free) RoPE, D even | f16/bf16 in+out; freqs f32/f16/bf16 | cos=1.0 |
 | `rms_rope_split_half` | Fused RMSNorm + split-half/partial RoPE, D multiple of 32 | f16/bf16 in+out; freqs/scales f32/f16/bf16 | cos=1.0 |
 | `stochastic_round_fp8` | Stochastic rounding to FP8 E4M3 | in f32/f16/bf16, rng INT32 → out FP8 | exact match |
 | `block_sparse_sage2_attn` | Block-sparse SageAttention2, sm89 only (kernel: SpargeAttn) | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] | cos=0.99953 |
-| `fused_int8_rope_sage_attn` | Fused INT8 RoPE+SageAttention DiT-self, D=128, S>1024 (new in 0.4.0) | in INT8 [B,H,S,128] + FP32 scales/norms → out BF16 | cos=0.99855 vs fp32 eager (matched rotation), 1.578 ms/layer @ S=4096,H=16 (1.29x vs separation; 1.12x @ S=9216, RTX 4070 Ti) |
+| `fused_int8_rope_sage_attn` | Fused INT8 RoPE+SageAttention DiT-self, D=128, S>1024 (new in 0.4.3) | in INT8 [B,H,S,128] + FP32 scales/norms → out BF16 | cos=0.99855 vs fp32 eager (matched rotation), 1.578 ms/layer @ S=4096,H=16 (1.29x vs separation; 1.12x @ S=9216, RTX 4070 Ti) |
 
 All plugin I/O is `kLINEAR` only. Q/K/V/scale inputs to one plugin must share
 one dtype. `UINT8` plugin I/O is unsupported by TRT 11.
