@@ -19,7 +19,8 @@ to guess safely. Fusion takes explicit tensor anchors instead::
 
 The fused DiT-self attention op (``fused_int8_rope_sage_attn``, 9 inputs,
 1 output) collapses a post-rope-surgery self-attention block
-(``rms_rope_split_half`` + ``SageInt8Attn``/``Attention``) into one node.
+(``rms_rope_split_half`` + ``Attention``/``sage_attn``/``int8_attention``,
+legacy ``SageInt8Attn`` accepted for old graphs) into one node.
 Same CLI surface: ``--fuse-dit-self-attn
 Q_I8,Q_SCALE,K_I8,K_SCALE,V_I8,V_SCALE,RMS_W_Q,RMS_W_K,INV_FREQ,ATTN_OUT[,NAME]``.
 
@@ -60,6 +61,12 @@ _SPECS: dict[str, tuple[int, int, frozenset[str]]] = {
     PluginOp.BLOCK_SPARSE_SAGE2_ATTN: (4, 1, frozenset({"scale", "pvthreshd", "attention_sink"})),
     PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: (9, 1, frozenset()),
 }
+
+_LEGACY_ATTN_OPS = (PluginOp.SAGE_INT8_LEGACY, "Attention")
+# Tier2 now emits dit-plugins ``sage_attn``/``int8_attention`` (shipped in
+# the wheel); fusion discovery accepts them too so fuse-after-Tier2 keeps
+# working exactly as it did for legacy ``SageInt8Attn``.
+_FUSABLE_ATTN_OPS = _LEGACY_ATTN_OPS + (PluginOp.SAGE_ATTN, PluginOp.INT8_ATTENTION)
 
 
 def _gs():
@@ -177,7 +184,8 @@ def fuse_dit_self_attn_block(graph, *, q_i8, q_scale, k_i8, k_scale, v_i8,
     anchors never "already exist")::
 
         rms_rope_split_half(qt, kt, freqs, qsc, ksc) -> (rq, rk)
-        SageInt8Attn/Attention(rq, rk, v) -> attn_out
+        Attention/sage_attn/int8_attention(rq, rk, v) -> attn_out
+        (legacy SageInt8Attn accepted too)
 
     All block tensors are explicit anchors (no pattern guessing, same
     philosophy as :func:`fuse_norm_affine`): the nine ``q_i8 ... inv_freq``
@@ -203,9 +211,9 @@ def fuse_dit_self_attn_block(graph, *, q_i8, q_scale, k_i8, k_scale, v_i8,
     if len(prods) != 1:
         raise ValueError(f"{attn_out}: want 1 producer, got {len(prods)}")
     attn = prods[0]
-    if attn.op not in (PluginOp.SAGE_INT8_LEGACY, "Attention"):
-        raise ValueError(f"{attn_out}: producer must be SageInt8Attn/Attention, "
-                         f"got {attn.op!r}")
+    if attn.op not in _FUSABLE_ATTN_OPS:
+        raise ValueError(f"{attn_out}: producer must be SageInt8Attn/Attention/sage_attn/int8_attention, "
+                          f"got {attn.op!r}")
     if len(attn.inputs) != 3:
         raise ValueError(f"{attn_out}: attention node needs exactly 3 inputs "
                          f"(mask unsupported), got {len(attn.inputs)}")
@@ -240,7 +248,6 @@ def fuse_dit_self_attn_block(graph, *, q_i8, q_scale, k_i8, k_scale, v_i8,
 # then delegate the fusion itself to fuse_dit_self_attn_block.
 
 _ROPE_OP = PluginOp.RMS_ROPE_SPLIT_HALF
-_LEGACY_ATTN_OPS = (PluginOp.SAGE_INT8_LEGACY, "Attention")
 # Truth: the fused kernel only implements the L>1024 path (validator gate).
 _FUSED_MIN_S = 1024
 
@@ -344,7 +351,7 @@ def _discover_dit_self_blocks_uncached(graph) -> list[dict[str, Any]]:
     tensors = graph.tensors()
     blocks: list[dict[str, Any]] = []
     for attn in graph.nodes:
-        if attn.op not in _LEGACY_ATTN_OPS:
+        if attn.op not in _FUSABLE_ATTN_OPS:
             continue
         if len(attn.inputs) < 3 or not attn.outputs:
             blocks.append({"attn": attn.name, "attn_op": attn.op,
@@ -507,7 +514,7 @@ def apply_dit_self_fused(graph, scales: dict[str, float]) -> dict[str, Any]:
 #
 # Unlike the constructors above, these find eligible subgraphs themselves:
 # rope blocks via upstream RMSNormalization + Mul (rope math) anchors, and
-# plain Attention nodes for the legacy SageInt8Attn rewrite. Cross-attn
+# plain Attention nodes for the attention-plugin rewrite. Cross-attn
 # (norm feeding attention directly, no rope math) is skipped, never fused.
 
 def _gs_norm_anchor(edge):
@@ -554,7 +561,7 @@ def fuse_rope_blocks(graph, fq, epsilon: float = 1e-6, rot_dim: int = 0) -> int:
     fq = np.ascontiguousarray(_checked_baked_freqs(fq), dtype=np.float32)
     plans: list[tuple] = []
     for attn in graph.nodes:
-        if attn.op not in _LEGACY_ATTN_OPS:
+        if attn.op not in _FUSABLE_ATTN_OPS:
             continue
         if len(attn.inputs) < 3 or not attn.outputs:
             raise ValueError(f"rope surgery: {attn.op} {attn.name} has "
@@ -593,7 +600,15 @@ def fuse_rope_blocks(graph, fq, epsilon: float = 1e-6, rot_dim: int = 0) -> int:
 
 
 def apply_sage_attention(graph, only: set[str] | None = None) -> int:
-    """Replace ``Attention`` nodes with ``SageInt8Attn`` in place.
+    """Replace ``Attention`` nodes with legacy ``SageInt8Attn`` in place.
+
+    .. deprecated::
+        The legacy ``sage_attn_plugin.so`` creator ships in NO wheel from
+        this repo, so graphs rewritten by this helper fail TRT parsing
+        unless callers dlopen an external legacy ``.so`` themselves.
+        Prefer :func:`apply_attention_plugins`, which emits the shipped
+        ``dit-plugins`` ``sage_attn``/``int8_attention`` ops directly.
+        Kept only for downstream compat with such external setups.
 
     This targets the legacy ``sage_attn_plugin.so`` op (empty namespace),
     NOT the ``dit-plugins`` ``sage_attn`` op: no domain is set and all
@@ -602,9 +617,8 @@ def apply_sage_attention(graph, only: set[str] | None = None) -> int:
     and reads head counts from Q/K/V shapes; the only semantic variant
     (causal mask) is rejected below, so default-scale non-causal
     ``Attention`` is a numerical drop-in. Guards: exactly 3 inputs,
-    1 output, non-causal. ``only`` restricts conversion to named nodes
-    (the unified entry uses it for per-site verdicts). Returns the
-    converted count; raises on zero.
+    1 output, non-causal. ``only`` restricts conversion to named nodes.
+    Returns the converted count; raises on zero.
     """
     n = 0
     for node in graph.nodes:
@@ -631,11 +645,50 @@ def apply_sage_attention(graph, only: set[str] | None = None) -> int:
     return n
 
 
-# New-lib ``sage_attn`` is not yet E2E-proven as a SageInt8Attn drop-in and
-# no ``int8_attention`` creator ships in the lib yet: selector verdicts for
-# either emit the legacy op until validation lands (one-line change here).
-_SAGE_PIN = (PluginOp.SAGE_INT8_LEGACY, "pinned: new-lib sage_attn/int8_attention "
-             "await E2E validation")
+def apply_plugin_attention(graph,
+                           plan: dict[str, tuple[Any, dict[str, Any]]]) -> dict[str, int]:
+    """Rewrite ``Attention`` nodes to shipped ``dit-plugins`` ops in place.
+
+    ``plan`` maps node name to ``(op, fields)`` where ``op`` is
+    ``sage_attn``/``int8_attention`` (the Tier2 selector verdicts) and
+    ``fields`` are the verdict's plugin fields (e.g. ``{"fp8_pv": 1}``).
+    Each rewritten node gets the ``dit-plugins`` domain plus
+    ``plugin_version``/``plugin_namespace``; stale exporter attrs are
+    stripped exactly like :func:`retarget_nodes`. Same structural guards
+    as :func:`apply_sage_attention` (3 inputs, 1 output, non-causal).
+    Returns ``{op: count}``; raises on zero matches.
+    """
+    counts: dict[str, int] = {}
+    for node in graph.nodes:
+        if node.op != "Attention" or node.name not in plan:
+            continue
+        op, fields = plan[node.name]
+        if op not in (PluginOp.SAGE_ATTN, PluginOp.INT8_ATTENTION):
+            raise ValueError(f"plugin surgery: {node.name} wants {op!r}, "
+                             f"want sage_attn/int8_attention")
+        if len(node.inputs) != 3:
+            raise ValueError(f"plugin surgery: Attention {node.name} has "
+                             f"{len(node.inputs)} inputs (mask unsupported)")
+        if len(node.outputs) != 1:
+            raise ValueError(f"plugin surgery: Attention {node.name} has "
+                             f"{len(node.outputs)} outputs")
+        if int(node.attrs.get("is_causal", 0)) != 0:
+            raise RuntimeError("plugin surgery: causal mask unsupported")
+        node.op = op
+        node.domain = PLUGIN_DOMAIN
+        node.attrs = {"plugin_version": PLUGIN_VERSION,
+                      "plugin_namespace": PLUGIN_NAMESPACE,
+                      **dict(fields or {})}
+        if op in _SPECS:
+            allowed = _SPECS[op][2] | {"plugin_version", "plugin_namespace"}
+            for k in list(node.attrs):
+                if k not in allowed:
+                    del node.attrs[k]
+        counts[op] = counts.get(op, 0) + 1
+    if not counts:
+        raise RuntimeError(f"plugin surgery matched 0 Attention nodes"
+                           f" of {len(plan)} requested")
+    return counts
 
 
 def _infer_base(graph) -> BasePrecision:
@@ -677,8 +730,11 @@ def apply_attention_plugins(graph, *, base: BasePrecision | None = None,
     - Tier1 (rope-fused DiT-self block, scales cover q/k/v): strict
       selector verdict with ``samples`` evidence, else the experimental
       no-samples path (static S/D/spec-floor gates, reported as such).
-    - Tier2 (plain ``Attention``): selector verdict mapped through
-      :data:`_SAGE_PIN`; already-converted ``SageInt8Attn`` is kept.
+    - Tier2 (plain ``Attention``): selector verdict (``sage_attn`` /
+      ``int8_attention``, incl. verdict fields such as ``fp8_pv``)
+      emitted directly as shipped ``dit-plugins`` nodes. Legacy
+      ``SageInt8Attn`` graphs are kept untouched but flagged by
+      :func:`validate_plugin_nodes` (no creator ships in this wheel).
     - Tier3 (``dit-plugins`` nodes) and native verdicts: untouched.
 
     Never raises on zero matches (check ``applied``); per-site structural
@@ -705,7 +761,7 @@ def apply_attention_plugins(graph, *, base: BasePrecision | None = None,
     applied: dict[str, int] = {}
     out_sites: list[dict[str, Any]] = []
     fused_blocks: list[dict[str, Any]] = []
-    sage_only: set[str] = set()
+    tier2_plan: dict[str, tuple[Any, dict[str, Any]]] = {}
     tier1_seen: set[str] = set()
     # Per-site fused opt-out reasons (structural N/A + Tier1 rejects) travel
     # into Tier2 entries: the old by_reason visibility, now per site.
@@ -778,13 +834,13 @@ def apply_attention_plugins(graph, *, base: BasePrecision | None = None,
             s = by_attn.get(node.name, {})
         verdict = s.get("op")
         if verdict in (PluginOp.SAGE_ATTN, PluginOp.INT8_ATTENTION):
-            sage_only.add(node.name)
+            fields = dict(s.get("fields") or {})
+            tier2_plan[node.name] = (verdict, fields)
             out_sites.append({"attn": node.name, "tier": 2,
                               "selected": verdict,
-                              "emitted": _SAGE_PIN[0],
+                              "emitted": verdict,
                               "reason": _note(node.name,
-                                              f"{s.get('reason', '')} "
-                                              f"[{_SAGE_PIN[1]}]")})
+                                              s.get("reason", ""))})
         else:
             out_sites.append({"attn": node.name, "tier": 2,
                               "selected": verdict, "emitted": None,
@@ -806,13 +862,13 @@ def apply_attention_plugins(graph, *, base: BasePrecision | None = None,
                 fuse_dit_self_attn_block(graph, attn_out=attn_out, **a)
             applied["fused_int8_rope_sage_attn"] = len(q["anchors"])
             graph.cleanup().toposort()
-        if sage_only:
-            applied[_SAGE_PIN[0]] = apply_sage_attention(graph, only=sage_only)
+        if tier2_plan:
+            applied.update(apply_plugin_attention(graph, tier2_plan))
     else:
         if fused_blocks:
             applied[PluginOp.FUSED_INT8_ROPE_SAGE_ATTN] = len(fused_blocks)
-        if sage_only:
-            applied[_SAGE_PIN[0]] = len(sage_only)
+        for op, _fields in tier2_plan.values():
+            applied[op] = applied.get(op, 0) + 1
     native = sum(1 for s in out_sites if s["emitted"] is None
                  and not any(o["attn"] == s["attn"] and o["emitted"]
                              for o in out_sites))
@@ -903,6 +959,14 @@ def validate_plugin_nodes(graph) -> list[str]:
     """Static checks that don't need a GPU. Returns error strings (empty = ok)."""
     errs: list[str] = []
     for node in graph.nodes:
+        if node.op == PluginOp.SAGE_INT8_LEGACY:
+            # Fail fast: no wheel from this repo registers this creator, so
+            # the TRT parser would reject it late with "Plugin not found".
+            errs.append(f"{node.name or node.op}: legacy SageInt8Attn has no "
+                        f"creator in this wheel; re-run apply_attention_plugins "
+                        f"(emits shipped sage_attn/int8_attention) or retarget "
+                        f"the node explicitly")
+            continue
         if node.domain != PLUGIN_DOMAIN:
             continue
         spec = _SPECS.get(node.op)

@@ -264,6 +264,7 @@ def test_fused_attn_validation():
     S.fuse_dit_self_attn_block(
         g, q_i8="qi", q_scale="qs", k_i8="ki", k_scale="ks", v_i8="vi",
         v_scale="vs", rms_w_q="qn", rms_w_k="kn", inv_freq="inv", attn_out="ao")
+    g.cleanup().toposort()  # caller prunes the replaced legacy nodes
     assert S.validate_plugin_nodes(g) == []
     # break q/k/v shape contract (H differs, S stays valid) -> must complain
     node = next(n for n in g.nodes if n.op == "fused_int8_rope_sage_attn")
@@ -278,6 +279,7 @@ def test_fused_attn_validation_rejects_short_seq():
     S.fuse_dit_self_attn_block(
         g, q_i8="qi", q_scale="qs", k_i8="ki", k_scale="ks", v_i8="vi",
         v_scale="vs", rms_w_q="qn", rms_w_k="kn", inv_freq="inv", attn_out="ao")
+    g.cleanup().toposort()  # caller prunes the replaced legacy nodes
     assert S.validate_plugin_nodes(g) == []
     # shrink S to the unsupported L<=1024 path -> must complain
     node = next(n for n in g.nodes if n.op == "fused_int8_rope_sage_attn")
@@ -291,6 +293,7 @@ def test_fused_attn_validation_ignores_dynamic_symbols():
     S.fuse_dit_self_attn_block(
         g, q_i8="qi", q_scale="qs", k_i8="ki", k_scale="ks", v_i8="vi",
         v_scale="vs", rms_w_q="qn", rms_w_k="kn", inv_freq="inv", attn_out="ao")
+    g.cleanup().toposort()  # caller prunes the replaced legacy nodes
     node = next(n for n in g.nodes if n.op == "fused_int8_rope_sage_attn")
     # dynamic axes with differing symbol names must not false-positive.
     node.inputs[0].shape = [1, 2, "batch", 128]
@@ -718,7 +721,9 @@ def _rope_fused_self(Sv=256):
     return g
 
 
-def test_apply_attention_plugins_tier2_sage_pin():
+def test_apply_attention_plugins_tier2_direct():
+    # MHA (Hq == Hkv): selector picks int8_attention, emitted directly as
+    # the shipped dit-plugins op (no legacy SageInt8Attn pin).
     B, H, Sv, D = 1, 2, 256, 128
     q = gs.Variable("q", dtype=F32, shape=[B, H, Sv, D])
     k = gs.Variable("k", dtype=F32, shape=[B, H, Sv, D])
@@ -728,17 +733,41 @@ def test_apply_attention_plugins_tier2_sage_pin():
                                 name="attn0")],
                  inputs=[q, k, v], outputs=[o])
     dry = S.apply_attention_plugins(g, dry_run=True)
-    assert dry["applied"] == {"SageInt8Attn": 1} and dry["native"] == 0
+    assert dry["applied"] == {"int8_attention": 1} and dry["native"] == 0
     assert [n.op for n in g.nodes] == ["Attention"]  # dry-run never mutates
     rep = S.apply_attention_plugins(g)
-    assert rep["applied"] == {"SageInt8Attn": 1}
-    assert g.nodes[0].op == "SageInt8Attn"
+    assert rep["applied"] == {"int8_attention": 1}
+    node = g.nodes[0]
+    assert node.op == "int8_attention" and node.domain == S.PLUGIN_DOMAIN
+    assert node.attrs["plugin_version"] == "1"
+    assert node.attrs["plugin_namespace"] == "dit-plugins"
     site = rep["sites"][0]
-    assert site["tier"] == 2 and site["emitted"] == "SageInt8Attn"
-    assert site["selected"] in ("sage_attn", "int8_attention")
+    assert site["tier"] == 2
+    assert site["selected"] == site["emitted"] == "int8_attention"
+    assert S.validate_plugin_nodes(g) == []
+    _check_ok(g)
     rep2 = S.apply_attention_plugins(g)
     assert rep2["applied"] == {} and rep2["native"] == 0
-    assert sum(n.op == "SageInt8Attn" for n in g.nodes) == 1
+    assert rep2["sites"][0]["tier"] == 3
+    assert sum(n.op == "int8_attention" for n in g.nodes) == 1
+
+
+def test_apply_attention_plugins_tier2_gqa_emits_sage():
+    # GQA (Hq % Hkv == 0, Hq != Hkv): int8_attention is out, sage_attn fits.
+    B, Hq, Hkv, Sv, D = 1, 4, 2, 256, 128
+    q = gs.Variable("q", dtype=F32, shape=[B, Hq, Sv, D])
+    k = gs.Variable("k", dtype=F32, shape=[B, Hkv, Sv, D])
+    v = gs.Variable("v", dtype=F32, shape=[B, Hkv, Sv, D])
+    o = gs.Variable("o", dtype=F32, shape=[B, Hq, Sv, D])
+    g = gs.Graph(nodes=[gs.Node("Attention", inputs=[q, k, v], outputs=[o],
+                                name="attn0")],
+                 inputs=[q, k, v], outputs=[o])
+    rep = S.apply_attention_plugins(g)
+    assert rep["applied"] == {"sage_attn": 1}
+    node = g.nodes[0]
+    assert node.op == "sage_attn" and node.domain == S.PLUGIN_DOMAIN
+    assert S.validate_plugin_nodes(g) == []
+    _check_ok(g)
 
 
 def test_apply_attention_plugins_tier1_experimental_fused():
@@ -769,14 +798,15 @@ def test_apply_attention_plugins_tier1_strict_with_samples():
     assert S.validate_plugin_nodes(g) == []
 
 
-def test_apply_attention_plugins_small_s_falls_back_to_sage():
+def test_apply_attention_plugins_small_s_falls_back_to_tier2():
     g = _rope_fused_self(256)
     b = S.discover_dit_self_blocks(g)[0]
     assert not b["eligible"] and b["reason"] == "S-256"
     sc = {b["q"]: 0.05, b["k"]: 0.05, b["v"]: 0.05}
     rep = S.apply_attention_plugins(g, scales=sc)
-    assert rep["applied"] == {"SageInt8Attn": 1}
+    assert rep["applied"] == {"int8_attention": 1}
     assert "fused N/A (S-256)" in rep["sites"][0]["reason"]
+    assert S.validate_plugin_nodes(g) == []
 
 
 def test_apply_sage_attention_only_subset():
@@ -796,6 +826,42 @@ def test_apply_sage_attention_only_subset():
     assert S.apply_sage_attention(g, only={"b"}) == 1
     assert {n.name: n.op for n in g.nodes} == \
         {"a": "Attention", "b_sage": "SageInt8Attn"}
+
+
+def test_validate_flags_legacy_sage():
+    # Fail fast: legacy SageInt8Attn has no creator in this wheel, so the
+    # validator must complain instead of letting TRT parsing fail late.
+    B, H, Sv, D = 1, 2, 256, 128
+    q = gs.Variable("q", dtype=F32, shape=[B, H, Sv, D])
+    k = gs.Variable("k", dtype=F32, shape=[B, H, Sv, D])
+    v = gs.Variable("v", dtype=F32, shape=[B, H, Sv, D])
+    o = gs.Variable("o", dtype=F32, shape=[B, H, Sv, D])
+    g = gs.Graph(nodes=[gs.Node("Attention", inputs=[q, k, v], outputs=[o],
+                                name="attn0")],
+                 inputs=[q, k, v], outputs=[o])
+    assert S.apply_sage_attention(g) == 1
+    errs = S.validate_plugin_nodes(g)
+    assert len(errs) == 1 and "SageInt8Attn" in errs[0]
+
+
+def test_apply_plugin_attention_rejects():
+    B, H, Sv, D = 1, 2, 256, 128
+    def mk(n, **kw):
+        return gs.Graph(
+            nodes=[gs.Node("Attention", inputs=[gs.Variable(f"i{j}", dtype=F32, shape=[B, H, Sv, D])
+                                                for j in range(kw.pop("nin", 3))],
+                           outputs=[gs.Variable("o", dtype=F32, shape=[B, H, Sv, D])],
+                           name=n, **kw)],
+            inputs=[], outputs=[])
+    with pytest.raises(ValueError, match="mask"):
+        S.apply_plugin_attention(mk("m", nin=4), {"m": ("sage_attn", {})})
+    with pytest.raises(RuntimeError, match="causal"):
+        S.apply_plugin_attention(mk("c", attrs={"is_causal": 1}),
+                                 {"c": ("sage_attn", {})})
+    with pytest.raises(ValueError, match="sage_attn/int8_attention"):
+        S.apply_plugin_attention(mk("w"), {"w": ("fused_int8_rope_sage_attn", {})})
+    with pytest.raises(RuntimeError, match="0 Attention"):
+        S.apply_plugin_attention(mk("z"), {"missing": ("sage_attn", {})})
 
 
 def _two_block_graph():
@@ -861,6 +927,9 @@ def test_apply_attention_plugins_fp8_vehicle_excludes_fused():
     sc = {"qt": 0.02, "kt": 0.03, "vi": 0.04}
     rep = S.apply_attention_plugins(g, scales=sc, gemm=GemmKind.FP8,
                                     base=BasePrecision.BF16, arch="sm89")
-    assert rep["applied"] == {"SageInt8Attn": 1}
+    assert rep["applied"] == {"sage_attn": 1}
+    node = next(n for n in g.nodes if n.op == "sage_attn")
+    assert node.domain == S.PLUGIN_DOMAIN and node.attrs.get("fp8_pv") == 1
+    assert S.validate_plugin_nodes(g) == []
     assert not [n for n in g.nodes if n.op == "fused_int8_rope_sage_attn"]
     assert not [n for n in g.nodes if n.op == "QuantizeLinear"]
