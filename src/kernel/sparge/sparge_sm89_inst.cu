@@ -4,6 +4,7 @@
 // pv_mode=1, causal=false, fuse_v_scale=true, no pv-count; hd{64,128} x out{fp16,bf16}.
 // Upstream generates 192 combos via autogen.py; we instantiate 4.
 #include "csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh"
+#include "sparge_launcher.h"
 
 #include <atomic>
 

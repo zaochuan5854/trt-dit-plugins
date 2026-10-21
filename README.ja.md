@@ -96,7 +96,7 @@ FP32 `[64]`。DiT-selfのみ（mask/causalなし）。S≤1024はビルド時拒
 | `stochastic_round_fp8` | [comfy-kitchen `backends/cuda/ops/per_tensor_quantize.cu`](https://github.com/Comfy-Org/comfy-kitchen/blob/main/comfy_kitchen/backends/cuda/ops/per_tensor_quantize.cu) |
 | `block_sparse_sage2_attn` | [SpargeAttn `csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh`](https://github.com/thu-ml/SpargeAttn/blob/main/csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh)（＋[`csrc/fused/fused.cu`](https://github.com/thu-ml/SpargeAttn/blob/main/csrc/fused/fused.cu)） |
 | `sage_attn` | 上記vendored `sage_attention` kernels（`fp8_pv`パス用にsparge sm89 kernelsを追加） |
-| `fused_int8_rope_sage_attn` | 自作 `src/kernel/own/fused_qk_rope_requant.cu`＋vendored `sage_attention` helpers |
+| `fused_int8_rope_sage_attn` | 自作 `src/kernel/fused_qk_rope_requant.cu`＋vendored `sage_attention` helpers |
 
 ## Requirements
 

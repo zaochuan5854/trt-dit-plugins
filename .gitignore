@@ -27,3 +27,4 @@ python/trt_dit_plugins/NOTICE
 *.log
 *.pid
 .ccache/
+.playwright-mcp/

@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
-typedef struct CUstream_st* cudaStream_t;
+#include <cuda_runtime.h>
 
 // Full pre-pipeline: K-mean, Q/K INT8 quant, mask->LUT, V transpose+FP8 quant.
 // All I/O contiguous BHSD (fp16/bf16); mask INT32 [B,H,QB,KB].

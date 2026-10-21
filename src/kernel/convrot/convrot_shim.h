@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Thin C glue between the TensorRT plugin and the vendored comfy-kitchen
-// ConvRot launchers (src/kernel/vendor/comfy). No kernels live here.
+// ConvRot launchers (third_party/comfy/convrot). No kernels live here.
 //
 // dtype codes are comfy's: 0 = FP32, 1 = FP16, 2 = BF16.
 // Errors: 0 = ok, 1 = "not applicable, caller falls back", -1 = failure.

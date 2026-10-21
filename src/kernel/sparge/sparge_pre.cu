@@ -12,6 +12,7 @@
 #include "csrc/cp_async.cuh"
 #include "csrc/numeric_conversion.cuh"
 #include "csrc/reduction_utils.cuh"
+#include "sparge_launcher.h"
 
 // ---- K row-mean (km), fp32 out (torch .mean() equivalent, fp32 accumulation) ----
 __global__ void sparge_kmean_kernel(const void* __restrict__ k, float* __restrict__ km,

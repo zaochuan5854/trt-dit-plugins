@@ -16,8 +16,10 @@ with or endorsed by Comfy Org; compatibility with ComfyKitchen is not a goal —
 existing DiT kernels are pluginized for TRT engines here.
 
 Unmodified copies of the following ComfyKitchen CUDA sources are vendored
-under src/kernel/ (Apache-2.0; each file carries a one-line vendoring notice
-on top, otherwise byte-identical, original SPDX headers retained):
+under third_party/comfy/ (Apache-2.0, upstream v0.2.33 commit
+e9ea99cf2f0af1d0c49c04690d4153a91c2b8668; each file carries a one-line
+vendoring notice on top, otherwise byte-identical, original SPDX headers
+retained):
 
 - backends/cuda/sage_attention/ (quant_qk_int8.cu, quant_v_int8.cu,
   sage_attn_launcher.cu and supporting .cuh)
@@ -28,10 +30,11 @@ on top, otherwise byte-identical, original SPDX headers retained):
 - backends/cuda/ops/rms_rope.cu, rope_device.cuh
 - backends/cuda/ops/per_tensor_quantize.cu
 - backends/cuda/{dtype_dispatch.cuh, float_utils.cuh, utils.cuh}
+  (deduplicated into third_party/comfy/common/)
 
 Portions of the ConvRot W8A8 / W4A4 kernels are vendored, PATCHED, under
-src/kernel/vendor/comfy/ (Apache-2.0, upstream v0.2.39 commit e40e76d9;
-see src/kernel/vendor/comfy/VENDOR.md for the exact file list and every
+third_party/comfy/convrot/ (Apache-2.0, upstream v0.2.39 commit e40e76d9;
+see third_party/comfy/VENDOR.md for the exact file list and every
 DIT-PLUGINS-PATCH change):
 
 - backends/cuda/ops/{int8_linear.cu, cutlass_gemm_int8.cu, convrot_w4a4.cu,
@@ -48,7 +51,7 @@ SpargeAttn
 Copyright (c) 2025 SpargeAttn team. All rights reserved.
 License: Apache-2.0
 Website: https://github.com/thu-ml/SpargeAttn (pinned: ae5b629, see
-src/kernel/sparge/SOURCE_PIN)
+third_party/sparge/VENDOR.md)
 
 The block_sparse_sage2_attn plugin implements the equivalent of SpargeAttn's
 block_sparse_sage2_attn_cuda (sm89 path). Extracted minimum (no whole-repo

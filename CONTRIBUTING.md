@@ -36,12 +36,13 @@ PYTHONPATH=python python3 -m pytest python/tests/test_rpn.py -q
 
 ## Rules
 
-- `src/kernel/` is vendored: content changes go upstream, only the vendoring
-  notice plus documented compat patches may live here.
-- Kernel origins are isolated per-TU in CMake (`src/kernel/<origin>/` only):
-  comfy and sparge trees share header basenames (`mma`/`math`/`cp_async`/…).
-  Never add a cross-origin `-I`; a bare cross-origin `#include` must fail,
-  not silently mix.
+- `third_party/` is vendored: content changes go upstream, only the vendoring
+  notice plus documented compat patches (`DIT-PLUGINS-PATCH`, see each
+  `VENDOR.md`) may live here. Everything under `src/` is project-owned.
+- Kernel origins are isolated per-TU in CMake (`third_party/<origin>/` only):
+  the comfy v0.2.33 tree, the comfy v0.2.39 `convrot/` tree and sparge share
+  header basenames (`mma`/`math`/`cp_async`/…). Never add a cross-origin `-I`;
+  a bare cross-origin `#include` must fail, not silently mix.
 - New plugins follow `src/wrapper/*_wrapper.cpp`: BF16-first dtype rules,
   `dit-plugins` namespace, `getTimingCacheID`, a `regcheck` entry in
   `test/test_register.cpp`, and measured verification (`cos` + ms;

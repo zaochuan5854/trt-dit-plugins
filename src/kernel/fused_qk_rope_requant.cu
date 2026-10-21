@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Own implementation (NOT vendored): lives in src/kernel/own/.
+// Own implementation (NOT vendored): lives in src/kernel/.
 // History: first written as src/kernel/sage_attention/quant_qk_int8_rope.cu,
 // moved here to separate own code from vendored SageAttention sources.
 // Uses vendored helpers (dtype_dispatch.cuh, float_utils.cuh) via -I.

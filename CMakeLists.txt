@@ -71,61 +71,63 @@ endif()
 # Split kernel lib (vendored, unmodified) from wrapper lib.
 # Runtime overhead is 3 PLT-routed launch calls only (ns-scale, unmeasurable).
 set(CONVROT_SOURCES
-    src/kernel/convrot_shim.cu
-    src/kernel/vendor/comfy/ops/int8_linear.cu
-    src/kernel/vendor/comfy/ops/cutlass_gemm_int8.cu
-    src/kernel/vendor/comfy/ops/convrot_w4a4.cu
-    src/kernel/vendor/comfy/ops/w4a8_gemm.cu)
+    src/kernel/convrot/convrot_shim.cu
+    third_party/comfy/convrot/int8_linear.cu
+    third_party/comfy/convrot/cutlass_gemm_int8.cu
+    third_party/comfy/convrot/convrot_w4a4.cu
+    third_party/comfy/convrot/w4a8_gemm.cu)
 add_library(ck_kernels SHARED
-    src/kernel/sage_attention/quant_qk_int8.cu
-    src/kernel/own/fused_qk_rope_requant.cu
-    src/kernel/sage_attention/quant_v_int8.cu
-    src/kernel/sage_attention/sage_attn_launcher.cu
-    src/kernel/adaln/adaln.cu
-    src/kernel/rope/rms_rope.cu
-    src/kernel/fp8/per_tensor_quantize.cu
+    third_party/comfy/sage_attention/quant_qk_int8.cu
+    src/kernel/fused_qk_rope_requant.cu
+    third_party/comfy/sage_attention/quant_v_int8.cu
+    third_party/comfy/sage_attention/sage_attn_launcher.cu
+    third_party/comfy/ops/adaln.cu
+    third_party/comfy/ops/rms_rope.cu
+    third_party/comfy/ops/per_tensor_quantize.cu
     src/kernel/sparge/sparge_pre.cu
     src/kernel/sparge/sparge_sm89_inst.cu
     src/kernel/prime.cu
     ${CONVROT_SOURCES})
-# ConvRot (comfy-kitchen): the vendor TUs keep upstream's nvcc flags verbatim
-# (CMakeLists.txt of comfy_kitchen/backends/cuda) so numerics match the oracle.
+# ConvRot (comfy-kitchen v0.2.39): the vendor TUs keep upstream's nvcc flags
+# verbatim (CMakeLists.txt of comfy_kitchen/backends/cuda) so numerics match
+# the oracle.
 set_source_files_properties(${CONVROT_SOURCES} PROPERTIES
     INCLUDE_DIRECTORIES
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/vendor/comfy;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/vendor/comfy/ops;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel;${CUTLASS_INCLUDE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/comfy/convrot;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/convrot;${CUTLASS_INCLUDE}"
     COMPILE_DEFINITIONS "COMFY_HAVE_CUTLASS=1"
     COMPILE_OPTIONS
     "-U__CUDA_NO_HALF_OPERATORS__;-U__CUDA_NO_HALF_CONVERSIONS__;-U__CUDA_NO_BFLOAT16_OPERATORS__;-U__CUDA_NO_BFLOAT16_CONVERSIONS__;-U__CUDA_NO_BFLOAT162_OPERATORS__;-U__CUDA_NO_BFLOAT162_CONVERSIONS__;--expt-relaxed-constexpr;--expt-extended-lambda;--use_fast_math;--compress-mode=size;-O3")
-# Origin isolation: same-basename headers exist in both trees (comfy vs
-# sparge: mma/math/cp_async/...). Each TU sees ONLY its own origin dir, so a
-# cross-origin bare #include fails loudly instead of silently mixing.
-# (Quote-includes resolve file-locally first; -I is a backstop.)
+# Origin isolation: same-basename headers exist in the comfy v0.2.33 tree, the
+# comfy v0.2.39 convrot tree and sparge (mma/math/cp_async/...). Each TU sees
+# ONLY its own origin dir, so a cross-origin bare #include fails loudly
+# instead of silently mixing. (Quote-includes resolve file-locally first; -I
+# is a backstop.)
 set_source_files_properties(
-    src/kernel/sage_attention/quant_qk_int8.cu src/kernel/sage_attention/quant_v_int8.cu
-    src/kernel/sage_attention/sage_attn_launcher.cu
-    PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sage_attention")
+    third_party/comfy/sage_attention/quant_qk_int8.cu
+    third_party/comfy/sage_attention/quant_v_int8.cu
+    third_party/comfy/sage_attention/sage_attn_launcher.cu
+    PROPERTIES INCLUDE_DIRECTORIES
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/comfy/common;${CMAKE_CURRENT_SOURCE_DIR}/third_party/comfy/sage_attention")
 # Own implementation (not vendored): sees its own dir plus the vendored
-# sage_attention helpers it builds on (same pattern as adaln/rope above).
-set_source_files_properties(src/kernel/own/fused_qk_rope_requant.cu
+# v0.2.33 common helpers it builds on.
+set_source_files_properties(src/kernel/fused_qk_rope_requant.cu
     PROPERTIES INCLUDE_DIRECTORIES
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/own;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sage_attention")
-set_source_files_properties(src/kernel/adaln/adaln.cu
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel;${CMAKE_CURRENT_SOURCE_DIR}/third_party/comfy/common")
+# v0.2.33 ops (adaln / rms_rope / fp8) share one upstream ops dir + common headers.
+set_source_files_properties(
+    third_party/comfy/ops/adaln.cu third_party/comfy/ops/rms_rope.cu
+    third_party/comfy/ops/per_tensor_quantize.cu
     PROPERTIES INCLUDE_DIRECTORIES
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/adaln;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sage_attention")
-set_source_files_properties(src/kernel/rope/rms_rope.cu
-    PROPERTIES INCLUDE_DIRECTORIES
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/rope;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sage_attention")
-set_source_files_properties(src/kernel/fp8/per_tensor_quantize.cu
-    PROPERTIES INCLUDE_DIRECTORIES
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/fp8;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sage_attention")
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/comfy/common;${CMAKE_CURRENT_SOURCE_DIR}/third_party/comfy/ops")
 set_source_files_properties(src/kernel/sparge/sparge_pre.cu src/kernel/sparge/sparge_sm89_inst.cu
-    PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sparge")
+    PROPERTIES INCLUDE_DIRECTORIES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sparge;${CMAKE_CURRENT_SOURCE_DIR}/third_party/sparge")
 # SpargeAttn sm89 kernel (wgmma): compile this TU for sm89 only; the plugin
 # refuses other architectures at build time (supportsTargetArchitecture).
 set_source_files_properties(src/kernel/sparge/sparge_sm89_inst.cu PROPERTIES CUDA_ARCHITECTURES 89-real)
 # fast-math ONLY for our own fused rope TU (vendored TUs untouched):
 # the numerics gate passes with it, so it stays scoped here.
-set_source_files_properties(src/kernel/own/fused_qk_rope_requant.cu
+set_source_files_properties(src/kernel/fused_qk_rope_requant.cu
     PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 target_link_libraries(ck_kernels PRIVATE CUDA::cudart)
 set_target_properties(ck_kernels PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
@@ -146,7 +148,8 @@ add_library(trt_dit_plugins SHARED
     src/wrapper/sparge_wrapper.cpp
     src/wrapper/convrot_linear_wrapper.cpp)
 target_include_directories(trt_dit_plugins PRIVATE ${TRT_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/kernel)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/convrot
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/sparge)
 target_link_libraries(trt_dit_plugins PRIVATE ck_kernels CUDA::cudart ${NVINFER_LIB})
 set_target_properties(trt_dit_plugins PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
 

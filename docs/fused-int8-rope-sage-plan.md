@@ -38,7 +38,7 @@ QKVはint8+scale入力 / 適用先は Reforge-New int8エンジン。
 * V単一パスrequant: int8→int8でper-tensor入力scaleをblock scaleにfold
   (`scale_out=sc_block*s_in`、量子化値側はs_inが相殺し既存と一致)。
   bf16中間を経由する二重変換を除去。
-* fast-mathは自作rope TU (`src/kernel/own/`) のみに限定。vendored TUは対象外。
+* fast-mathは自作rope TU (`src/kernel/`) のみに限定。vendored TUは対象外。
 * Hadamard正規化のscale集約: `convrot128` 末尾の定数倍を格納scale側に集約し、
   量子化divisor側で対応する除算に (対称INT8では丸め一致)。
 * K half-staging: half-0をSMEM fp16、half-1をレジスタ保持し、PassBの再計算を

@@ -10,22 +10,13 @@
 #include <NvInferRuntime.h>
 
 #include "rt.h"
+#include "sparge_launcher.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 
 #include <cuda_runtime.h>
-
-extern "C" {
-void launch_sparge_preprocess(const void* q, const void* k, const void* mask, const void* v,
-    int8_t* q_i8, float* q_s, int8_t* k_i8, float* k_s, float* km, int32_t* lut, int32_t* vbn,
-    void* vT, void* v_fp8, float* v_s, void* v_fp16_tmp, int B, int Hq, int Hkv, int S, int D,
-    int is_bf16, void* stream);
-void launch_block_sparse_sage2_sm89(int8_t* q_i8, int8_t* k_i8, void* v_fp8, void* o,
-    int32_t* lut, int32_t* vbn, float* pv_thr, float* q_s, float* k_s, float* v_s, int B, int Hq,
-    int Hkv, int S, int D, int is_bf16, float sm_scale, void* stream);
-}
 
 namespace {
 constexpr char const* kName = "block_sparse_sage2_attn";

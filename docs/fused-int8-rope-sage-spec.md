@@ -4,14 +4,15 @@
 
 Anima DiT-self attentionに対し、int8量子化TRTエンジン(`ComfyUI-TensorRT-Reforge-Dev-New` の
 SmoothQuant W8A8 static系)上で動作する RoPE+SageAttn 融合プラグインを新設する。
-QKV入力は **INT8+scale** であり、bf16入力パスは既存 `int8_attention` が担当するため本仕様の対象外。
+QKV入力は **INT8+scale** を基本とする。0.5.0以降は **BF16/FP16/FP32 も受容**し
+(scale入力は無視)、前段の QuantizeLinear を省ける (`fused_rope_sage_attn`)。
 
 ## 2. スコープ
 
 ### 2.1 対象
 
 * Anima DiT 28層の **self-attnのみ**。Q/K/V同長 (square)、H=16、D=128固定。
-* S (=潜在画像のH×W積) は `1025〜9216` (代表点 S=4096・S=9216、S≦1024はビルド時拒否)。B=1固定。
+* S (=潜在画像のH×W積) は `1〜9216` (代表点 S=4096・S=9216)。S≦1024も可 (cta_k=128固定)。B=1固定。
 * 適用先: `ComfyUI-TensorRT-Reforge-Dev-New` の int8量子化TRTエンジン
   (`src/trt_reforge/onnx_ops/int8.py` の per-channel weight + per-tensor act Q/DQ系)。
 
@@ -28,7 +29,7 @@ cross-attn、LLMAdapter (D64)、causal/mask、sparse/window、FP8、動画T>1、
   `dit_plugins.py:112-193` norm+rope→`rms_rope_split_half` (PRE-norm入力+baked freqs)。
 * 既存 `int8_attention` pluginは bf16/fp16/fp32入力→内部quant→attn
   (`src/wrapper/int8_attention_wrapper.cpp:5,110-142,194-206`)。
-  本新設はこの前段を置き換え、`src/kernel/sage_attention/` 本体
+  本新設はこの前段を置き換え、`third_party/comfy/sage_attention/` 本体
   (`quant_qk/quant_v/sage_attn_launcher`)は再利用する。
 * Anima DiT-self確定値: `D_model 2048/H16/D128/MHA`、QK per-head RMSNorm eps1e-6、
   3D split-half行列RoPE fp32、非causal・maskなし。
@@ -58,7 +59,7 @@ cross-attn、LLMAdapter (D64)、causal/mask、sparse/window、FP8、動画T>1、
   norm scalesはkFLOAT/kHALF/kBF16許容、出力kBF16、formatはkLINEARのみ。
 * `configurePlugin`: D==128・ndims==4以外拒否。
 * workspaceは既存 `planWs` 流儀+前段バッファ (fp32 Q/Kタイル・Sage scale) を加算。
-  `cta_k = (Lk>1024) ? 128 : 64` は既存踏襲 (本条件ではほぼ128)。
+  `cta_k` は常に128 (量子化レイアウトがBLKK=128固定のため)。
 
 ## 5. カーネルデータフロー
 
