@@ -3,7 +3,7 @@
 // Registration: name="fused_int8_rope_sage_attn", namespace="dit-plugins".
 //
 // Scope (see docs/fused-int8-rope-sage-spec.md):
-// - DiT-self only (Q/K/V same [B,H,S,D]), Hq==Hkv, D==128, L>1024, non-causal.
+// - DiT-self only (Q/K/V same [B,H,S,D]), Hq==Hkv, D==128, non-causal.
 // - Q/K/V arrive as INT8 + per-tensor FP32 input scales (int8 engine); the
 //   plugin fuses dequant -> RMSNorm -> split-half RoPE (inv_freq[64]) ->
 //   Sage per-thread INT8 quant, then runs the existing Sage attention body.
@@ -68,7 +68,9 @@ struct WsPlan {
 
 WsPlan planWs(int B, int H, int L, int D) {
     WsPlan p{0, 0, 0, 0, 0, 0, 0, 0, 0};
-    p.cta_k = (D >= 128 && L > 1024) ? 128 : 64;
+    // The fused K quantizer writes the BLKK=128 scale layout, so the Sage
+    // body must consume cta_k=128 at every L (cta_k=64 is a perf choice only).
+    p.cta_k = 128;
     p.padded_L = (L + p.cta_k - 1) / p.cta_k * p.cta_k;
     int64_t off = 0;
     p.off_qi = off;
@@ -180,18 +182,6 @@ public:
                 return -1;
         if (in[kQ].max.d[3] != 128)
             return -1; // D=128 only
-        if (in[kQ].max.d[2] <= 1024) {
-            DIT_REJECT(kName, "configure", "max S %d <= 1024 (L<=1024 path is broken)",
-                       in[kQ].max.d[2]);
-            return -1; // ROTATION=128 path (L>1024); the L<=1024 path is
-        }
-        // The L<=1024 path is broken (wrong results/crash): reject when the
-        // profile can produce it, not only when max says so (R3).
-        if (in[kQ].min.d[2] >= 0 && in[kQ].min.d[2] <= 1024) {
-            DIT_REJECT(kName, "configure", "min S %d <= 1024 (L<=1024 path is broken)",
-                       in[kQ].min.d[2]);
-            return -1;
-        }
         return 0;
     }
 
@@ -202,7 +192,7 @@ public:
             return 0;
         int B = in[kQ].max.d[0], H = in[kQ].max.d[1], L = in[kQ].max.d[2],
             D = in[kQ].max.d[3];
-        if (D != 128 || L <= 1024)
+        if (D != 128)
             return 0;
         return (size_t)planWs(B, H, L, D).total;
     }
@@ -221,7 +211,7 @@ public:
         H_ = in[kQ].dims.d[1];
         L_ = in[kQ].dims.d[2];
         D_ = in[kQ].dims.d[3];
-        if (D_ != 128 || L_ <= 1024)
+        if (D_ != 128)
             return -1;
         for (int i : {kK, kV})
             for (int d = 0; d < 4; ++d)

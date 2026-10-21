@@ -13,17 +13,18 @@
 // per-thread INT8 quant with Sage-identical scale layout.
 //
 // Output layout contract is IDENTICAL to launch_quant_qk_per_thread_int8 with
-// BLKQ=128/WARPQ=32/BLKK=128/WARPK=128 (the Lk>1024 dispatch of the existing
-// quantizer): q_sc_per_h = q_oblk*8, k_sc_per_h = k_oblk*4, so the existing
-// launch_sage_attn_kernel consumes our outputs unchanged.
+// BLKQ=128/WARPQ=32/BLKK=128/WARPK=128: q_sc_per_h = q_oblk*8,
+// k_sc_per_h = k_oblk*4, so launch_sage_attn_kernel(cta_k=128) consumes our
+// outputs unchanged at every L.
 //
 // Deliberate simplifications:
 // - No anchor search: K uses per-head mean subtraction (smooth-K). The existing
 //   detect_k_anchor path is skipped; accuracy is covered by the cos gate.
 // - Norm is computed in fp32 WITHOUT the bf16 intermediate rounding that
 //   rms_rope.cu applies (strictly less lossy; cos gate absorbs the delta).
-// - D=128, contiguous [B,H,L,D] INT8 I/O, L>1024 (asserted, else fallback;
-//   the L<=1024 path is broken, so every layer rejects it at build time).
+// - D=128, contiguous [B,H,L,D] INT8 I/O. Every L uses the BLKK=128 scale
+//   layout; the Sage body is launched with cta_k=128 for consistency (the
+//   cta_k=64 layout was the source of the old L<=1024 mismatch).
 // - Input scales are per-tensor scalars (SmoothQuant static convention).
 
 #include "dtype_dispatch.cuh"
@@ -799,9 +800,6 @@ void launch_fused_qk_rope_int8(
   if (C != 128)
     throw std::runtime_error(
         "fused_qk_rope_int8: head_dim 128 only");
-  if (L <= 1024)
-    throw std::runtime_error(
-        "fused_qk_rope_int8: requires L>1024 (ROTATION=128 path)");
   if (!ws_mean)
     throw std::runtime_error("fused_qk_rope_int8: mean workspace required");
   if (reinterpret_cast<uintptr_t>(q_i8) % 4 != 0 ||

@@ -117,7 +117,8 @@ _QUANT_ALIASES = {
 # universal truths. Gate lookup uses the exact-S point when present, else
 # the conservative min over known points (see _table_cos).
 KNOWN_COS: dict[str, dict[int, float]] = {
-    PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: {2048: 0.9977, 4096: 0.99855},
+    PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: {1024: 0.99836, 2048: 0.9977,
+                                        4096: 0.99855},
     PluginOp.INT8_ATTENTION: {4096: 0.99990},
     PluginOp.SAGE_ATTN: {4096: 0.99927},
     "sage_attn+fp8_pv": {4096: 0.99925},
@@ -181,21 +182,13 @@ _DISCOVERY_OPS = ("Attention", PluginOp.SAGE_INT8_LEGACY)
 _PLUGIN_ATTN_OPS = (PluginOp.SAGE_ATTN, PluginOp.INT8_ATTENTION,
                     PluginOp.FUSED_INT8_ROPE_SAGE_ATTN,
                     PluginOp.BLOCK_SPARSE_SAGE2_ATTN)
-_FUSED_MAX_S = 9216  # validated range per fused spec sec 2.1 (validator gates >1024).
+_FUSED_MAX_S = 9216  # validated range per fused spec sec 2.1.
 
 # Observed kernel failures. Entries must stay excluded by the gates below;
 # test_known_bad_regressions enforces it via each probe. Add an entry (with
 # a probe) whenever a crash/wrong-result condition is found -- never relax
-# a covering gate without removing its entry first. Defense in depth for
-# the S<=1024 entry also lives in the launcher (assert), the wrapper
-# (configurePlugin/onShapeChange reject), ops.py (pre-launch ValueError),
-# and surgeon.validate_plugin_nodes.
-KNOWN_BAD: tuple[dict[str, Any], ...] = (
-    {"op": PluginOp.FUSED_INT8_ROPE_SAGE_ATTN, "cond": "S<=1024",
-     "failure": "L<=1024 path: cos 0.80 at S=512, illegal memory access at S=1024",
-     "probe": {"base": BasePrecision.BF16, "quant": QuantKind.INT8, "S": 1024, "D": 128,
-               "Hq": 16, "Hkv": 16, "arch": "sm89", "rope_fusable": True}},
-)
+# a covering gate without removing its entry first.
+KNOWN_BAD: tuple[dict[str, Any], ...] = ()
 
 
 def _coerce_base(v: Any) -> BasePrecision:
@@ -278,8 +271,6 @@ def fused_static_ok(*, S: int | None, D: int | None) -> tuple[bool, str]:
     """
     if S is None:
         return False, "fused: unknown S"
-    if S <= 1024:
-        return False, f"fused: S={S} known-bad (<=1024)"
     if S > _FUSED_MAX_S:
         return False, f"fused: S={S} out of validated range (>{_FUSED_MAX_S})"
     if D is not None and D != 128:
@@ -514,11 +505,8 @@ def select_attention(*, base: BasePrecision, quant: QuantKind | None = None,
         elif D is not None and D != 128:
             notes.append(f"fused: D={D}, want 128")
         elif S is None:
-            notes.append("fused: unknown S (needs S>1024; dynamic profiles"
-                         " must be proven >1024 before fusing)")
-        elif S <= 1024:
-            notes.append(f"fused: S={S} known-bad (wrong results/crash"
-                         " observed on the L<=1024 path)")
+            notes.append("fused: unknown S (the cos table is per-S; use a"
+                         " static S to select)")
         elif S > _FUSED_MAX_S:
             notes.append(f"fused: S={S} out of validated range (>{_FUSED_MAX_S})")
         elif compat is None or not isinstance(compat, dict) \

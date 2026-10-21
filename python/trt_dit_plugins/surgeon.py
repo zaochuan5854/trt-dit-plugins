@@ -233,7 +233,7 @@ def import_comfy_convrot(graph, *, gemm_config=-1):
 def add_dit_self_fused_attn(graph, q_i8, q_scale, k_i8, k_scale, v_i8,
                             v_scale, rms_w_q, rms_w_k, inv_freq, name=None,
                             out_dtype=None):
-    """DiT-self int8 RoPE+Sage fused (D=128, S>1024).
+    """DiT-self int8 RoPE+Sage fused (D=128).
 
     q_i8/k_i8/v_i8: INT8 [B,H,S,128]; q_scale/k_scale/v_scale: FP32 scalar;
     rms_w_q/rms_w_k: [128]; inv_freq: FP32 [64]. Returns BF16 [B,H,S,128].
@@ -252,7 +252,7 @@ def fuse_dit_self_attn_block(graph, *, q_i8, q_scale, k_i8, k_scale, v_i8,
                              v_scale, rms_w_q, rms_w_k, inv_freq, attn_out,
                              name=None):
     """Third surgery: collapse a post-rope-surgery self-attn block into one
-    ``fused_int8_rope_sage_attn`` node (DiT-self, D=128, S>1024).
+    ``fused_int8_rope_sage_attn`` node (DiT-self, D=128).
 
     Expected pre-shape (rope+sage surgery done; the nine INT8 anchors
     created by the caller, e.g. ``QuantizeLinear`` Q nodes with calibrated
@@ -324,8 +324,6 @@ def fuse_dit_self_attn_block(graph, *, q_i8, q_scale, k_i8, k_scale, v_i8,
 # then delegate the fusion itself to fuse_dit_self_attn_block.
 
 _ROPE_OP = PluginOp.RMS_ROPE_SPLIT_HALF
-# Truth: the fused kernel only implements the L>1024 path (validator gate).
-_FUSED_MIN_S = 1024
 
 # Same-input result cache for graph queries. Keyed by structural
 # fingerprint (not object identity): equal graphs share results, and any
@@ -406,8 +404,8 @@ def discover_dit_self_blocks(graph) -> list[dict[str, Any]]:
 
     A block is eligible when Q/K come from the SAME ``rms_rope_split_half``
     node (this rejects cross-attn) and no statically-known shape violates
-    the plugin contract (D=128, rank-4 Q/K/V, S>1024, ``[1,1,S,64,2,2]``
-    freqs, ``[128]`` norms). Unknown (dynamic/profile) dims never reject:
+    the plugin contract (D=128, rank-4 Q/K/V, ``[1,1,S,64,2,2]`` freqs,
+    ``[128]`` norms). Unknown (dynamic/profile) dims never reject:
     TRT resolves them at build. Returns one dict per candidate with
     ``eligible`` + ``reason``; source names (``q``/``k``/``freqs``/
     ``rms_w_q``/``rms_w_k``/``v``/``attn_out``) are always populated for
@@ -461,8 +459,6 @@ def _check_dit_self_block(b: dict[str, Any], tensors: dict[str, Any]) -> dict[st
                 return {"eligible": False, "reason": f"{key}-rank-{len(dims)}"}
             if dims[3] is not None and dims[3] != 128:
                 return {"eligible": False, "reason": f"D-{dims[3]}"}
-            if key != "v" and dims[2] is not None and dims[2] <= _FUSED_MIN_S:
-                return {"eligible": False, "reason": f"S-{dims[2]}"}
     dims = _dims(tensors.get(b["freqs"]))
     if dims is not None and (len(dims) != 6 or dims[3] != 64):
         return {"eligible": False, "reason": f"bad-freqs-{dims}"}
@@ -1113,8 +1109,6 @@ def validate_plugin_nodes(graph) -> list[str]:
             s = _shape_of(node.inputs[0], 2)
             if d is not None and d != 128:
                 errs.append(f"{node.name or node.op}: D={d}, want 128")
-            if s is not None and s <= 1024:
-                errs.append(f"{node.name or node.op}: S={s}, want >1024")
             if len(node.inputs) == 9:
                 # DiT-self contract: q/k/v identical shapes, fully-static only
                 # (dynamic dims/symbols never reject; TRT resolves at build).

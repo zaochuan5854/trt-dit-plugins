@@ -173,7 +173,7 @@ def block_sparse_sage2_attn(q, k, v, mask, scale=0.0, pvthreshd=50.0, attention_
 
 def fused_int8_rope_sage_attn(q_i8, q_scale, k_i8, k_scale, v_i8, v_scale,
                                rms_w_q, rms_w_k, inv_freq):
-    """INT8-input RoPE+SageAttn fused DiT-self (D=128 only, S>1024).
+    """INT8-input RoPE+SageAttn fused DiT-self (D=128 only).
 
     q_i8/k_i8/v_i8: int8 CUDA [B,H,S,128] (identical shapes required).
     q_scale/k_scale/v_scale: per-tensor fp32 scalar (single-element CUDA tensors).
@@ -189,8 +189,6 @@ def fused_int8_rope_sage_attn(q_i8, q_scale, k_i8, k_scale, v_i8, v_scale,
             raise ValueError("fused q/k/v must be 4D int8 with D=128")
     if not (q_i8.shape == k_i8.shape == v_i8.shape):
         raise ValueError("q,k,v shapes must match (DiT-self)")
-    if q_i8.shape[2] <= 1024:
-        raise ValueError("fused q/k/v need S>1024 (L<=1024 path unsupported)")
     for t in (q_scale, k_scale, v_scale):
         if t.dtype != torch.float32 or t.numel() != 1:
             raise ValueError("input scales must be single-element fp32")

@@ -273,18 +273,18 @@ def test_fused_attn_validation():
     assert S.validate_plugin_nodes(g) != []
 
 
-def test_fused_attn_validation_rejects_short_seq():
+def test_fused_attn_validation_accepts_short_seq():
     g = _post_rope_graph()
     S.fuse_dit_self_attn_block(
         g, q_i8="qi", q_scale="qs", k_i8="ki", k_scale="ks", v_i8="vi",
         v_scale="vs", rms_w_q="qn", rms_w_k="kn", inv_freq="inv", attn_out="ao")
     g.cleanup().toposort()  # caller prunes the replaced legacy nodes
     assert S.validate_plugin_nodes(g) == []
-    # shrink S to the unsupported L<=1024 path -> must complain
+    # S<=1024 is supported since the fused path pins cta_k=128.
     node = next(n for n in g.nodes if n.op == "fused_int8_rope_sage_attn")
     for i in (0, 2, 4):
         node.inputs[i].shape = [1, 2, 1024, 128]
-    assert any("want >1024" in e for e in S.validate_plugin_nodes(g))
+    assert S.validate_plugin_nodes(g) == []
 
 
 def test_fused_attn_validation_ignores_dynamic_symbols():
@@ -388,7 +388,7 @@ def _discover_graph():
     co = gs.Variable("co", dtype=F32, shape=[B, H, 2048, D])
     g.inputs += [cq, ck, cv]
     g.nodes.append(gs.Node("Attention", inputs=[cq, ck, cv], outputs=[co]))
-    # short-S self block (S=512 <= 1024 truth gate)
+    # short-S self block (S=512)
     st = gs.Variable("st", dtype=np.int8, shape=[B, H, 512, D])
     sk = gs.Variable("sk", dtype=np.int8, shape=[B, H, 512, D])
     sv = gs.Variable("sv", dtype=F32, shape=[B, H, 512, D])
@@ -416,7 +416,7 @@ def test_discover_dit_self_blocks():
     assert blocks["ao"]["eligible"] and blocks["ao"]["reason"] == "ok"
     assert blocks["ao"]["rms_w_q"] == "qsc" and blocks["ao"]["v"] == "vi"
     assert not blocks["co"]["eligible"] and blocks["co"]["reason"] == "cross-or-unpaired-qk"
-    assert not blocks["sao"]["eligible"] and blocks["sao"]["reason"] == "S-512"
+    assert blocks["sao"]["eligible"] and blocks["sao"]["reason"] == "ok"
     assert not blocks["mo"]["eligible"] and blocks["mo"]["reason"] == "malformed-attn"
 
 
@@ -713,16 +713,16 @@ def test_discover_cache_invalidated_by_mutation():
     assert S.discover_dit_self_blocks(g)[0]["eligible"]
     rope = next(n for n in g.nodes if n.op == "rms_rope_split_half")
     for i in (0, 1):
-        rope.inputs[i].shape = [1, 2, 512, 128]
+        rope.inputs[i].shape = [1, 2, 1024, 64]
     after = S.discover_dit_self_blocks(g)
-    assert not after[0]["eligible"] and after[0]["reason"] == "S-512"
+    assert not after[0]["eligible"] and after[0]["reason"] == "D-64"
 
 
 def _rope_fused_self(Sv=256):
     B, Hd, D = 1, 2, 128
     q = gs.Variable("q", dtype=F32, shape=[B, Sv, Hd, D])
     k = gs.Variable("k", dtype=F32, shape=[B, Sv, Hd, D])
-    v = gs.Variable("v", dtype=F32, shape=[B, Sv, Hd, D])
+    v = gs.Variable("v", dtype=F32, shape=[B, Hd, Sv, D])
     qs = gs.Variable("qs", dtype=F32, shape=[D])
     ks = gs.Variable("ks", dtype=F32, shape=[D])
     nq = gs.Variable("nq", dtype=F32, shape=[B, Sv, Hd, D])
@@ -824,14 +824,14 @@ def test_apply_attention_plugins_tier1_strict_with_samples():
     assert S.validate_plugin_nodes(g) == []
 
 
-def test_apply_attention_plugins_small_s_falls_back_to_tier2():
+def test_apply_attention_plugins_small_s_uses_fused():
     g = _rope_fused_self(256)
     b = S.discover_dit_self_blocks(g)[0]
-    assert not b["eligible"] and b["reason"] == "S-256"
+    assert b["eligible"] and b["reason"] == "ok"
     sc = {b["q"]: 0.05, b["k"]: 0.05, b["v"]: 0.05}
     rep = S.apply_attention_plugins(g, scales=sc)
-    assert rep["applied"] == {"int8_attention": 1}
-    assert "fused N/A (S-256)" in rep["sites"][0]["reason"]
+    assert rep["applied"] == {"fused_int8_rope_sage_attn": 1}
+    assert rep["sites"][0]["tier"] == 1
     assert S.validate_plugin_nodes(g) == []
 
 

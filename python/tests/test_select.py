@@ -93,7 +93,7 @@ def test_fused_scope_min_cos_applies_to_sim_not_table():
 def test_fused_seq_gates_and_s_bucket():
     assert C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=1024, D=128,
                               Hq=16, Hkv=16, arch="sm89", rope_fusable=True,
-                              compat=_compat())["op"] is None
+                              compat=_compat())["op"] == "fused_int8_rope_sage_attn"
     assert C.select_attention(base=BasePrecision.BF16, quant=QuantKind.INT8, S=None, D=128,
                               Hq=16, Hkv=16, arch="sm89", rope_fusable=True,
                               compat=_compat())["op"] is None
