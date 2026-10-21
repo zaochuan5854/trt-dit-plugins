@@ -38,7 +38,7 @@ import itertools
 from collections import deque
 from typing import Any
 
-from .select import BasePrecision, GemmKind, PluginOp, require_enum
+from .select import BasePrecision, GemmKind, PluginOp, convrot_shape_ok, require_enum
 
 PLUGIN_DOMAIN = "dit-plugins"
 PLUGIN_VERSION = "1"
@@ -159,8 +159,9 @@ def add_convrot_linear(graph, x, weight, weight_scale, bias, *, w4a4=False,
     bias: [N] in the output dtype (zeros with ``has_bias=False``). The weight
     must already carry the ConvRot rotation. Returns y [..., N].
 
-    ``out_dtype``: -1 = input dtype, 0 = BF16, 1 = FP16, 2 = FP32 (plan 4.2;
-    BF16 has no numpy dtype, so the declared output keeps ``x.dtype``).
+    ``out_dtype``: -1 = input dtype, 0 = BF16, 1 = FP16, 2 = FP32 (plan 4.2).
+    The declared output dtype is the plugin's real output; ``bias`` must
+    already be in that dtype.
     ``gemm_config``: -1 = automatic route; >= 0 pins a W4A4 GEMM tile config.
     """
     gs = _gs()
@@ -169,7 +170,10 @@ def add_convrot_linear(graph, x, weight, weight_scale, bias, *, w4a4=False,
     out_shape = None
     if x.shape is not None:
         out_shape = [*x.shape[:-1], n if n is not None else -1]
-    dtype = {2: "float32", 1: "float16"}.get(int(out_dtype), x.dtype)
+    code = int(out_dtype)
+    if code not in (-1, 0, 1, 2):
+        raise ValueError(f"out_dtype must be -1/0/1/2, got {out_dtype!r}")
+    dtype = {0: "bfloat16", 1: "float16", 2: "float32"}.get(code, x.dtype)
     out = gs.Variable(name=f"dit_out{next(_uid)}", dtype=dtype, shape=out_shape)
     _plugin_node(graph, op, [x, weight, weight_scale, bias], [out],
                  {"group_size": 256, "has_bias": int(bool(has_bias)),
@@ -205,8 +209,11 @@ def import_comfy_convrot(graph, *, gemm_config=-1):
         if int(attr.get("transposed", 0)):
             skipped.append(name)  # _qdata is [K,N]; v1 only takes [N,K]
             continue
-        if len(node.inputs) < 4 or node.inputs[3] is None or not node.inputs[3].name:
-            skipped.append(name)  # bias is required (the plugin always takes it)
+        if (len(node.inputs) != 4 or len(node.outputs) != 1
+                or node.inputs[3] is None or not node.inputs[3].name):
+            # The plugin takes exactly (x, w, ws, b) and one output; comfy's
+            # optional residual_scale / extra outputs are not representable.
+            skipped.append(name)
             continue
         out_code = attr.get("output_dtype_code")
         if out_code not in (0, 1, 2):
@@ -218,7 +225,7 @@ def import_comfy_convrot(graph, *, gemm_config=-1):
         weight = node.inputs[1]
         n = _shape_of(weight, 0)
         k = _shape_of(weight, 1)
-        if n is None or k is None or k % 256 or k > 16384 or n % 4:
+        if convrot_shape_ok(k, n, w4a4=False) is not None:
             skipped.append(name)
             continue
         node.op = PluginOp.CONVROT_LINEAR
@@ -397,6 +404,30 @@ def _checked_baked_freqs(fq):
     if fq.ndim != 6 or fq.shape[0] != 1 or fq.shape[1] != 1 or fq.shape[4:] != (2, 2):
         raise ValueError(f"baked freqs must be [1,1,S,r,2,2], got {tuple(fq.shape)}")
     return fq
+
+
+def _dtype_name(d) -> str | None:
+    """'float32' for both the string and numpy-dtype spellings."""
+    if d is None:
+        return None
+    return d if isinstance(d, str) else getattr(d, "__name__", str(d))
+
+
+def _check_freqs_tensor(t) -> None:
+    """Static half of ``_checked_baked_freqs`` for a graph tensor."""
+    if t.shape is not None:
+        if len(t.shape) != 6:
+            raise ValueError(f"freqs tensor {t.name!r} must be [1,1,S,r,2,2], "
+                             f"got {tuple(t.shape)}")
+        head = list(t.shape[:2]) + list(t.shape[4:])
+        if any(isinstance(d, int) and d != want
+               for d, want in zip(head, (1, 1, 2, 2))):
+            raise ValueError(f"freqs tensor {t.name!r} must be [1,1,S,r,2,2], "
+                             f"got {tuple(t.shape)}")
+    dn = _dtype_name(t.dtype)
+    if dn is not None and dn not in ("float32", "float16", "bfloat16"):
+        raise ValueError(f"freqs tensor {t.name!r} dtype {dn}, "
+                         f"want float32/float16/bfloat16")
 
 
 def discover_dit_self_blocks(graph) -> list[dict[str, Any]]:
@@ -660,6 +691,7 @@ def fuse_rope_blocks(graph, fq=None, epsilon: float = 1e-6, rot_dim: int = 0,
         ftensor = graph.tensors().get(freqs)
         if ftensor is None:
             raise KeyError(f"freqs tensor {freqs!r} not in graph")
+        _check_freqs_tensor(ftensor)
     else:
         fq = np.ascontiguousarray(_checked_baked_freqs(fq), dtype=np.float32)
     plans: list[tuple] = []
@@ -1141,6 +1173,10 @@ def validate_plugin_nodes(graph) -> list[str]:
                                     f"{tuple(t.shape)}, want {want}")
         if node.op in (PluginOp.CONVROT_LINEAR, PluginOp.CONVROT_LINEAR_W4A4) and len(node.inputs) == 4:
             w4a4 = node.op == PluginOp.CONVROT_LINEAR_W4A4
+            tag = node.name or node.op
+            if any(t is None for t in node.inputs):
+                errs.append(f"{tag}: null input")
+                continue
             k = _shape_of(node.inputs[1], 1)
             n = _shape_of(node.inputs[1], 0)
             xshape = node.inputs[0].shape
@@ -1148,20 +1184,45 @@ def validate_plugin_nodes(graph) -> list[str]:
             if k is not None:
                 k *= 2 if w4a4 else 1
                 if k % 256 != 0 or k > 16384:
-                    errs.append(f"{node.name or node.op}: K={k}, want a multiple "
-                                f"of 256 and <= 16384")
+                    errs.append(f"{tag}: K={k}, want a multiple of 256 and <= 16384")
                 if xk is not None and xk != k:
-                    errs.append(f"{node.name or node.op}: x K={xk} != weight K={k}")
+                    errs.append(f"{tag}: x K={xk} != weight K={k}")
             if n is not None and not w4a4 and n % 4 != 0:
-                errs.append(f"{node.name or node.op}: N={n}, want a multiple of 4")
+                errs.append(f"{tag}: N={n}, want a multiple of 4")
             if node.attrs.get("group_size", 256) != 256:
-                errs.append(f"{node.name or node.op}: group_size must be 256")
+                errs.append(f"{tag}: group_size must be 256")
+            od = node.attrs.get("out_dtype", -1)
+            if od not in (-1, 0, 1, 2):
+                errs.append(f"{tag}: out_dtype={od}, want -1/0/1/2")
+                od = -1
+            hb = node.attrs.get("has_bias", 1)
+            if hb not in (0, 1):
+                errs.append(f"{tag}: has_bias={hb}, want 0/1")
+            try:
+                gc = int(node.attrs.get("gemm_config", -1))
+            except (TypeError, ValueError):
+                gc = None
+            if gc is None or gc < -1:
+                errs.append(f"{tag}: gemm_config={node.attrs.get('gemm_config')}, want >= -1")
+            xd = _dtype_name(node.inputs[0].dtype)
+            if xd not in ("float32", "float16", "bfloat16"):
+                errs.append(f"{tag}: x dtype {xd}, want float32/float16/bfloat16")
+            wd = _dtype_name(node.inputs[1].dtype)
+            if wd != "int8":
+                errs.append(f"{tag}: weight dtype {wd}, want int8")
+            sd = _dtype_name(node.inputs[2].dtype)
+            if sd != "float32":
+                errs.append(f"{tag}: weight_scale dtype {sd}, want float32")
+            want_dtype = {0: "bfloat16", 1: "float16", 2: "float32"}.get(od, xd)
+            bd = _dtype_name(node.inputs[3].dtype)
+            if bd != want_dtype:
+                errs.append(f"{tag}: bias dtype {bd}, want {want_dtype}")
             for idx, want in ((2, (n,)), (3, (n,))):
                 t = node.inputs[idx]
                 if (n is not None and t.shape is not None and
                         all(isinstance(x, int) for x in t.shape) and
                         tuple(t.shape) != want):
-                    errs.append(f"{node.name or node.op}: input {idx} shape "
+                    errs.append(f"{tag}: input {idx} shape "
                                 f"{tuple(t.shape)}, want {want}")
     return errs
 

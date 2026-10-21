@@ -32,7 +32,12 @@ def cached_config(m: int, n: int, k: int, out_dtype: str = "bfloat16") -> int | 
 
 def autotune_convrot_w4a4(m: int, n: int, k: int, out_dtype: str = "bfloat16",
                           *, refresh: bool = False) -> int:
-    """Measure and cache the best config for one shape. Returns the index."""
+    """Measure and cache the best CUTLASS config for one W4A4 shape.
+
+    Returns the config index, or ``-1`` when no CUTLASS tile fits (``N % 32
+    != 0``); that is also the plugin's "automatic route", so the result can
+    be passed straight to ``gemm_config`` and the legacy W4A8 fallback runs.
+    """
     key = _key(m, n, k, out_dtype)
     cache = _read()
     if not refresh and key in cache:
@@ -48,9 +53,14 @@ def autotune_convrot_w4a4(m: int, n: int, k: int, out_dtype: str = "bfloat16",
                               device="cuda")
         cfg = run(m, n, k, _DTYPE_CODE[out_dtype], scratch)
     if cfg < 0:
-        raise RuntimeError(f"convrot W4A4 autotune failed for {key}")
+        # CUTLASS int4 tiles need N % 32 == 0; shapes outside that still run
+        # through the plugin's legacy fallback, so do not fail the tune.
+        return -1
     cache[key] = cfg
-    _write(cache)
+    try:
+        _write(cache)
+    except OSError:
+        pass  # measured result is still valid; the next call re-measures
     return cfg
 
 

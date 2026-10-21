@@ -221,7 +221,8 @@ def fused_rope_sage_attn(q, k, v, rms_w_q, rms_w_k, inv_freq):
                                      inv_freq)
 
 
-def _convrot_linear(op, x, weight, weight_scale, bias, out_dtype, gemm_config, w4a4):
+def _convrot_linear(op, x, weight, weight_scale, bias, out_dtype, gemm_config, w4a4,
+                    profile=None):
     import torch
 
     _require_cuda(x, weight, weight_scale, *(() if bias is None else (bias,)))
@@ -259,25 +260,31 @@ def _convrot_linear(op, x, weight, weight_scale, bias, out_dtype, gemm_config, w
          "out_dtype": -1 if out_dtype is None
          else {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}[otype],
          "gemm_config": int(gemm_config)},
+        profile=profile,
     )
     return outs["y"]
 
 
-def convrot_linear(x, weight, weight_scale, bias=None, *, out_dtype=None, gemm_config=-1):
+def convrot_linear(x, weight, weight_scale, bias=None, *, out_dtype=None, gemm_config=-1,
+                   profile=None):
     """ConvRot W8A8 linear: y = x @ W.T + bias.
 
     x: f32/f16/bf16 CUDA [..., K]; weight: int8 [N, K] already ConvRot-rotated;
     weight_scale: fp32 [N]; bias: [N] in the output dtype (None = zeros, the
     kernel still runs the bias epilogue with has_bias=0).
+    ``profile``: {"x": (min, opt, max)} makes the M dim dynamic so one engine
+    serves many token counts (same form as ``_engine.run_plugin``).
     """
     return _convrot_linear(PluginOp.CONVROT_LINEAR, x, weight, weight_scale, bias,
-                           out_dtype, gemm_config, False)
+                           out_dtype, gemm_config, False, profile)
 
 
-def convrot_linear_w4a4(x, qweight, wscales, bias=None, *, out_dtype=None, gemm_config=-1):
+def convrot_linear_w4a4(x, qweight, wscales, bias=None, *, out_dtype=None, gemm_config=-1,
+                        profile=None):
     """ConvRot W4A4 linear: packed signed INT4 weight [N, K/2], fp32 scales [N].
 
     ``gemm_config``: -1 = automatic route, else a pinned sm8x tile config.
+    ``profile``: {"x": (min, opt, max)} makes the M dim dynamic.
     """
     return _convrot_linear(PluginOp.CONVROT_LINEAR_W4A4, x, qweight, wscales, bias,
-                           out_dtype, gemm_config, True)
+                           out_dtype, gemm_config, True, profile)

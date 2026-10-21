@@ -125,9 +125,8 @@ KNOWN_COS: dict[str, dict[int, float]] = {
     PluginOp.BLOCK_SPARSE_SAGE2_ATTN: {4096: 0.99953},
     PluginOp.RMS_ADALN: {}, PluginOp.APPLY_ROPE: {},
     PluginOp.RMS_ROPE_SPLIT_HALF: {},
-    # Plan 3.2: W8A8 / W4A4 measured cosine against the eager reference.
-    PluginOp.CONVROT_LINEAR: {17: 0.99999},
-    PluginOp.CONVROT_LINEAR_W4A4: {17: 0.99676},
+    # convrot is keyed by M (tokens), not S: deliberately absent here; its
+    # measured cosines live in the README table.
 }
 
 QUALITY_CLASS: dict[str, str] = {
@@ -630,6 +629,19 @@ def select_norm(*, base: BasePrecision, quant: QuantKind | None = None,
             "cos": 1.0, "trt_flags": _plugin_flags()}
 
 
+def convrot_shape_ok(k: int | None, n: int | None, *, w4a4: bool) -> str | None:
+    """Why (K, N) violates the ConvRot plugin contract, or None if it may run.
+
+    ``k`` is the logical K (W4A4 callers pass ``weight.shape[1] * 2``).
+    Dynamic (None) dims are not judged; TRT resolves them at build.
+    """
+    if k is not None and (k % 256 or k > 16384):
+        return f"K={k}, want a multiple of 256 and <= 16384"
+    if n is not None and not w4a4 and n % 4:
+        return f"N={n}, want a multiple of 4"
+    return None
+
+
 def select_linear(*, quant_format: str, convrot: bool, transposed: bool,
                   group_size: int, k: int, n: int, sm: int,
                   out_dtype: BasePrecision | str = BasePrecision.BF16,
@@ -639,13 +651,19 @@ def select_linear(*, quant_format: str, convrot: bool, transposed: bool,
     Exactly the addendum §5.7 table. "INT8" alone never implies ConvRot:
     un-rotated ``int8_tensorwise`` weights silently mean a different
     computation, so only an explicit ``convrot=True`` selects a plugin.
-    Fail-open (None) keeps the layer in BF16. ``group_size``/``k``/``n``/
-    ``sm``/``out_dtype`` are accepted for the caller's record; the kernel
-    enforces its own limits at build time.
+    Fail-open (None) keeps the layer in BF16. ``k``/``n``/``group_size``
+    are enforced here (same gate as :func:`surgeon.import_comfy_convrot`);
+    ``sm`` and ``out_dtype`` are accepted for the caller's record: W4A4
+    still selects on sm90+ (the kernel degrades to W4A8) and every output
+    dtype is supported.
     """
+    if transposed or int(group_size) != 256:
+        return None
     if quant_format == "convrot_w4a4":
-        return None if transposed else PluginOp.CONVROT_LINEAR_W4A4
-    if quant_format == "int8_tensorwise" and convrot and not transposed:
+        return (None if convrot_shape_ok(k, n, w4a4=True)
+                else PluginOp.CONVROT_LINEAR_W4A4)
+    if (quant_format == "int8_tensorwise" and convrot
+            and convrot_shape_ok(k, n, w4a4=False) is None):
         return PluginOp.CONVROT_LINEAR
     return None
 

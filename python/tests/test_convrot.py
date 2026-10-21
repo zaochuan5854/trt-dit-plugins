@@ -53,6 +53,41 @@ def test_add_convrot_linear_w4a4():
     assert S.validate_plugin_nodes(g) == []
 
 
+def test_add_convrot_out_dtype_declares_real_output():
+    for xdt in ("float16", "float32", "bfloat16"):
+        x = gs.Variable("x", dtype=xdt, shape=[4, 2048])
+        w = gs.Variable("w", dtype=I8, shape=[256, 2048])
+        ws = gs.Variable("ws", dtype=F32, shape=[256])
+        b = gs.Variable("b", dtype="bfloat16", shape=[256])
+        g = gs.Graph(nodes=[], inputs=[x, w, ws, b], outputs=[])
+        y = S.add_convrot_linear(g, x, w, ws, b, out_dtype=0)  # 0 = BF16
+        assert y.dtype == "bfloat16", xdt
+        g.outputs = [y]
+        assert S.validate_plugin_nodes(g) == []
+    with pytest.raises(ValueError, match="out_dtype"):
+        S.add_convrot_linear(g, x, w, ws, b, out_dtype=7)
+
+
+def test_convrot_validation_rejects_bad_dtypes_and_fields():
+    g, _ = _convrot_node()
+    node = g.nodes[0]
+    node.inputs[0].dtype = "float64"
+    node.inputs[1].dtype = "float32"
+    node.inputs[2].dtype = "float16"
+    node.inputs[3].dtype = "float16"
+    node.attrs.update(out_dtype=7, has_bias=5, gemm_config=-2)
+    errs = S.validate_plugin_nodes(g)
+    for frag in ("x dtype", "weight dtype", "weight_scale dtype", "bias dtype",
+                 "out_dtype", "has_bias", "gemm_config"):
+        assert any(frag in e for e in errs), (frag, errs)
+
+
+def test_convrot_validation_bias_must_match_output_dtype():
+    g, _ = _convrot_node()  # x/bias f32, out_dtype=-1 -> f32
+    g.nodes[0].attrs["out_dtype"] = 0  # BF16
+    assert any("bias dtype" in e for e in S.validate_plugin_nodes(g))
+
+
 def test_convrot_validation_rejects_bad_shapes():
     g, _ = _convrot_node(k=2048)
     g.nodes[0].attrs["group_size"] = 512
@@ -111,6 +146,11 @@ def test_import_comfy_convrot():
 def test_import_comfy_convrot_fails_open():
     transposed = _comfy_node()
     transposed.nodes[0].attrs["transposed"] = 1
+    five_inputs = _comfy_node()
+    five_inputs.nodes[0].inputs.append(gs.Variable("rs", dtype=F32, shape=[128]))
+    two_outputs = _comfy_node()
+    two_outputs.nodes[0].outputs.append(
+        gs.Variable("y2", dtype="bfloat16", shape=[128, 256]))
     reasons = (
         _comfy_node(convrot=0),          # plain (non-ConvRot) linear
         transposed,                       # _qdata layout is [K,N]
@@ -118,6 +158,8 @@ def test_import_comfy_convrot_fails_open():
         _comfy_node(bias=False),          # the plugin always takes a bias tensor
         _comfy_node(out_code=7),          # unknown output dtype code
         _comfy_node(k=2000),              # K % 256 != 0
+        five_inputs,                      # residual_scale not representable
+        two_outputs,                      # plugin has exactly one output
     )
     for g in reasons:
         converted, skipped = S.import_comfy_convrot(g)

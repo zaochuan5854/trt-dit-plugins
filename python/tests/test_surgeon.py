@@ -561,6 +561,19 @@ def test_fuse_rope_blocks_accepts_freqs_tensor():
     _check_ok(g)
 
 
+def test_fuse_rope_blocks_rejects_bad_freqs_tensor():
+    g = _pre_rope_graph()
+    g.inputs.append(gs.Variable("bad_fq", dtype="float16", shape=[1, 256, 64]))
+    with pytest.raises(ValueError, match="must be"):
+        S.fuse_rope_blocks(g, freqs="bad_fq")
+
+    g = _pre_rope_graph()
+    g.inputs.append(gs.Variable("bad_dt", dtype=np.int32,
+                                shape=[1, 1, 256, 64, 2, 2]))
+    with pytest.raises(ValueError, match="dtype"):
+        S.fuse_rope_blocks(g, freqs="bad_dt")
+
+
 def test_fuse_rope_blocks_rejects():
     g = _pre_rope_graph()
     g.nodes = [n for n in g.nodes if n.op != "Attention" or n.outputs[0].name == "co"]

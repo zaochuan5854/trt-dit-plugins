@@ -38,6 +38,14 @@ def test_select_linear_table():
     assert _linear(quant_format="fp8") is None
 
 
+def test_select_linear_enforces_shape_contract():
+    assert _linear(k=20000) is None
+    assert _linear(k=2048, n=6) is C.PluginOp.CONVROT_LINEAR_W4A4  # W4A4: any N
+    assert _linear(group_size=128) is None
+    assert _linear(quant_format="int8_tensorwise", k=2000) is None
+    assert _linear(quant_format="int8_tensorwise", n=6) is None
+
+
 def test_enum_strict_rejects_plain_strings():
     assert C.select_attention(base=BasePrecision.BF16, S=256, D=64)["op"] == "int8_attention"
     with pytest.raises(TypeError, match="base must be BasePrecision"):
