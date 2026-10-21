@@ -41,6 +41,9 @@ def test_add_convrot_linear_w8a8():
     assert (node.op, node.domain) == (PluginOp.CONVROT_LINEAR, "dit-plugins")
     assert node.attrs["group_size"] == 256 and node.attrs["has_bias"] == 1
     assert node.attrs["out_dtype"] == -1 and node.attrs["gemm_config"] == -1
+    assert node.attrs["epilogue"] == 0 and node.attrs["residual_gate"] == 0
+    assert node.attrs["out_layout"] == 0 and node.attrs["qkv_heads"] == 0
+    assert node.attrs["head_dim"] == 0
     assert y.shape == [128, 256] and y.dtype == F32
     assert S.validate_plugin_nodes(g) == []
     onnx.checker.check_model(gs.export_onnx(g))

@@ -822,8 +822,9 @@ def _transpose_bhsd(graph, edge, out_name: str):
 
 
 def fuse_rope_blocks(graph, fq=None, epsilon: float = 1e-6, rot_dim: int = 0,
-                     *, freqs: str | None = None) -> int:
-    """Replace self-block norm+rope regions with ``rms_rope_split_half`` nodes.
+                     *, freqs: str | None = None, qk_layout: str = "bshd",
+                     include_cross: bool = False) -> int:
+    """Replace norm+rope regions with ``rms_rope_split_half`` nodes.
 
     Pass exactly one of: ``fq``, the baked freqs array in ``[1,1,S,r,2,2]``
     layout (one shared constant for all blocks; grid-dependent, so callers
@@ -831,13 +832,17 @@ def fuse_rope_blocks(graph, fq=None, epsilon: float = 1e-6, rot_dim: int = 0,
     an existing graph tensor in the same layout (dynamic freqs — TRT
     resolves the grid at build time). The plugin fuses RMSNorm itself, so it
     takes the PRE-norm tensors plus the norm scales (feeding norm outputs
-    would normalize twice). Q/K arrive ``[B,S,H,d]`` and are transposed to
-    ``[B,H,S,d]`` views around the plugin. Blocks without rope math
-    (cross-attn) are skipped. Returns the fused block count; raises on zero
-    matches or malformed attention/norm nodes.
+    would normalize twice). Q/K arrive ``[B,S,H,d]`` by default and are
+    transposed to ``[B,H,S,d]`` views around the plugin; ``qk_layout="bhsd"``
+    skips those transposes. ``include_cross=True`` with ``rot_dim < 0`` fuses
+    the two independent RMSNorm nodes feeding a cross-attention block, since
+    the pair op requires equal Q/K sequence lengths. Returns the fused block
+    count; raises on zero matches or malformed attention/norm nodes.
     """
     import numpy as np
     gs = _gs()
+    if qk_layout not in ("bshd", "bhsd"):
+        raise ValueError("qk_layout must be 'bshd' or 'bhsd'")
     if (fq is None) == (freqs is None):
         raise ValueError("pass exactly one of fq (baked array) or freqs "
                          "(graph tensor name)")
@@ -856,33 +861,55 @@ def fuse_rope_blocks(graph, fq=None, epsilon: float = 1e-6, rot_dim: int = 0,
         if len(attn.inputs) < 3 or not attn.outputs:
             raise ValueError(f"rope surgery: {attn.op} {attn.name} has "
                              f"malformed inputs/outputs")
-        # Idempotency: skip blocks already fed by a rope node so a second
-        # run neither double-fuses nor collides on generated tensor names.
-        if any(getattr(p, "op", "") == _ROPE_OP
+        # Idempotency: skip blocks already fed by a rope/rms_norm node so a
+        # second run neither double-fuses nor collides on generated names.
+        if any(getattr(p, "op", "") in (_ROPE_OP, PluginOp.RMS_NORM)
                for t in attn.inputs[:2] for p in t.inputs):
             continue
         nq = _gs_norm_anchor(attn.inputs[0])
         nk = _gs_norm_anchor(attn.inputs[1])
         if nq is None or nk is None:
             continue
-        if not (_gs_has_rope_math(attn.inputs[0], nq.outputs[0].name) and
-                _gs_has_rope_math(attn.inputs[1], nk.outputs[0].name)):
-            continue  # cross-attn (norm feeds attention directly)
         if len(nq.inputs) < 2 or len(nk.inputs) < 2:
             raise ValueError("rope surgery: RMSNormalization node missing scale input")
-        plans.append((attn, nq.inputs[0], nk.inputs[0], nq.inputs[1], nk.inputs[1]))
+        q_in, k_in = nq.inputs[0], nk.inputs[0]
+        has_rope = (_gs_has_rope_math(attn.inputs[0], nq.outputs[0].name) and
+                    _gs_has_rope_math(attn.inputs[1], nk.outputs[0].name))
+        is_cross = not has_rope
+        if include_cross and rot_dim < 0 and has_rope:
+            # A scalar identity Mul can fake rope math; unequal Q/K lengths
+            # mean cross-attn, so take the independent-norm path.
+            si = 1 if qk_layout == "bshd" else 2
+            dq, dk = _dims(q_in), _dims(k_in)
+            sq = dq[si] if dq is not None and len(dq) == 4 else None
+            sk = dk[si] if dk is not None and len(dk) == 4 else None
+            is_cross = sq is not None and sk is not None and sq != sk
+        if is_cross and not (include_cross and rot_dim < 0):
+            continue
+        plans.append(("cross" if is_cross else "self", attn, q_in, k_in,
+                      nq.inputs[1], nk.inputs[1]))
     if not plans:
         raise RuntimeError("rope surgery matched 0 blocks")
     fconst = ftensor if ftensor is not None else gs.Constant(
         "dit_rope_freqs", values=fq)
     n_done = 0
-    for attn, q_in, k_in, qsc, ksc in plans:
+    for kind, attn, q_in, k_in, qsc, ksc in plans:
         base = attn.name or attn.outputs[0].name
-        qt = _transpose_bhsd(graph, q_in, base + "_toBHSD_q")
-        kt = _transpose_bhsd(graph, k_in, base + "_toBHSD_k")
-        qo, ko = add_rms_rope_split_half(graph, qt, kt, fconst, qsc, ksc,
-                                         epsilon=epsilon, rot_dim=rot_dim,
-                                         name=base + "_rmsrope")
+        if kind == "cross":
+            layout = "bshd" if qk_layout == "bshd" else "bhsd"
+            qo = add_rms_norm(graph, q_in, qsc, eps=epsilon, layout=layout,
+                              name=base + "_rmsnorm_q")
+            ko = add_rms_norm(graph, k_in, ksc, eps=epsilon, layout=layout,
+                              name=base + "_rmsnorm_k")
+        else:
+            if qk_layout == "bhsd":
+                qt, kt = q_in, k_in
+            else:
+                qt = _transpose_bhsd(graph, q_in, base + "_toBHSD_q")
+                kt = _transpose_bhsd(graph, k_in, base + "_toBHSD_k")
+            qo, ko = add_rms_rope_split_half(graph, qt, kt, fconst, qsc, ksc,
+                                             epsilon=epsilon, rot_dim=rot_dim,
+                                             name=base + "_rmsrope")
         attn.inputs[0] = qo
         attn.inputs[1] = ko
         n_done += 1

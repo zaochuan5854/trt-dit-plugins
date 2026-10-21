@@ -686,6 +686,78 @@ def test_fuse_rope_blocks_dynamic_shape():
     _check_ok(g)
 
 
+def _pre_rope_graph_bhsd():
+    B, H, S_, D = 1, 2, 256, 128
+    q = gs.Variable("q", dtype=F32, shape=[B, H, S_, D])
+    k = gs.Variable("k", dtype=F32, shape=[B, H, S_, D])
+    v = gs.Variable("v", dtype=F32, shape=[B, H, S_, D])
+    qs = gs.Variable("qs", dtype=F32, shape=[D])
+    ks = gs.Variable("ks", dtype=F32, shape=[D])
+    c1 = gs.Constant("c1", values=np.ones((1,), dtype=F32))
+    nq = gs.Variable("nq", dtype=F32, shape=[B, H, S_, D])
+    nk = gs.Variable("nk", dtype=F32, shape=[B, H, S_, D])
+    mq = gs.Variable("mq", dtype=F32, shape=[B, H, S_, D])
+    mk = gs.Variable("mk", dtype=F32, shape=[B, H, S_, D])
+    ao = gs.Variable("ao", dtype=F32, shape=[B, H, S_, D])
+    nodes = [
+        gs.Node("RMSNormalization", inputs=[q, qs], outputs=[nq]),
+        gs.Node("RMSNormalization", inputs=[k, ks], outputs=[nk]),
+        gs.Node("Mul", inputs=[nq, c1], outputs=[mq]),
+        gs.Node("Mul", inputs=[nk, c1], outputs=[mk]),
+        gs.Node("Attention", inputs=[mq, mk, v], outputs=[ao]),
+    ]
+    g = gs.Graph(nodes=nodes, inputs=[q, k, v, qs, ks], outputs=[ao])
+    g.opset = 23
+    return g
+
+
+def test_fuse_rope_blocks_bhsd_skips_transposes():
+    rng = np.random.default_rng(3)
+    g = _pre_rope_graph_bhsd()
+    fq = _baked_freqs(rng.random(64).astype(F32) * 0.1 + 0.01, 256)
+    assert S.fuse_rope_blocks(g, fq=fq, qk_layout="bhsd") == 1
+    assert not [n for n in g.nodes if n.op == "Transpose"]
+    assert S.validate_plugin_nodes(g) == []
+
+
+def _cross_norm_graph():
+    B, H, Sq, Sk, D = 1, 2, 64, 16, 128
+    q = gs.Variable("q", dtype=F32, shape=[B, Sq, H, D])
+    k = gs.Variable("k", dtype=F32, shape=[B, Sk, H, D])
+    v = gs.Variable("v", dtype=F32, shape=[B, Sk, H, D])
+    qs = gs.Variable("qs", dtype=F32, shape=[D])
+    ks = gs.Variable("ks", dtype=F32, shape=[D])
+    c1 = gs.Constant("c1", values=np.ones((1,), dtype=F32))
+    nq = gs.Variable("nq", dtype=F32, shape=[B, Sq, H, D])
+    nk = gs.Variable("nk", dtype=F32, shape=[B, Sk, H, D])
+    mq = gs.Variable("mq", dtype=F32, shape=[B, Sq, H, D])
+    mk = gs.Variable("mk", dtype=F32, shape=[B, Sk, H, D])
+    ao = gs.Variable("ao", dtype=F32, shape=[B, H, Sq, D])
+    nodes = [
+        gs.Node("RMSNormalization", inputs=[q, qs], outputs=[nq]),
+        gs.Node("RMSNormalization", inputs=[k, ks], outputs=[nk]),
+        gs.Node("Mul", inputs=[nq, c1], outputs=[mq]),
+        gs.Node("Mul", inputs=[nk, c1], outputs=[mk]),
+        gs.Node("Attention", inputs=[mq, mk, v], outputs=[ao]),
+    ]
+    g = gs.Graph(nodes=nodes, inputs=[q, k, v, qs, ks], outputs=[ao])
+    g.opset = 23
+    return g
+
+
+def test_fuse_rope_blocks_cross_attn_different_s():
+    g = _cross_norm_graph()
+    dummy = np.zeros((1, 1, 1, 1, 2, 2), F32)
+    assert S.fuse_rope_blocks(
+        g, fq=dummy, rot_dim=-1, include_cross=True) == 1
+    rms = [n for n in g.nodes if n.op == "rms_norm"]
+    attn = next(n for n in g.nodes if n.op == "Attention")
+    assert len(rms) == 2
+    assert attn.inputs[0].shape == [1, 2, 64, 128]
+    assert attn.inputs[1].shape == [1, 2, 16, 128]
+    assert not [n for n in g.nodes if n.op == "Transpose"]
+
+
 def test_apply_sage_attention():
     B, H, Sv, D = 1, 2, 256, 128
     q = gs.Variable("q", dtype=F32, shape=[B, H, Sv, D])
