@@ -15,7 +15,7 @@ from .select import BasePrecision, GemmKind, NormKind, PluginOp, QuantKind, Rope
 # (Plugin libraries themselves remain lazily loaded via ensure_loaded()).
 _lib._preload_deps()
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 __all__ = [
     "PLUGIN_VERSION",
     "PLUGINS",

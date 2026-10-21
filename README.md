@@ -59,9 +59,9 @@ out = tdp.fused_rope_sage_attn(q, k, v, rms_w_q, rms_w_k, inv_freq)
 
 ```bash
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.5.0-cu13/trt_dit_plugins-0.5.0-py3-none-linux_x86_64.whl   # Linux
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.5.1-cu13/trt_dit_plugins-0.5.1-py3-none-linux_x86_64.whl   # Linux
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.5.0-cu13/trt_dit_plugins-0.5.0-py3-none-win_amd64.whl      # Windows
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.5.1-cu13/trt_dit_plugins-0.5.1-py3-none-win_amd64.whl      # Windows
 ```
 
 ## Quick Start
