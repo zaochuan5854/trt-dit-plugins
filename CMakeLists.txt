@@ -1,6 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Interface derived from ComfyKitchen (Copyright (c) 2025 Comfy Org, Apache-2.0).
 cmake_minimum_required(VERSION 3.24)
+# Multi-arch default must be chosen before project() enables CUDA: afterwards
+# CMake has already cached the compiler default (sm_75 for CUDA 13) and the
+# default list below would never apply. An explicit
+# -DCMAKE_CUDA_ARCHITECTURES=... still wins; nvidia/cuda images export
+# CUDAARCHS, which is ignored on purpose so the build stays multi-arch.
+# sm80/86 (Ampere) + sm89 (Ada, verified) + sm90 (Hopper) + sm100/120
+# (Blackwell) as SASS; sm90 PTX for driver JIT on newer targets.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real 89-real 90-real 100-real 120-real 90-virtual)
+endif()
 project(trt_dit_plugins LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -16,20 +26,8 @@ if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
                         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
 endif()
-# sm80/86 (Ampere) + sm89 (Ada, verified) + sm90 (Hopper) as SASS; sm90
-# PTX (driver JIT). Override with -DCMAKE_CUDA_ARCHITECTURES=89 for Ada-only.
-# nvidia/cuda images export CUDAARCHS (e.g. 89), which CMake copies into
-# CMAKE_CUDA_ARCHITECTURES and would silently single-arch the build.
-# Drop env-initialized values so the default below applies; an explicit
-# -D on the command line still wins.
-if(DEFINED CMAKE_CUDA_ARCHITECTURES AND DEFINED ENV{CUDAARCHS}
-   AND CMAKE_CUDA_ARCHITECTURES STREQUAL "$ENV{CUDAARCHS}")
-    unset(CMAKE_CUDA_ARCHITECTURES)
-    unset(CMAKE_CUDA_ARCHITECTURES CACHE)
-endif()
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real 89-real 90-real 90-virtual)
-endif()
+# sm80/86 (Ampere) + sm89 (Ada, verified) + sm90 (Hopper) + sm100/120
+# (Blackwell) as SASS; sm90 PTX (driver JIT).
 
 find_package(CUDAToolkit REQUIRED)
 # TensorRT location: $TENSORRT_ROOT/{include,lib} if set (Windows CI),
@@ -63,8 +61,21 @@ if (CCACHE_BIN)
     set(CMAKE_CUDA_COMPILER_LAUNCHER ${CCACHE_BIN})
 endif()
 
+# CUTLASS is a pinned submodule (plan 4.2): header-only, no build step.
+set(CUTLASS_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/include")
+if(NOT EXISTS "${CUTLASS_INCLUDE}/cutlass/cutlass.h")
+    message(FATAL_ERROR
+        "CUTLASS headers not found. Run: git submodule update --init --recursive")
+endif()
+
 # Split kernel lib (vendored, unmodified) from wrapper lib.
 # Runtime overhead is 3 PLT-routed launch calls only (ns-scale, unmeasurable).
+set(CONVROT_SOURCES
+    src/kernel/convrot_shim.cu
+    src/kernel/vendor/comfy/ops/int8_linear.cu
+    src/kernel/vendor/comfy/ops/cutlass_gemm_int8.cu
+    src/kernel/vendor/comfy/ops/convrot_w4a4.cu
+    src/kernel/vendor/comfy/ops/w4a8_gemm.cu)
 add_library(ck_kernels SHARED
     src/kernel/sage_attention/quant_qk_int8.cu
     src/kernel/own/fused_qk_rope_requant.cu
@@ -75,7 +86,16 @@ add_library(ck_kernels SHARED
     src/kernel/fp8/per_tensor_quantize.cu
     src/kernel/sparge/sparge_pre.cu
     src/kernel/sparge/sparge_sm89_inst.cu
-    src/kernel/prime.cu)
+    src/kernel/prime.cu
+    ${CONVROT_SOURCES})
+# ConvRot (comfy-kitchen): the vendor TUs keep upstream's nvcc flags verbatim
+# (CMakeLists.txt of comfy_kitchen/backends/cuda) so numerics match the oracle.
+set_source_files_properties(${CONVROT_SOURCES} PROPERTIES
+    INCLUDE_DIRECTORIES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/vendor/comfy;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/vendor/comfy/ops;${CMAKE_CURRENT_SOURCE_DIR}/src/kernel;${CUTLASS_INCLUDE}"
+    COMPILE_DEFINITIONS "COMFY_HAVE_CUTLASS=1"
+    COMPILE_OPTIONS
+    "-U__CUDA_NO_HALF_OPERATORS__;-U__CUDA_NO_HALF_CONVERSIONS__;-U__CUDA_NO_BFLOAT16_OPERATORS__;-U__CUDA_NO_BFLOAT16_CONVERSIONS__;-U__CUDA_NO_BFLOAT162_OPERATORS__;-U__CUDA_NO_BFLOAT162_CONVERSIONS__;--expt-relaxed-constexpr;--expt-extended-lambda;--use_fast_math;--compress-mode=size;-O3")
 # Origin isolation: same-basename headers exist in both trees (comfy vs
 # sparge: mma/math/cp_async/...). Each TU sees ONLY its own origin dir, so a
 # cross-origin bare #include fails loudly instead of silently mixing.
@@ -123,8 +143,10 @@ add_library(trt_dit_plugins SHARED
     src/wrapper/fp8_wrapper.cpp
     src/wrapper/fused_int8_rope_sage_wrapper.cpp
     src/wrapper/rms_rope_wrapper.cpp
-    src/wrapper/sparge_wrapper.cpp)
-target_include_directories(trt_dit_plugins PRIVATE ${TRT_INCLUDE_DIR})
+    src/wrapper/sparge_wrapper.cpp
+    src/wrapper/convrot_linear_wrapper.cpp)
+target_include_directories(trt_dit_plugins PRIVATE ${TRT_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/kernel)
 target_link_libraries(trt_dit_plugins PRIVATE ck_kernels CUDA::cudart ${NVINFER_LIB})
 set_target_properties(trt_dit_plugins PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
 

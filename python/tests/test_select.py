@@ -22,6 +22,22 @@ def _compat(x=None, scale=0.02, base=BasePrecision.BF16, min_cos=None):
                                     quant=QuantKind.INT8, min_cos=min_cos)
 
 
+def _linear(**kw):
+    args = dict(quant_format="convrot_w4a4", convrot=True, transposed=False,
+                group_size=256, k=4096, n=4096, sm=89)
+    args.update(kw)
+    return C.select_linear(**args)
+
+
+def test_select_linear_table():
+    assert _linear() is C.PluginOp.CONVROT_LINEAR_W4A4
+    assert _linear(transposed=True) is None
+    assert _linear(quant_format="int8_tensorwise") is C.PluginOp.CONVROT_LINEAR
+    assert _linear(quant_format="int8_tensorwise", convrot=False) is None
+    assert _linear(quant_format="int8_tensorwise", transposed=True) is None
+    assert _linear(quant_format="fp8") is None
+
+
 def test_enum_strict_rejects_plain_strings():
     assert C.select_attention(base=BasePrecision.BF16, S=256, D=64)["op"] == "int8_attention"
     with pytest.raises(TypeError, match="base must be BasePrecision"):
@@ -202,7 +218,7 @@ def test_arch_optional_defaults_to_unknown():
 
 def test_norm_and_rope():
     assert C.select_norm(base=BasePrecision.F16, norm=NormKind.RMS)["op"] == "rms_adaln"
-    assert C.select_norm(base=BasePrecision.BF16, norm=NormKind.LAYER)["op"] == "adaln"
+    assert C.select_norm(base=BasePrecision.BF16, norm=NormKind.LAYER)["op"] is None
     qn = C.select_norm(base=BasePrecision.F16, quant=QuantKind.INT8, norm=NormKind.RMS)
     assert qn["op"] is None and qn["trt_flags"]["builder"] == ["FP16", "INT8"]
     r = C.select_rope(base=BasePrecision.F16, style=RopeStyle.SPLIT_HALF, fuse_norm=True,

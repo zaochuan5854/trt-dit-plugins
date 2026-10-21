@@ -90,13 +90,14 @@ class PluginOp(str, Enum):
 
     INT8_ATTENTION = "int8_attention"
     SAGE_ATTN = "sage_attn"
-    ADALN = "adaln"
     RMS_ADALN = "rms_adaln"
     APPLY_ROPE = "apply_rope"
     RMS_ROPE_SPLIT_HALF = "rms_rope_split_half"
     STOCHASTIC_ROUND_FP8 = "stochastic_round_fp8"
     BLOCK_SPARSE_SAGE2_ATTN = "block_sparse_sage2_attn"
     FUSED_INT8_ROPE_SAGE_ATTN = "fused_int8_rope_sage_attn"
+    CONVROT_LINEAR = "convrot_linear"
+    CONVROT_LINEAR_W4A4 = "convrot_linear_w4a4"
     SAGE_INT8_LEGACY = "SageInt8Attn"
 
     __str__ = str.__str__
@@ -121,16 +122,21 @@ KNOWN_COS: dict[str, dict[int, float]] = {
     PluginOp.SAGE_ATTN: {4096: 0.99927},
     "sage_attn+fp8_pv": {4096: 0.99925},
     PluginOp.BLOCK_SPARSE_SAGE2_ATTN: {4096: 0.99953},
-    PluginOp.ADALN: {}, PluginOp.RMS_ADALN: {}, PluginOp.APPLY_ROPE: {},
+    PluginOp.RMS_ADALN: {}, PluginOp.APPLY_ROPE: {},
     PluginOp.RMS_ROPE_SPLIT_HALF: {},
+    # Plan 3.2: W8A8 / W4A4 measured cosine against the eager reference.
+    PluginOp.CONVROT_LINEAR: {17: 0.99999},
+    PluginOp.CONVROT_LINEAR_W4A4: {17: 0.99676},
 }
 
 QUALITY_CLASS: dict[str, str] = {
-    PluginOp.ADALN: "exact", PluginOp.RMS_ADALN: "exact",
+    PluginOp.RMS_ADALN: "exact",
     PluginOp.APPLY_ROPE: "exact", PluginOp.RMS_ROPE_SPLIT_HALF: "exact",
     PluginOp.INT8_ATTENTION: "quant", PluginOp.SAGE_ATTN: "quant",
     PluginOp.BLOCK_SPARSE_SAGE2_ATTN: "quant",
     PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: "fused",
+    PluginOp.CONVROT_LINEAR: "quant",
+    PluginOp.CONVROT_LINEAR_W4A4: "quant",
 }
 # Spec sec 7 floor (vs the separated path): below this the kernel is
 # broken, not lossy. A broken-detector, not a quality bar -- note the
@@ -614,16 +620,18 @@ def select_norm(*, base: BasePrecision, quant: QuantKind | None = None,
                 norm: NormKind,
                 shape: tuple | None = None, eps: float = 1e-6,
                 min_cos: float | None = None) -> dict[str, Any]:
-    """``NormKind.LAYER`` -> ``adaln`` / ``NormKind.RMS`` -> ``rms_adaln`` (or native)."""
+    """``NormKind.RMS`` -> ``rms_adaln``; ``NormKind.LAYER`` has no plugin (native)."""
     base = require_enum("base", base, BasePrecision)
     quant = require_opt("quant", quant, QuantKind)
     norm = require_enum("norm", norm, NormKind)
-    op = PluginOp.ADALN if norm is NormKind.LAYER else PluginOp.RMS_ADALN
+    op = PluginOp.RMS_ADALN
 
     def native(reason: str) -> dict[str, Any]:
         return {"op": NATIVE_OP, "fields": {}, "reason": reason,
                 "cos": None, "trt_flags": _trt_flags(base, GemmKind.AUTO, quant)}
 
+    if norm is NormKind.LAYER:
+        return native("layernorm AdaLN plugin was removed; plain TRT")
     if quant is not None:
         return native(f"{op}: no quantized-norm plugin; plain TRT")
     if shape is not None and len(shape) != 2:
@@ -632,6 +640,26 @@ def select_norm(*, base: BasePrecision, quant: QuantKind | None = None,
         return native(f"{op}: exact cos 1.0 < min_cos {min_cos}; plain TRT")
     return {"op": op, "fields": {"eps": float(eps)}, "reason": f"{op} fits",
             "cos": 1.0, "trt_flags": _plugin_flags()}
+
+
+def select_linear(*, quant_format: str, convrot: bool, transposed: bool,
+                  group_size: int, k: int, n: int, sm: int,
+                  out_dtype: BasePrecision | str = BasePrecision.BF16,
+                  ) -> PluginOp | None:
+    """Pick the ConvRot linear plugin from exporter metadata, or None.
+
+    Exactly the addendum §5.7 table. "INT8" alone never implies ConvRot:
+    un-rotated ``int8_tensorwise`` weights silently mean a different
+    computation, so only an explicit ``convrot=True`` selects a plugin.
+    Fail-open (None) keeps the layer in BF16. ``group_size``/``k``/``n``/
+    ``sm``/``out_dtype`` are accepted for the caller's record; the kernel
+    enforces its own limits at build time.
+    """
+    if quant_format == "convrot_w4a4":
+        return None if transposed else PluginOp.CONVROT_LINEAR_W4A4
+    if quant_format == "int8_tensorwise" and convrot and not transposed:
+        return PluginOp.CONVROT_LINEAR
+    return None
 
 
 def select_rope(*, base: BasePrecision, quant: QuantKind | None = None,

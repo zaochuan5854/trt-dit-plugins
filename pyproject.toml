@@ -6,8 +6,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trt-dit-plugins"
-version = "0.4.2"
-description = "TensorRT IPluginV3 wrappers with comfy-kitchen-compatible op names (sm80/86/89 + 100/120 PTX)"
+# Single source: python/trt_dit_plugins/__init__.py (parsed by setuptools).
+dynamic = ["version"]
+description = "TensorRT IPluginV3 wrappers with comfy-kitchen-compatible op names (sm80/86/89/90/100/120 SASS)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -25,6 +26,9 @@ onnx = ["onnx>=1.20", "onnx-graphsurgeon>=0.3"]
 
 [tool.setuptools]
 package-dir = { "" = "python" }
+
+[tool.setuptools.dynamic]
+version = {attr = "trt_dit_plugins.__version__"}
 
 [tool.setuptools.package-data]
 trt_dit_plugins = ["lib/*.so", "lib/*.dll", "py.typed"]

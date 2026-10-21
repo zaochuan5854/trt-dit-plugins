@@ -20,6 +20,8 @@
 #include <cstdint>
 #include <initializer_list>
 
+#include "rt.h"
+
 extern "C" {
 void launch_fused_qk_rope_int8(const void *q_i8, const void *q_s_in,
     void *q_int8, void *q_scale, const void *k_i8, const void *k_s_in,
@@ -178,9 +180,18 @@ public:
                 return -1;
         if (in[kQ].max.d[3] != 128)
             return -1; // D=128 only
-        if (in[kQ].max.d[2] <= 1024)
+        if (in[kQ].max.d[2] <= 1024) {
+            DIT_REJECT(kName, "configure", "max S %d <= 1024 (L<=1024 path is broken)",
+                       in[kQ].max.d[2]);
             return -1; // ROTATION=128 path (L>1024); the L<=1024 path is
-        // broken (wrong results/crash), so reject at build time.
+        }
+        // The L<=1024 path is broken (wrong results/crash): reject when the
+        // profile can produce it, not only when max says so (R3).
+        if (in[kQ].min.d[2] >= 0 && in[kQ].min.d[2] <= 1024) {
+            DIT_REJECT(kName, "configure", "min S %d <= 1024 (L<=1024 path is broken)",
+                       in[kQ].min.d[2]);
+            return -1;
+        }
         return 0;
     }
 
@@ -234,6 +245,7 @@ public:
             return -1;
         normCode_ = normCode(in[kQn].type);
         smScale_ = 1.0f / std::sqrt((float)D_);
+        plan_ = planWs(B_, H_, L_, D_);
         return 0;
     }
 
@@ -241,7 +253,9 @@ public:
         nvinfer1::PluginTensorDesc const *, void const *const *in,
         void *const *out, void *ws, cudaStream_t stream) noexcept override {
         try {
-            WsPlan p = planWs(B_, H_, L_, D_);
+            WsPlan p = plan_;
+            if (p.total == 0) // engine loaded without a shape change
+                p = plan_ = planWs(B_, H_, L_, D_);
             char *w = static_cast<char *>(ws);
             // Sequential single-stream: sharing events across sequential
             // enqueues is unsound (a lagging main stream can observe a later
@@ -290,6 +304,7 @@ public:
 private:
     int B_ = 0, H_ = 0, L_ = 0, D_ = 0, normCode_ = 0;
     float smScale_ = 0;
+    WsPlan plan_{};
     nvinfer1::PluginFieldCollection fc_{};
 };
 

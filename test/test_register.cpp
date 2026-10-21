@@ -15,13 +15,14 @@ namespace {
 const char* kNames[] = {
     "int8_attention",
     "sage_attn",
-    "adaln",
     "rms_adaln",
     "apply_rope",
     "rms_rope_split_half",
     "stochastic_round_fp8",
     "block_sparse_sage2_attn",
     "fused_int8_rope_sage_attn",
+    "convrot_linear",
+    "convrot_linear_w4a4",
 };
 } // namespace
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Interface derived from ComfyKitchen (Copyright (c) 2025 Comfy Org, Apache-2.0).
-// TRT IPluginV3 for comfy-kitchen's adaln / rms_adaln (torch.ops.comfy_kitchen.*).
-// Registration: comfy_kitchen::adaln, comfy_kitchen::rms_adaln. Base precision BF16.
+// TRT IPluginV3 for comfy-kitchen's rms_adaln (torch.ops.comfy_kitchen.*).
+// Registration: comfy_kitchen::rms_adaln. Base precision BF16.
 // Contract: x[N,D], scale[Rs,D], shift[Rt,D] (N%Rs==0, N%Rt==0; materialize
 // non-groupable broadcasts upstream).
 // Fields: eps(float, default 1e-6). No workspace, single launch.
@@ -29,9 +29,6 @@ constexpr int dtypeCode(nvinfer1::DataType t) {
 }
 
 template <bool kSubtractMean> struct Traits;
-template <> struct Traits<true> {
-    static constexpr char const* kName = "adaln";
-};
 template <> struct Traits<false> {
     static constexpr char const* kName = "rms_adaln";
 };
@@ -227,7 +224,6 @@ template <bool B> AdaLNCreator<B>* gCreator() {
 }
 struct AutoRegister {
     AutoRegister() {
-        getPluginRegistry()->registerCreator(*gCreator<true>(), kNamespace);
         getPluginRegistry()->registerCreator(*gCreator<false>(), kNamespace);
     }
 };

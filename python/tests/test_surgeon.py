@@ -32,7 +32,6 @@ def test_add_all_plugins():
     sc = gs.Variable("sc", dtype=F32, shape=[1, D2])
     sh = gs.Variable("sh", dtype=F32, shape=[1, D2])
     g.inputs += [x, sc, sh]
-    o_ada = S.add_adaln(g, x, sc, sh, eps=1e-6)
     o_rms = S.add_rms_adaln(g, x, sc, sh)
     f = gs.Variable("f", dtype=F32, shape=[1, 1, 1, D // 2, 2, 2])
     g.inputs.append(f)
@@ -45,11 +44,11 @@ def test_add_all_plugins():
     g.inputs.append(r)
     o_fp8 = S.add_stochastic_round_fp8(g, x, r)
     o_sp = S.add_block_sparse_sage2_attn(g, q, k, v, m)
-    g.outputs = [o_attn, o_ada, o_rms, qo, ko, qo2, ko2, o_fp8, o_sp]
+    g.outputs = [o_attn, o_rms, qo, ko, qo2, ko2, o_fp8, o_sp]
     g.cleanup().toposort()
 
     assert S.summarize(g)["plugin_nodes"] == {
-        "int8_attention": 1, "adaln": 1, "rms_adaln": 1, "apply_rope": 1,
+        "int8_attention": 1, "rms_adaln": 1, "apply_rope": 1,
         "rms_rope_split_half": 1, "stochastic_round_fp8": 1,
         "block_sparse_sage2_attn": 1,
     }
@@ -109,10 +108,10 @@ def test_cli_end_to_end(tmp_path):
     src = tmp_path / "in.onnx"
     dst = tmp_path / "out.onnx"
     onnx.save(gs.export_onnx(g), str(src))
-    rc = S.main([str(src), str(dst), "--fuse-adaln", "norm,sc,sh,o,1e-6"])
+    rc = S.main([str(src), str(dst), "--fuse-rms-adaln", "norm,sc,sh,o,1e-6"])
     assert rc == 0 and dst.exists()
     out_g = S.load(str(dst))
-    assert S.summarize(out_g)["plugin_nodes"] == {"adaln": 1}
+    assert S.summarize(out_g)["plugin_nodes"] == {"rms_adaln": 1}
     assert S.validate_plugin_nodes(out_g) == []
 
 
@@ -462,6 +461,24 @@ def test_quantize_dit_self_anchors():
     assert any("carrier" in n.name for n in g.nodes)
 
 
+def test_quantize_dit_self_anchors_explicit_inv_freq():
+    g, inv = _quantizable_graph()
+    rep = S.quantize_dit_self_anchors(
+        g, {"qt": 0.02, "kt": 0.03, "vi": 0.04}, inv_freq=inv)
+    got = next(t for t in g.tensors().values()
+               if t.name == "fused_shared_inv_freq")
+    assert np.allclose(got.values, inv)
+
+
+def test_quantize_dit_self_anchors_named_inv_freq():
+    g, _ = _quantizable_graph()
+    g.inputs.append(gs.Variable("dyn_inv", dtype=F32, shape=[64]))
+    rep = S.quantize_dit_self_anchors(
+        g, {"qt": 0.02, "kt": 0.03, "vi": 0.04}, inv_freq="dyn_inv")
+    assert rep["inv_freq"] == "dyn_inv"
+    assert not [n for n in g.nodes if n.op == "Identity"]
+
+
 def test_apply_dit_self_fused():
     g, _ = _quantizable_graph()
     rep = S.apply_dit_self_fused(g, {"qt": 0.02, "kt": 0.03, "vi": 0.04})
@@ -531,6 +548,16 @@ def test_fuse_rope_blocks():
     cross = next(x for x in g.nodes if x.op == "Attention" and x.outputs[0].name == "co")
     assert [i.name for i in cross.inputs] == ["cn", "cn", "v"]
     assert S.summarize(g)["plugin_nodes"] == {"rms_rope_split_half": 1}
+    _check_ok(g)
+
+
+def test_fuse_rope_blocks_accepts_freqs_tensor():
+    g = _pre_rope_graph()
+    g.inputs.append(gs.Variable("dyn_fq", dtype=F32, shape=[1, 1, 256, 64, 2, 2]))
+    n = S.fuse_rope_blocks(g, freqs="dyn_fq")
+    assert n == 1
+    rope = [x for x in g.nodes if x.op == "rms_rope_split_half"][0]
+    assert rope.inputs[2].name == "dyn_fq"
     _check_ok(g)
 
 
@@ -623,13 +650,12 @@ def test_fuse_norm_affine_bf16():
                                gs.Node("Add", inputs=[a, sh], outputs=[o])],
                         inputs=[x, sc, sh], outputs=[o])
 
-    for plugin in (PluginOp.ADALN, PluginOp.RMS_ADALN):
-        g = mkgraph()
-        S.fuse_norm_affine(g, norm="norm", scale="sc", shift="sh", out="o",
-                           plugin=plugin)
-        assert [n.op for n in g.nodes if n.domain == S.PLUGIN_DOMAIN] == [plugin]
-        assert S.summarize(g)["total"] == 1
-        _check_ok(g)
+    g = mkgraph()
+    S.fuse_norm_affine(g, norm="norm", scale="sc", shift="sh", out="o",
+                       plugin=PluginOp.RMS_ADALN)
+    assert [n.op for n in g.nodes if n.domain == S.PLUGIN_DOMAIN] == ["rms_adaln"]
+    assert S.summarize(g)["total"] == 1
+    _check_ok(g)
 
 
 def test_save_falls_back_to_external_data(tmp_path, monkeypatch):

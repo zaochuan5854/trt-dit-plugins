@@ -94,11 +94,6 @@ def _adaln(name, x, scale, shift, eps=1e-6):
     return outs["o"]
 
 
-def adaln(x, scale, shift, eps=1e-6):
-    """Fused LayerNorm AdaLN: layernorm(x) * (1 + scale) + shift."""
-    return _adaln(PluginOp.ADALN, x, scale, shift, eps)
-
-
 def rms_adaln(x, scale, shift, eps=1e-6):
     """Fused RMSNorm AdaLN: rmsnorm(x) * (1 + scale) + shift."""
     return _adaln(PluginOp.RMS_ADALN, x, scale, shift, eps)
@@ -210,3 +205,65 @@ def fused_int8_rope_sage_attn(q_i8, q_scale, k_i8, k_scale, v_i8, v_scale,
         [("o", torch.bfloat16, tuple(q_i8.shape))],
     )
     return outs["o"]
+
+
+def _convrot_linear(op, x, weight, weight_scale, bias, out_dtype, gemm_config, w4a4):
+    import torch
+
+    _require_cuda(x, weight, weight_scale, *(() if bias is None else (bias,)))
+    if x.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError("convrot_linear expects f32/f16/bf16 x")
+    if weight.dim() != 2 or weight.dtype != torch.int8:
+        raise ValueError("weight must be a 2D int8 tensor")
+    if weight_scale.dtype != torch.float32 or tuple(weight_scale.shape) != (weight.shape[0],):
+        raise ValueError("weight_scale must be fp32 [N]")
+    k = weight.shape[1] * (2 if w4a4 else 1)
+    if x.shape[-1] != k:
+        raise ValueError(f"x K={x.shape[-1]} does not match weight K={k}")
+    if k % 256 != 0 or k > 16384:
+        raise ValueError("K must be a multiple of 256 and <= 16384")
+    if not w4a4 and weight.shape[0] % 4 != 0:
+        raise ValueError("N must be a multiple of 4")
+    if out_dtype is None:
+        otype = x.dtype
+    elif out_dtype in (torch.float32, torch.float16, torch.bfloat16):
+        otype = out_dtype
+    else:
+        raise ValueError("out_dtype must be float32/float16/bfloat16 or None")
+    if bias is None:
+        has_bias = 0
+        bias = torch.zeros(weight.shape[0], dtype=otype, device=x.device)
+    elif bias.dtype != otype or tuple(bias.shape) != (weight.shape[0],):
+        raise ValueError("bias must be [N] in the output dtype")
+    else:
+        has_bias = 1
+    outs = E.run_plugin(
+        op,
+        {"x": x, "w": weight, "ws": weight_scale, "b": bias},
+        [("y", otype, (*x.shape[:-1], weight.shape[0]))],
+        {"group_size": 256, "has_bias": has_bias,
+         "out_dtype": -1 if out_dtype is None
+         else {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}[otype],
+         "gemm_config": int(gemm_config)},
+    )
+    return outs["y"]
+
+
+def convrot_linear(x, weight, weight_scale, bias=None, *, out_dtype=None, gemm_config=-1):
+    """ConvRot W8A8 linear: y = x @ W.T + bias.
+
+    x: f32/f16/bf16 CUDA [..., K]; weight: int8 [N, K] already ConvRot-rotated;
+    weight_scale: fp32 [N]; bias: [N] in the output dtype (None = zeros, the
+    kernel still runs the bias epilogue with has_bias=0).
+    """
+    return _convrot_linear(PluginOp.CONVROT_LINEAR, x, weight, weight_scale, bias,
+                           out_dtype, gemm_config, False)
+
+
+def convrot_linear_w4a4(x, qweight, wscales, bias=None, *, out_dtype=None, gemm_config=-1):
+    """ConvRot W4A4 linear: packed signed INT4 weight [N, K/2], fp32 scales [N].
+
+    ``gemm_config``: -1 = automatic route, else a pinned sm8x tile config.
+    """
+    return _convrot_linear(PluginOp.CONVROT_LINEAR_W4A4, x, qweight, wscales, bias,
+                           out_dtype, gemm_config, True)

@@ -81,6 +81,8 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install deps
         run: |
           apt-get update -qq
@@ -135,6 +137,8 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

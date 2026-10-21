@@ -7,6 +7,8 @@
 #include <NvInfer.h>
 #include <NvInferRuntime.h>
 
+#include "rt.h"
+
 #include <cmath>
 #include <cstdint>
 
@@ -180,13 +182,16 @@ public:
         inCode_ = dtypeCode(in[0].type);
         outCode_ = dtypeCode(outTypeFor(in[0].type));
         smScale_ = 1.0f / std::sqrt((float)D_);
+        plan_ = planWs(B_, Hq_, Lq_, Hkv_, Lk_, D_);
         return 0;
     }
 
     int32_t enqueue(nvinfer1::PluginTensorDesc const*, nvinfer1::PluginTensorDesc const*,
         void const* const* in, void* const* out, void* ws, cudaStream_t stream) noexcept override {
         try {
-            WsPlan p = planWs(B_, Hq_, Lq_, Hkv_, Lk_, D_);
+            WsPlan p = plan_;
+            if (p.total == 0) // engine loaded without a shape change
+                p = plan_ = planWs(B_, Hq_, Lq_, Hkv_, Lk_, D_);
             char* w = static_cast<char*>(ws);
             int64_t sb_q = (int64_t)Hq_ * Lq_ * D_, sh_q = (int64_t)Lq_ * D_;
             int64_t sb_k = (int64_t)Hkv_ * Lk_ * D_, sh_k = (int64_t)Lk_ * D_;
@@ -224,6 +229,7 @@ public:
 private:
     int B_ = 0, Hq_ = 0, Lq_ = 0, Hkv_ = 0, Lk_ = 0, D_ = 0, inCode_ = 2, outCode_ = 2;
     float smScale_ = 0;
+    WsPlan plan_{};
     nvinfer1::PluginFieldCollection fc_{};
 };
 

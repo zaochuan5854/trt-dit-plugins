@@ -9,6 +9,8 @@
 #include <NvInfer.h>
 #include <NvInferRuntime.h>
 
+#include "rt.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -76,9 +78,11 @@ class BlockSparseSage2Attn : public nvinfer1::IPluginV3,
                              public nvinfer1::IPluginV3OneBuild,
                              public nvinfer1::IPluginV3OneRuntime {
 public:
-    BlockSparseSage2Attn() = default;
+    BlockSparseSage2Attn() { (void)::dit::pinnedFloats(); }
     BlockSparseSage2Attn(float scale, float pvthreshd, int32_t sink)
-        : scale_(scale), pvthreshd_(pvthreshd), sink_(sink) {}
+        : scale_(scale), pvthreshd_(pvthreshd), sink_(sink) {
+        (void)::dit::pinnedFloats();
+    }
 
     nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override {
         if (type == nvinfer1::PluginCapabilityType::kCORE)
@@ -182,18 +186,25 @@ public:
             in[3].dims.d[3] != S_ / 64)
             return -1;
         isBf16_ = in[0].type == nvinfer1::DataType::kBF16;
-        if (Hq_ > kMaxHeads)
+        if (Hq_ > kMaxHeads) {
+            DIT_REJECT(kName, "onShapeChange", "Hq %d > %d", Hq_, kMaxHeads);
             return -1;
+        }
+        plan_ = planWs(B_, Hq_, Hkv_, S_, D_);
         return 0;
     }
 
     int32_t enqueue(nvinfer1::PluginTensorDesc const*, nvinfer1::PluginTensorDesc const*,
         void const* const* in, void* const* out, void* ws, cudaStream_t stream) noexcept override {
         try {
-            WsPlan p = planWs(B_, Hq_, Hkv_, S_, D_);
+            WsPlan p = plan_;
+            if (p.total == 0) // engine loaded without a shape change
+                p = plan_ = planWs(B_, Hq_, Hkv_, S_, D_);
             char* w = static_cast<char*>(ws);
             float sm = scale_ > 0 ? scale_ : 1.0f / std::sqrt((float)D_);
-            float pvhost[kMaxHeads];
+            float* pvhost = ::dit::pinnedFloats();
+            if (pvhost == nullptr)
+                return -1;
             for (int i = 0; i < Hq_; ++i) pvhost[i] = pvthreshd_;
             if (cudaMemcpyAsync(w + p.off_pv, pvhost, (size_t)Hq_ * 4, cudaMemcpyHostToDevice,
                     stream) != cudaSuccess)
@@ -238,6 +249,7 @@ private:
     int32_t sink_ = 0;
     int B_ = 0, Hq_ = 0, Hkv_ = 0, S_ = 0, D_ = 0;
     bool isBf16_ = false;
+    WsPlan plan_{};
     nvinfer1::PluginField fields_[3]{};
     nvinfer1::PluginFieldCollection fc_{};
 };

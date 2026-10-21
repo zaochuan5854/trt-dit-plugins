@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Interface derived from ComfyKitchen (Copyright (c) 2025 Comfy Org, Apache-2.0).
-// adaln/rms_adaln E2E: engine build -> run -> CPU-reference cos. x[N,D].
-// Usage: ./adaln_test <rms:0|1> <N> <D> <dt> <so>
+// rms_adaln E2E: engine build -> run -> CPU-reference cos. x[N,D].
+// Usage: ./adaln_test <N> <D> <dt> <so>
 #include <NvInfer.h>
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
@@ -33,7 +33,7 @@ float frand() {
     return std::sqrt(-2.0f * std::log(u1)) * std::cos(6.2831853f * u2);
 }
 
-int run(bool rms, int N, int D, float eps, int dt, bool use_native) {
+int run(int N, int D, float eps, int dt, bool use_native) {
     const int M = N * D;
     // dt: 0=FP32, 1=FP16, 2=BF16 (shared by inputs and outputs)
     auto dtype = dt == 0 ? nvinfer1::DataType::kFLOAT
@@ -63,7 +63,7 @@ int run(bool rms, int N, int D, float eps, int dt, bool use_native) {
     std::vector<uint8_t> hOne, hEps; // kept alive through build
     if (!use_native) {
         auto* cre = getPluginRegistry()->getCreator(
-            rms ? "rms_adaln" : "adaln", "1", "dit-plugins");
+            "rms_adaln", "1", "dit-plugins");
         if (!cre) {
             std::fprintf(stderr, "creator not found\n");
             return 1;
@@ -79,8 +79,7 @@ int run(bool rms, int N, int D, float eps, int dt, bool use_native) {
         net->markOutput(*out);
     } else {
         // Native baseline with matching traffic ([N,D] scale/shift inputs,
-        // no host-side math fusion). adaln replicates norm*(1+scale)+shift
-        // as n1*sc + n1 + sh around a unit-scale LayerNorm layer.
+        // no host-side math fusion).
         hOne.assign(M * esz, 0);
         hEps.assign(esz, 0);
         for (int i = 0; i < M; ++i)
@@ -94,13 +93,6 @@ int run(bool rms, int N, int D, float eps, int dt, bool use_native) {
         // Native baseline from primitives (what an exporter emits):
         // xc = x - mean(x) for LayerNorm, xc = x for RMS.
         nvinfer1::ITensor* xc = x;
-        if (!rms) {
-            auto* m0 = net->addReduce(*x, nvinfer1::ReduceOperation::kAVG,
-                                      1U << 1, true);
-            auto* sub = net->addElementWise(*x, *m0->getOutput(0),
-                nvinfer1::ElementWiseOperation::kSUB);
-            xc = sub->getOutput(0);
-        }
         {
             auto* sq = net->addElementWise(
                 *xc, *xc, nvinfer1::ElementWiseOperation::kPROD);
@@ -184,13 +176,13 @@ int run(bool rms, int N, int D, float eps, int dt, bool use_native) {
         }
         mean /= D;
         ms /= D;
-        double var = rms ? ms : ms - mean * mean;
+        double var = ms;
         double rstd = 1.0 / std::sqrt(var + eps);
         for (int d = 0; d < D; ++d) {
             float v = fxf[n * D + d];
             float s = fsf[n * D + d];
             float h = fhf[n * D + d];
-            float r = (float)((rms ? v : v - mean) * rstd * (1.0 + s) + h);
+            float r = (float)(v * rstd * (1.0 + s) + h);
             float o = fof[n * D + d];
             dot += o * r;
             no += o * o;
@@ -198,10 +190,10 @@ int run(bool rms, int N, int D, float eps, int dt, bool use_native) {
         }
     }
     double cos = dot / std::sqrt(no * nr);
-    std::fprintf(stderr, "%s%s N=%d D=%d dt=%d cos=%.5f\n", use_native ? "native" : "",
-        rms ? "rms_adaln" : "adaln", N, D, dt, cos);
+    std::fprintf(stderr, "%srms_adaln N=%d D=%d dt=%d cos=%.5f\n",
+        use_native ? "native" : "", N, D, dt, cos);
     // Native BF16 decomposition rounds at every stage; gate it looser.
-    double gate = (use_native && rms && dt != 0) ? 0.99 : 0.999;
+    double gate = (use_native && dt != 0) ? 0.99 : 0.999;
     if (!(cos >= gate)) { // also rejects NaN
         std::fprintf(stderr, "COS FAIL\n");
         return 1;
@@ -221,8 +213,8 @@ int run(bool rms, int N, int D, float eps, int dt, bool use_native) {
     cudaEventElapsedTime(&ms, e0, e1);
     ms /= 500;
     double gbps = 4.0 * M * esz / ms / 1e6; // 3 reads + 1 write
-    std::fprintf(stderr, "%sBENCH rms=%d N=%d D=%d dt=%d ms_per_iter=%.4f gbps=%.1f\n",
-        use_native ? "NATIVE_" : "ADALN_", rms ? 1 : 0, N, D, dt, ms, gbps);
+    std::fprintf(stderr, "%sBENCH rms=1 N=%d D=%d dt=%d ms_per_iter=%.4f gbps=%.1f\n",
+        use_native ? "NATIVE_" : "ADALN_", N, D, dt, ms, gbps);
     std::fprintf(stderr, "ADALN_DONE\n");
     return 0;
 }
@@ -231,15 +223,15 @@ int run(bool rms, int N, int D, float eps, int dt, bool use_native) {
 int main(int argc, char** argv) {
     const char* so = nullptr;
     bool native = false;
-    int pos[4] = {0, 256, 128, 2}, np = 0;
+    int pos[3] = {256, 128, 2}, np = 0;
     for (int i = 1; i < argc; ++i)
         if (argv[i][0] == '/')
             so = argv[i];
         else if (!std::strcmp(argv[i], "native"))
             native = true;
-        else if (np < 4)
+        else if (np < 3)
             pos[np++] = std::atoi(argv[i]);
     if (so)
         dlopen(so, RTLD_NOW | RTLD_GLOBAL);
-    return run(pos[0] != 0, pos[1], pos[2], 1e-6f, pos[3], native);
+    return run(pos[0], pos[1], 1e-6f, pos[2], native);
 }

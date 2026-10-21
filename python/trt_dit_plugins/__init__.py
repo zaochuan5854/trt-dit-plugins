@@ -15,7 +15,7 @@ from .select import BasePrecision, GemmKind, NormKind, PluginOp, QuantKind, Rope
 # (Plugin libraries themselves remain lazily loaded via ensure_loaded()).
 _lib._preload_deps()
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 __all__ = [
     "PLUGIN_VERSION",
     "PLUGINS",
@@ -29,13 +29,14 @@ __all__ = [
     "RopeStyle",
     "int8_attention",
     "sage_attn",
-    "adaln",
     "rms_adaln",
     "apply_rope",
     "rms_rope_split_half",
     "stochastic_rounding_fp8",
     "block_sparse_sage2_attn",
     "fused_int8_rope_sage_attn",
+    "convrot_linear",
+    "convrot_linear_w4a4",
 ]
 
 PLUGIN_VERSION = _lib.PLUGIN_VERSION
@@ -45,13 +46,14 @@ def __getattr__(name: str):
     if name in (
         "int8_attention",
         "sage_attn",
-        "adaln",
         "rms_adaln",
         "apply_rope",
         "rms_rope_split_half",
         "stochastic_rounding_fp8",
         "block_sparse_sage2_attn",
         "fused_int8_rope_sage_attn",
+        "convrot_linear",
+        "convrot_linear_w4a4",
     ):
         from . import ops as _ops
 

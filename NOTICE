@@ -29,6 +29,19 @@ on top, otherwise byte-identical, original SPDX headers retained):
 - backends/cuda/ops/per_tensor_quantize.cu
 - backends/cuda/{dtype_dispatch.cuh, float_utils.cuh, utils.cuh}
 
+Portions of the ConvRot W8A8 / W4A4 kernels are vendored, PATCHED, under
+src/kernel/vendor/comfy/ (Apache-2.0, upstream v0.2.39 commit e40e76d9;
+see src/kernel/vendor/comfy/VENDOR.md for the exact file list and every
+DIT-PLUGINS-PATCH change):
+
+- backends/cuda/ops/{int8_linear.cu, cutlass_gemm_int8.cu, convrot_w4a4.cu,
+  w4a8_gemm.cu} and supporting {utils.cuh, dtype_dispatch.cuh,
+  float_utils.cuh, input_act_codes.h, svdquant_utils.cuh,
+  cutlass_gemm_common.cuh}
+
+CUTLASS (header-only, pinned submodule third_party/cutlass, commit
+d4b4b494c3c51bf6507e7ab09fbafd1e9fa94f39) is used by those kernels.
+
 --------------------------------------------------------------------------------
 SpargeAttn
 --------------------------------------------------------------------------------

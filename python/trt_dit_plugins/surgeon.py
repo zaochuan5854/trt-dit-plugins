@@ -53,13 +53,14 @@ _uid = itertools.count()
 _SPECS: dict[str, tuple[int, int, frozenset[str]]] = {
     PluginOp.INT8_ATTENTION: (3, 1, frozenset()),
     PluginOp.SAGE_ATTN: (3, 1, frozenset({"fp8_pv"})),
-    PluginOp.ADALN: (3, 1, frozenset({"eps"})),
     PluginOp.RMS_ADALN: (3, 1, frozenset({"eps"})),
     PluginOp.APPLY_ROPE: (3, 2, frozenset()),
     PluginOp.RMS_ROPE_SPLIT_HALF: (5, 2, frozenset({"epsilon", "rot_dim"})),
     PluginOp.STOCHASTIC_ROUND_FP8: (2, 1, frozenset({"alias_rng"})),
     PluginOp.BLOCK_SPARSE_SAGE2_ATTN: (4, 1, frozenset({"scale", "pvthreshd", "attention_sink"})),
     PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: (9, 1, frozenset()),
+    PluginOp.CONVROT_LINEAR: (4, 1, frozenset({"group_size", "has_bias", "out_dtype", "gemm_config"})),
+    PluginOp.CONVROT_LINEAR_W4A4: (4, 1, frozenset({"group_size", "has_bias", "out_dtype", "gemm_config"})),
 }
 
 _LEGACY_ATTN_OPS = (PluginOp.SAGE_INT8_LEGACY, "Attention")
@@ -115,11 +116,6 @@ def _add_adaln(op, graph, x, scale, shift, eps=1e-6, name=None):
                         {"eps": float(eps)}, name=name).outputs[0]
 
 
-def add_adaln(graph, x, scale, shift, eps=1e-6, name=None):
-    """Fused LayerNorm AdaLN: layernorm(x) * (1 + scale) + shift."""
-    return _add_adaln(PluginOp.ADALN, graph, x, scale, shift, eps, name)
-
-
 def add_rms_adaln(graph, x, scale, shift, eps=1e-6, name=None):
     """Fused RMSNorm AdaLN: rmsnorm(x) * (1 + scale) + shift."""
     return _add_adaln(PluginOp.RMS_ADALN, graph, x, scale, shift, eps, name)
@@ -154,9 +150,89 @@ def add_block_sparse_sage2_attn(graph, q, k, v, m, scale=0.0, pvthreshd=50.0,
                          "attention_sink": int(attention_sink)}, name=name).outputs[0]
 
 
+def add_convrot_linear(graph, x, weight, weight_scale, bias, *, w4a4=False,
+                       has_bias=True, out_dtype=-1, gemm_config=-1, name=None):
+    """ConvRot linear (W8A8, or W4A4 when ``w4a4=True``).
+
+    x: float [..., K] (pre-rotation activation); weight: INT8 [N, K] for W8A8,
+    INT8 [N, K/2] packed signed INT4 for W4A4; weight_scale: FP32 [N];
+    bias: [N] in the output dtype (zeros with ``has_bias=False``). The weight
+    must already carry the ConvRot rotation. Returns y [..., N].
+
+    ``out_dtype``: -1 = input dtype, 0 = BF16, 1 = FP16, 2 = FP32 (plan 4.2;
+    BF16 has no numpy dtype, so the declared output keeps ``x.dtype``).
+    ``gemm_config``: -1 = automatic route; >= 0 pins a W4A4 GEMM tile config.
+    """
+    gs = _gs()
+    op = PluginOp.CONVROT_LINEAR_W4A4 if w4a4 else PluginOp.CONVROT_LINEAR
+    n = weight.shape[0] if weight.shape is not None else None
+    out_shape = None
+    if x.shape is not None:
+        out_shape = [*x.shape[:-1], n if n is not None else -1]
+    dtype = {2: "float32", 1: "float16"}.get(int(out_dtype), x.dtype)
+    out = gs.Variable(name=f"dit_out{next(_uid)}", dtype=dtype, shape=out_shape)
+    _plugin_node(graph, op, [x, weight, weight_scale, bias], [out],
+                 {"group_size": 256, "has_bias": int(bool(has_bias)),
+                  "out_dtype": int(out_dtype), "gemm_config": int(gemm_config)},
+                 name=name)
+    return out
+
+
+def import_comfy_convrot(graph, *, gemm_config=-1):
+    """Rewrite ``comfy_kitchen::int8_linear`` (convrot) nodes to dit-plugins.
+
+    The Reforge exporter emits the custom op with inputs
+    ``(x, weight, weight_scale, bias, ...)`` and attributes
+    ``output_dtype_code`` / ``convrot`` / ``convrot_groupsize``. Only the plain
+    ConvRot form is representable by this plugin (no fused input activation,
+    residual or bias-less layer), and shapes must satisfy the plugin contract;
+    anything else is left untouched. Returns ``(converted, skipped)`` node names
+    so the caller can keep the BF16 path for the skipped ones (fail-open).
+    """
+    converted: list[str] = []
+    skipped: list[str] = []
+    for node in graph.nodes:
+        if node.domain != "comfy_kitchen" or node.op != "int8_linear":
+            continue
+        name = node.name or node.op
+        attr = node.attrs
+        if not int(attr.get("convrot", 0)) or int(attr.get("convrot_groupsize", 256)) != 256:
+            skipped.append(name)
+            continue
+        if attr.get("input_act") not in (None, "", "none") or attr.get("residual"):
+            skipped.append(name)
+            continue
+        if int(attr.get("transposed", 0)):
+            skipped.append(name)  # _qdata is [K,N]; v1 only takes [N,K]
+            continue
+        if len(node.inputs) < 4 or node.inputs[3] is None or not node.inputs[3].name:
+            skipped.append(name)  # bias is required (the plugin always takes it)
+            continue
+        out_code = attr.get("output_dtype_code")
+        if out_code not in (0, 1, 2):
+            skipped.append(name)
+            continue
+        # comfy codes (0=FP32, 1=FP16, 2=BF16) -> plugin field codes (0=BF16,
+        # 1=FP16, 2=FP32, plan 4.2).
+        out_code = {0: 2, 1: 1, 2: 0}[int(out_code)]
+        weight = node.inputs[1]
+        n = _shape_of(weight, 0)
+        k = _shape_of(weight, 1)
+        if n is None or k is None or k % 256 or k > 16384 or n % 4:
+            skipped.append(name)
+            continue
+        node.op = PluginOp.CONVROT_LINEAR
+        node.domain = PLUGIN_DOMAIN
+        node.attrs = {"plugin_version": PLUGIN_VERSION, "plugin_namespace": PLUGIN_NAMESPACE,
+                      "group_size": 256, "has_bias": 1, "out_dtype": int(out_code),
+                      "gemm_config": int(gemm_config)}
+        converted.append(name)
+    return converted, skipped
+
+
 def add_dit_self_fused_attn(graph, q_i8, q_scale, k_i8, k_scale, v_i8,
-                              v_scale, rms_w_q, rms_w_k, inv_freq, name=None,
-                              out_dtype=None):
+                            v_scale, rms_w_q, rms_w_k, inv_freq, name=None,
+                            out_dtype=None):
     """DiT-self int8 RoPE+Sage fused (D=128, S>1024).
 
     q_i8/k_i8/v_i8: INT8 [B,H,S,128]; q_scale/k_scale/v_scale: FP32 scalar;
@@ -419,15 +495,21 @@ def _block_scales_ok(b: dict[str, Any], scales: dict[str, float]) -> bool:
     return all(k in scales and scales[k] > 0 for k in need)
 
 
-def quantize_dit_self_anchors(graph, scales: dict[str, float]) -> dict[str, Any]:
+def quantize_dit_self_anchors(graph, scales: dict[str, float], *,
+                              inv_freq=None) -> dict[str, Any]:
     """Insert ``QuantizeLinear`` anchors for fused blocks from calibrated scales.
 
     ``scales`` maps ONNX tensor name (``q``/``k``/``v`` as reported by
     :func:`discover_dit_self_blocks`) to the per-tensor FP32 INT8 scale.
     Per anchored block this appends three ``QuantizeLinear`` nodes (INT8,
-    symmetric, no zero-point) plus FP32 scalar scale constants, and creates
-    one shared ``[64]`` ``    inv_freq`` constant derived from the first anchored block's baked freqs (blocks in practice share one capture; a
-    differing block would silently reuse the first vector).
+    symmetric, no zero-point) plus FP32 scalar scale constants, and picks
+    one shared ``[64]`` ``inv_freq`` for all blocks (they share one capture;
+    a differing block would silently reuse the first vector).
+
+    ``inv_freq`` selects that vector: ``None`` derives it from the first
+    anchored block's baked freqs constant (static graphs); a tensor name
+    uses that graph tensor (dynamic freqs); a 64-element array creates a
+    constant from it.
 
     The shared inv constant is born orphan (invisible to ``tensors()``), so
     a transient carrier ``Identity`` is appended to make it discoverable;
@@ -448,6 +530,16 @@ def quantize_dit_self_anchors(graph, scales: dict[str, float]) -> dict[str, Any]
     gs = _gs()
     tensors = graph.tensors()
     inv_name: str | None = None
+    inv_values = None
+    if inv_freq is not None:
+        if isinstance(inv_freq, str):
+            if inv_freq not in tensors:
+                raise KeyError(f"inv_freq tensor {inv_freq!r} not in graph")
+            inv_name = inv_freq
+        else:
+            inv_values = np.ascontiguousarray(np.asarray(inv_freq, dtype=np.float32))
+            if inv_values.shape != (64,):
+                raise ValueError(f"inv_freq must be [64], got {inv_values.shape}")
     skipped = 0
     anchors: dict[str, dict[str, str]] = {}
     for b in discover_dit_self_blocks(graph):
@@ -467,13 +559,16 @@ def quantize_dit_self_anchors(graph, scales: dict[str, float]) -> dict[str, Any]
             tensors[qi.name] = qi
             a[f"{stem}_i8"], a[f"{stem}_scale"] = qi.name, sname
         if inv_name is None:
-            fvar = tensors[b["freqs"]]
-            if not isinstance(fvar, gs.Constant) or fvar.values is None:
-                raise ValueError(f"baked freqs {b['freqs']!r} have no values; "
-                                 f"expected an initializer-backed constant")
+            if inv_values is None:
+                fvar = tensors[b["freqs"]]
+                if not isinstance(fvar, gs.Constant) or fvar.values is None:
+                    raise ValueError(
+                        f"baked freqs {b['freqs']!r} have no values; "
+                        f"pass inv_freq= for dynamic freqs")
+                inv_values = np.ascontiguousarray(
+                    inv_freq_from_baked_freqs(fvar.values), dtype=np.float32)
             inv_name = "fused_shared_inv_freq"
-            inv_const = gs.Constant(inv_name, values=np.ascontiguousarray(
-                inv_freq_from_baked_freqs(fvar.values), dtype=np.float32))
+            inv_const = gs.Constant(inv_name, values=inv_values)
             carrier = gs.Variable(inv_name + "_carrier", dtype=np.float32, shape=[64])
             graph.nodes.append(gs.Node("Identity", inputs=[inv_const],  # type: ignore[arg-type]
                                        outputs=[carrier], name=carrier.name))
@@ -544,21 +639,33 @@ def _transpose_bhsd(graph, edge, out_name: str):
     return out
 
 
-def fuse_rope_blocks(graph, fq, epsilon: float = 1e-6, rot_dim: int = 0) -> int:
+def fuse_rope_blocks(graph, fq=None, epsilon: float = 1e-6, rot_dim: int = 0,
+                     *, freqs: str | None = None) -> int:
     """Replace self-block norm+rope regions with ``rms_rope_split_half`` nodes.
 
-    ``fq`` is the baked freqs array in ``[1,1,S,r,2,2]`` layout (one shared
-    constant for all blocks; grid-dependent, so callers must fuse only at a
-    fixed resolution profile). The plugin fuses RMSNorm itself, so it takes
-    the PRE-norm tensors plus the norm scales (feeding norm outputs would
-    normalize twice). Q/K arrive ``[B,S,H,d]`` and are transposed to
+    Pass exactly one of: ``fq``, the baked freqs array in ``[1,1,S,r,2,2]``
+    layout (one shared constant for all blocks; grid-dependent, so callers
+    must fuse only at a fixed resolution profile), or ``freqs``, the name of
+    an existing graph tensor in the same layout (dynamic freqs — TRT
+    resolves the grid at build time). The plugin fuses RMSNorm itself, so it
+    takes the PRE-norm tensors plus the norm scales (feeding norm outputs
+    would normalize twice). Q/K arrive ``[B,S,H,d]`` and are transposed to
     ``[B,H,S,d]`` views around the plugin. Blocks without rope math
     (cross-attn) are skipped. Returns the fused block count; raises on zero
     matches or malformed attention/norm nodes.
     """
     import numpy as np
     gs = _gs()
-    fq = np.ascontiguousarray(_checked_baked_freqs(fq), dtype=np.float32)
+    if (fq is None) == (freqs is None):
+        raise ValueError("pass exactly one of fq (baked array) or freqs "
+                         "(graph tensor name)")
+    ftensor = None
+    if freqs is not None:
+        ftensor = graph.tensors().get(freqs)
+        if ftensor is None:
+            raise KeyError(f"freqs tensor {freqs!r} not in graph")
+    else:
+        fq = np.ascontiguousarray(_checked_baked_freqs(fq), dtype=np.float32)
     plans: list[tuple] = []
     for attn in graph.nodes:
         if attn.op not in _FUSABLE_ATTN_OPS:
@@ -583,7 +690,8 @@ def fuse_rope_blocks(graph, fq, epsilon: float = 1e-6, rot_dim: int = 0) -> int:
         plans.append((attn, nq.inputs[0], nk.inputs[0], nq.inputs[1], nk.inputs[1]))
     if not plans:
         raise RuntimeError("rope surgery matched 0 blocks")
-    fconst = gs.Constant("dit_rope_freqs", values=fq)
+    fconst = ftensor if ftensor is not None else gs.Constant(
+        "dit_rope_freqs", values=fq)
     n_done = 0
     for attn, q_in, k_in, qsc, ksc in plans:
         base = attn.name or attn.outputs[0].name
@@ -886,7 +994,7 @@ def _last_dim(t):
 
 
 def fuse_norm_affine(graph, *, norm: str, scale: str, shift: str, out: str,
-                     plugin: str | PluginOp = PluginOp.ADALN,
+                     plugin: str | PluginOp = PluginOp.RMS_ADALN,
                      eps: float = 1e-6):
     """Replace ``norm*(1+scale)+shift`` ending at tensor ``out`` with one plugin node.
 
@@ -894,9 +1002,8 @@ def fuse_norm_affine(graph, *, norm: str, scale: str, shift: str, out: str,
     ...); only the 4 anchor tensor names matter. Dead producers are pruned by
     cleanup unless shared with other live tensors. Returns the plugin node.
     """
-    if not isinstance(plugin, PluginOp) or plugin not in (
-            PluginOp.ADALN, PluginOp.RMS_ADALN):
-        raise TypeError(f"plugin must be PluginOp.ADALN/RMS_ADALN, got {plugin!r}")
+    if plugin is not PluginOp.RMS_ADALN:
+        raise TypeError(f"plugin must be PluginOp.RMS_ADALN, got {plugin!r}")
     tensors = graph.tensors()
     for n in (norm, scale, shift, out):
         if n not in tensors:
@@ -1038,6 +1145,30 @@ def validate_plugin_nodes(graph) -> list[str]:
                             tuple(t.shape) != want):
                         errs.append(f"{node.name or node.op}: input {idx} shape "
                                     f"{tuple(t.shape)}, want {want}")
+        if node.op in (PluginOp.CONVROT_LINEAR, PluginOp.CONVROT_LINEAR_W4A4) and len(node.inputs) == 4:
+            w4a4 = node.op == PluginOp.CONVROT_LINEAR_W4A4
+            k = _shape_of(node.inputs[1], 1)
+            n = _shape_of(node.inputs[1], 0)
+            xshape = node.inputs[0].shape
+            xk = _shape_of(node.inputs[0], len(xshape) - 1) if xshape else None
+            if k is not None:
+                k *= 2 if w4a4 else 1
+                if k % 256 != 0 or k > 16384:
+                    errs.append(f"{node.name or node.op}: K={k}, want a multiple "
+                                f"of 256 and <= 16384")
+                if xk is not None and xk != k:
+                    errs.append(f"{node.name or node.op}: x K={xk} != weight K={k}")
+            if n is not None and not w4a4 and n % 4 != 0:
+                errs.append(f"{node.name or node.op}: N={n}, want a multiple of 4")
+            if node.attrs.get("group_size", 256) != 256:
+                errs.append(f"{node.name or node.op}: group_size must be 256")
+            for idx, want in ((2, (n,)), (3, (n,))):
+                t = node.inputs[idx]
+                if (n is not None and t.shape is not None and
+                        all(isinstance(x, int) for x in t.shape) and
+                        tuple(t.shape) != want):
+                    errs.append(f"{node.name or node.op}: input {idx} shape "
+                                f"{tuple(t.shape)}, want {want}")
     return errs
 
 
@@ -1098,7 +1229,6 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Rewrite ONNX subgraphs to dit-plugins nodes.")
     ap.add_argument("input", help="input .onnx")
     ap.add_argument("output", nargs="?", help="output .onnx (required unless --dry-run)")
-    ap.add_argument("--fuse-adaln", action="append", default=[], metavar="NORM,SCALE,SHIFT,OUT[,EPS]")
     ap.add_argument("--fuse-rms-adaln", action="append", default=[], metavar="NORM,SCALE,SHIFT,OUT[,EPS]")
     ap.add_argument("--fuse-dit-self-attn", action="append", default=[],
                     metavar="Q_I8,Q_SCALE,K_I8,K_SCALE,V_I8,V_SCALE,RMS_W_Q,RMS_W_K,INV_FREQ,ATTN_OUT[,NAME]")
@@ -1117,10 +1247,6 @@ def main(argv=None) -> int:
         if dst not in _SPECS:
             ap.error(f"unknown plugin op: {dst!r} (want one of {sorted(_SPECS)})")
         print(f"retarget {src} -> {dst}: {retarget_nodes(graph, {src: dst})}")
-    for spec in args.fuse_adaln:
-        n, s, sh, o, eps = _fuse_spec(spec)
-        fuse_norm_affine(graph, norm=n, scale=s, shift=sh, out=o, plugin=PluginOp.ADALN, eps=eps)
-        print(f"fused adaln -> {o}")
     for spec in args.fuse_rms_adaln:
         n, s, sh, o, eps = _fuse_spec(spec)
         fuse_norm_affine(graph, norm=n, scale=s, shift=sh, out=o, plugin=PluginOp.RMS_ADALN, eps=eps)

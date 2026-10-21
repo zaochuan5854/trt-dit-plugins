@@ -24,6 +24,8 @@
 #include <NvInfer.h>
 #include <NvInferRuntime.h>
 
+#include "rt.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -154,6 +156,8 @@ class SageAttn : public nvinfer1::IPluginV3,
     friend class SageAttnCreator;
 
 public:
+    SageAttn() { (void)::dit::pinnedFloats(); }
+
     nvinfer1::IPluginCapability* getCapabilityInterface(
         nvinfer1::PluginCapabilityType type) noexcept override {
         if (type == nvinfer1::PluginCapabilityType::kCORE)
@@ -273,17 +277,18 @@ public:
         // selection stays on the portable path.
         tactic_ = 0;
         if (fp8pv_) {
-            int dev = 0;
-            cudaDeviceProp prop{};
-            if (cudaGetDevice(&dev) != cudaSuccess ||
-                cudaGetDeviceProperties(&prop, dev) != cudaSuccess)
-                return -1;
-            if (prop.major != 8 || prop.minor != 9 || (D_ != 64 && D_ != 128) ||
+            if (::dit::smVersion() != 89 || (D_ != 64 && D_ != 128) ||
                 Lq_ != Lk_ || Lk_ < 128 || Lk_ % 128 != 0 ||
-                in[0].type == nvinfer1::DataType::kFLOAT)
+                in[0].type == nvinfer1::DataType::kFLOAT) {
+                DIT_REJECT(kName, "onShapeChange", "fp8_pv tactic: sm89 D64/128 square only");
                 return -1;
+            }
             tactic_ = 1;
         }
+        if (tactic_ == 1)
+            plan1_ = planWs1(B_, Hq_, Hkv_, Lk_, D_);
+        else
+            plan0_ = planWs0(B_, Hq_, Lq_, Hkv_, Lk_, D_);
         return 0;
     }
 
@@ -292,8 +297,12 @@ public:
         try {
             char* w = static_cast<char*>(ws);
             if (tactic_ == 1) {
-                WsPlan1 p = planWs1(B_, Hq_, Hkv_, Lk_, D_);
-                float pvhost[kMaxHeads];
+                WsPlan1 p = plan1_;
+                if (p.total == 0) // engine loaded without a shape change
+                    p = plan1_ = planWs1(B_, Hq_, Hkv_, Lk_, D_);
+                float* pvhost = ::dit::pinnedFloats();
+                if (pvhost == nullptr)
+                    return -1;
                 for (int i = 0; i < Hq_; ++i) pvhost[i] = 50.0f;
                 if (cudaMemcpyAsync(w + p.off_pv, pvhost, (size_t)Hq_ * 4, cudaMemcpyHostToDevice,
                         stream) != cudaSuccess)
@@ -319,7 +328,9 @@ public:
                     B_, Hq_, Hkv_, Lk_, D_, inCode_ == 2 ? 1 : 0, smScale_, stream);
                 return 0;
             }
-            WsPlan0 p = planWs0(B_, Hq_, Lq_, Hkv_, Lk_, D_);
+            WsPlan0 p = plan0_;
+            if (p.total == 0) // engine loaded without a shape change
+                p = plan0_ = planWs0(B_, Hq_, Lq_, Hkv_, Lk_, D_);
             int64_t sb_q = (int64_t)Hq_ * Lq_ * D_, sh_q = (int64_t)Lq_ * D_;
             int64_t sb_k = (int64_t)Hkv_ * Lk_ * D_, sh_k = (int64_t)Lk_ * D_;
             int64_t sb_v = (int64_t)Hkv_ * Lk_ * D_, sh_v = (int64_t)Lk_ * D_;
@@ -352,7 +363,9 @@ public:
         return &fc_;
     }
 
-    char const* getTimingCacheID() noexcept override { return "sage_attn/1"; }
+    char const* getTimingCacheID() noexcept override {
+        return fp8pv_ ? "sage_attn/1;fp8_pv=1" : "sage_attn/1;fp8_pv=0";
+    }
 
     int tactic() const noexcept { return tactic_; }
 
@@ -360,6 +373,8 @@ private:
     static constexpr int kMaxHeads = 256;
     int B_ = 0, Hq_ = 0, Hkv_ = 0, Lq_ = 0, Lk_ = 0, D_ = 0;
     int inCode_ = 0, outCode_ = 0, tactic_ = 0;
+    WsPlan0 plan0_{};
+    WsPlan1 plan1_{};
     int32_t fp8pv_ = 0;
     float smScale_ = 0;
     nvinfer1::PluginField fields_[1]{};

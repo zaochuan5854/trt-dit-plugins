@@ -31,12 +31,6 @@ def main():
     x = torch.randn(N, D, device="cuda", dtype=torch.bfloat16)
     sc = torch.randn(N, D, device="cuda", dtype=torch.bfloat16) * 0.2
     sh = torch.randn(N, D, device="cuda", dtype=torch.bfloat16) * 0.2
-    o = tdp.adaln(x, sc, sh)
-    ref = F.layer_norm(x.float(), (D,), eps=1e-6) * (1 + sc.float()) + sh.float()
-    c = cos(o, ref.bfloat16())
-    print(f"adaln cos={c:.5f}", flush=True)
-    assert c > 0.999, c
-
     o = tdp.rms_adaln(x, sc, sh)
     ref = (
         x.float() / x.float().pow(2).mean(-1, keepdim=True).add(1e-6).sqrt()

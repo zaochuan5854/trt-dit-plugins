@@ -17,20 +17,11 @@ from pathlib import Path
 PLUGIN_VERSION = "1"
 PLUGIN_NAMESPACE = "dit-plugins"
 
-# name -> (lib file, TRT plugin name). lib resolved at load time.
+# Filled from the TensorRT plugin registry by ensure_loaded(): one source of
+# truth, no second hand-maintained op list. Empty until then.
 from .select import PluginOp
 
-PLUGINS = {
-    PluginOp.INT8_ATTENTION: "int8_attention",
-    PluginOp.SAGE_ATTN: "sage_attn",
-    PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: "fused_int8_rope_sage_attn",
-    PluginOp.ADALN: "adaln",
-    PluginOp.RMS_ADALN: "rms_adaln",
-    PluginOp.APPLY_ROPE: "apply_rope",
-    PluginOp.RMS_ROPE_SPLIT_HALF: "rms_rope_split_half",
-    PluginOp.STOCHASTIC_ROUND_FP8: "stochastic_round_fp8",
-    PluginOp.BLOCK_SPARSE_SAGE2_ATTN: "block_sparse_sage2_attn",
-}
+PLUGINS: dict[PluginOp, str] = {}
 
 # pip packages searched (first hit wins) for each dependency library.
 _PKG_CANDIDATES = ("nvidia.cu13", "tensorrt_libs")
@@ -133,4 +124,46 @@ def ensure_loaded() -> dict[str, ctypes.CDLL]:
         d = libdir()
         _loaded["ck_kernels"] = _load_one(d, "ck_kernels")
         _loaded["trt_dit_plugins"] = _load_one(d, "trt_dit_plugins")
+        _refresh_plugins()
     return _loaded
+
+
+def _refresh_plugins() -> None:
+    """Rebuild PLUGINS from the registered creators (same enum names)."""
+    try:
+        import tensorrt as trt
+    except ImportError:  # autotune-only use without TensorRT
+        return
+
+    names = {
+        c.name
+        for c in trt.get_plugin_registry().all_creators_recursive
+        if c.plugin_namespace == PLUGIN_NAMESPACE
+    }
+    PLUGINS.clear()
+    for op in PluginOp:
+        if op.value in names:
+            PLUGINS[op] = op.value
+
+
+def get_autotune():
+    """``convrot_int4_autotune(M, N, K, out_dtype, scratch)`` -> config index.
+
+    Build-time only: the tuner measures kernels, so it must never run from a
+    TRT enqueue. ``scratch`` is a CUDA int8 tensor sized by
+    :func:`autotune.scratch_bytes`.
+    """
+    fn = ensure_loaded()["ck_kernels"].convrot_int4_autotune
+    fn.argtypes = [
+        ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+    ]
+    fn.restype = ctypes.c_int
+
+    def run(m: int, n: int, k: int, out_dtype: int, scratch) -> int:
+        import torch
+
+        return int(fn(m, n, k, out_dtype, scratch.data_ptr(), scratch.numel(),
+                      torch.cuda.current_stream(scratch.device).cuda_stream))
+
+    return run

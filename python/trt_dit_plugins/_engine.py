@@ -90,7 +90,10 @@ def _fields_key(fields: dict[str, Any]) -> tuple:
 
 
 def _sig_key(
-    name: str, fields: dict[str, Any], inputs: Sequence[tuple[str, Any, tuple[int, ...]]]
+    name: str,
+    fields: dict[str, Any],
+    inputs: Sequence[tuple[str, Any, tuple[int, ...]]],
+    profile: dict[str, tuple] | None = None,
 ) -> tuple:
     return (
         name,
@@ -98,6 +101,7 @@ def _sig_key(
         _lib.PLUGIN_NAMESPACE,
         _fields_key(fields),
         tuple((n, str(d), tuple(s)) for n, d, s in inputs),
+        tuple(sorted((n, tuple(map(tuple, p))) for n, p in (profile or {}).items())),
     )
 
 
@@ -107,11 +111,16 @@ def _build_engine(
     inputs: Sequence[tuple[str, Any, tuple[int, ...]]],
     n_outputs: int,
     out_names: Sequence[str] | None = None,
+    profile: dict[str, tuple] | None = None,
 ) -> Any:
-    """Build (or fetch from cache) a single-plugin engine."""
+    """Build (or fetch from cache) a single-plugin engine.
+
+    ``profile`` maps an input name to ``(min, opt, max)`` dim tuples; those
+    dims are declared ``-1`` on the network and resolved per execution.
+    """
     trt = _trt()
     _lib.ensure_loaded()
-    key = _sig_key(name, fields, inputs)
+    key = _sig_key(name, fields, inputs, profile)
     with _lock:
         if key in _cache:
             return _cache[key]
@@ -146,6 +155,11 @@ def _build_engine(
             network.mark_output(layer.get_output(i))
         config = builder.create_builder_config()
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
+        if profile:
+            opt = builder.create_optimization_profile()
+            for n, (lo, o, hi) in profile.items():
+                opt.set_shape(n, tuple(lo), tuple(o), tuple(hi))
+            config.add_optimization_profile(opt)
         engine = builder.build_engine_with_config(network, config)
         if engine is None:
             raise RuntimeError(f"engine build failed: {name} {key}")
@@ -158,12 +172,14 @@ def run_plugin(
     tensors: dict[str, Any],
     out_specs: Sequence[tuple[str, Any, tuple[int, ...]]],
     fields: dict[str, Any] | None = None,
+    profile: dict[str, tuple] | None = None,
 ) -> dict[str, Any]:
     """Run one plugin layer end to end. Returns {out_name: torch.Tensor}.
 
     tensors: {input_name: torch CUDA tensor} (insertion order = plugin input
     order — do NOT sort: positions matter, e.g. q before k).
     out_specs: [(out_name, torch dtype, shape)].
+    profile: {input_name: (min, opt, max)} makes that input dynamic (R5).
     """
     from .select import PluginOp
 
@@ -182,10 +198,20 @@ def run_plugin(
         if not t.is_cuda or t.device != device or not t.is_contiguous():
             raise ValueError(f"input {n}: same CUDA device + contiguous required")
     in_sig = [(n, torch_dtype_to_trt(tensors[n].dtype), tuple(tensors[n].shape)) for n in names]
+    decl = []
+    for n, d, s in in_sig:
+        r = (profile or {}).get(n)
+        if r:
+            if len(r) != 3:
+                raise ValueError(f"profile[{n!r}] must be (min, opt, max)")
+            s = tuple(-1 if not (a == b == c) else b for a, b, c in zip(*r))
+        decl.append((n, d, s))
     out_names = [o[0] for o in out_specs]
-    engine = _build_engine(name, fields, in_sig, len(out_specs), out_names)
+    engine = _build_engine(name, fields, decl, len(out_specs), out_names, profile)
     ctx = engine.create_execution_context()
     for n in names:
+        if profile and n in profile:
+            ctx.set_input_shape(n, tuple(tensors[n].shape))
         ctx.set_tensor_address(n, tensors[n].data_ptr())
     outs: dict[str, Any] = {}
     for oname, odtype, oshape in out_specs:
