@@ -138,6 +138,7 @@ jobs:
           python -m pip wheel . -w dist --no-deps --no-build-isolation
 
       - name: Verify wheel contents
+        shell: bash  # the heredoc is bash-only; pwsh rejects `python - <<`
         run: |
           python - <<'PY'
           import glob, zipfile
