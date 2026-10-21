@@ -59,9 +59,9 @@ out = tdp.fused_rope_sage_attn(q, k, v, rms_w_q, rms_w_k, inv_freq)
 
 ```bash
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.5.1-cu13/trt_dit_plugins-0.5.1-py3-none-linux_x86_64.whl   # Linux
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.6.0-cu13/trt_dit_plugins-0.6.0-py3-none-linux_x86_64.whl   # Linux
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.5.1-cu13/trt_dit_plugins-0.5.1-py3-none-win_amd64.whl      # Windows
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.6.0-cu13/trt_dit_plugins-0.6.0-py3-none-win_amd64.whl      # Windows
 ```
 
 ## Quick Start
@@ -75,10 +75,10 @@ that call it is empty by design.
 
 ### Migrating from 0.4.x
 
-LayerNorm AdaLN was removed in 0.5.0: `PluginOp.ADALN`,
-`surgeon.add_adaln` and the `--fuse-adaln` CLI flag no longer exist. Use
-`rms_adaln` (`fuse_norm_affine(..., plugin="rms_adaln")`); LayerNorm AdaLN
-graphs now stay native.
+The old 2D `adaln` op (`PluginOp.ADALN`, `surgeon.add_adaln`,
+`--fuse-adaln`) was removed in 0.5.0 and stays removed. Use `rms_adaln` or,
+since 0.6.0, `layer_norm_adaln` (`fuse_norm_affine(..., plugin=...)`) with 3D
+input and optional `weight` / `residual` / `gate`.
 
 ## Plugins
 
@@ -86,13 +86,15 @@ graphs now stay native.
 |---|---|---|---|
 | `int8_attention` | INT8 Q/K/V attention (SageAttention), D ∈ {64,128,256} | in f32/f16/bf16 → out f16/bf16 (f32→bf16) | cos=0.99990, 0.910 ms/layer @ S=4096,H=16,D=128 (RTX 4070 Ti) |
 | `sage_attn` | Plain dense SageAttention, GQA ok, D ∈ {64,128,256} (new in 0.4.0) | in f32/f16/bf16 (FP8 inputs rejected) → out f16/bf16 (f32→bf16) | sm89+D∈{64,128}+S%128==0: FP8-PV Sage2 tactic (cos=0.99925, opt-in via `fp8_pv=1`); else portable FP16-PV (cos=0.99927) |
-| `rms_adaln` | Fused RMSNorm AdaLN | f32/f16/bf16 in+out (uniform) | cos=1.0 |
+| `rms_adaln` | Fused RMSNorm AdaLN; 2D/3D x, broadcast modulation, optional weight / residual+gate | f32/f16/bf16 in+out (uniform); modulation one dtype | cos=1.0 |
+| `layer_norm_adaln` | Fused LayerNorm AdaLN (new in 0.6.0), same I/O and residual+gate as `rms_adaln` | f32/f16/bf16 in+out (uniform); modulation one dtype | cos=1.0 |
+| `rms_norm` | Single-tensor RMSNorm; `layout="bshd"` also emits the BHSD view (new in 0.6.0) | f32/f16/bf16 in+out; weight same dtype | cos=1.0 |
 | `apply_rope` | Strided (copy-free) RoPE, D even | f16/bf16 in+out; freqs f32/f16/bf16 | cos=1.0 |
-| `rms_rope_split_half` | Fused RMSNorm + split-half/partial RoPE, D multiple of 32 | f16/bf16 in+out; freqs/scales f32/f16/bf16 | cos=1.0 |
+| `rms_rope_split_half` | Fused RMSNorm + split-half/partial RoPE, D multiple of 32; dynamic B/S, `rot_dim=-1` = RMS-only (new in 0.6.0) | f16/bf16 in+out; freqs/scales f32/f16/bf16 | cos=1.0 |
 | `stochastic_round_fp8` | Stochastic rounding to FP8 E4M3 | in f32/f16/bf16, rng INT32 → out FP8 | exact match |
 | `block_sparse_sage2_attn` | Block-sparse SageAttention2, sm89 only (kernel: SpargeAttn) | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] | cos=0.99953 |
 | `fused_int8_rope_sage_attn` | Fused RoPE+SageAttention DiT-self, D=128 (new in 0.4.0) | in INT8 [B,H,S,128] + FP32 scales, or f32/f16/bf16 [B,H,S,128] (scales ignored; `fused_rope_sage_attn`) + norms → out BF16 | cos=0.99855 vs fp32 eager (matched rotation), 1.578 ms/layer @ S=4096,H=16 (1.29x vs separation; 1.12x @ S=9216, RTX 4070 Ti) |
-| `convrot_linear` | ConvRot W8A8 dynamic-quant linear (INT8 weight, online Hadamard rotation) | x f16/bf16/f32, weight INT8 [N,K], scale FP32 [N], bias [N] → f16/bf16/f32 | bit-exact vs comfy-kitchen (max_abs=0) |
+| `convrot_linear` | ConvRot W8A8 dynamic-quant linear (INT8 weight, online Hadamard rotation); 0.6.0 adds GELU/SiLU + residual+gate epilogue and BHSD/QKV output | x f16/bf16/f32, weight INT8 [N,K], scale FP32 [N], bias [N] → f16/bf16/f32 or `[B,H,S,D]` ×3 | bit-exact vs comfy-kitchen (max_abs=0); epilogue/layout covered by GPU tests |
 | `convrot_linear_w4a4` | ConvRot W4A4 linear (packed signed INT4 weight [N,K/2], INT4 activation) | x f16/bf16/f32, weight INT8 packed [N,K/2], scale FP32 [N], bias [N] → f16/bf16/f32 | bit-exact vs comfy-kitchen (max_abs=0) |
 
 All plugin I/O is `kLINEAR` only. Q/K/V/scale inputs to one plugin must share
@@ -168,6 +170,11 @@ y = tdp.convrot_linear_w4a4(x, w_i4_packed, w_scale, bias, gemm_config=cfg)
 # one engine across token counts (M dynamic; K is fixed)
 y = tdp.convrot_linear(x, w_i8, w_scale, bias,
                        profile={"x": ((1, K), (M, K), (M_max, K))})
+# 0.6.0: fused epilogue / residual+gate, or QKV in head-major layout
+y = tdp.convrot_linear(x, w_i8, w_scale, bias, epilogue="gelu",
+                       residual=res, gate=mod)
+q, k, v = tdp.convrot_linear(x, w_qkv, w_qkv_scale, bias_qkv,
+                             out_layout="bhsd", qkv_heads=16, head_dim=128)
 ```
 
 Constraints (rejected at build time): `K % 256 == 0`, `K <= 16384`,
@@ -203,7 +210,10 @@ python -m trt_dit_plugins.surgeon model.onnx model.trt.onnx \
 Python API: `add_int8_attention` / `add_sage_attn` /
 `add_rms_adaln` / `add_apply_rope` / `add_rms_rope_split_half` /
 `add_stochastic_round_fp8` / `add_block_sparse_sage2_attn` /
-`add_dit_self_fused_attn` / `add_convrot_linear`, plus explicit-anchor `fuse_norm_affine`,
+`add_dit_self_fused_attn` / `add_convrot_linear` / `add_rms_norm` /
+`add_layer_norm_adaln`, plus explicit-anchor `fuse_norm_affine`,
+`fuse_rope_blocks` (`qk_layout="bhsd"` skips transposes; `rot_dim=-1` +
+`include_cross=True` inserts the two cross-attn RMSNorms),
 `fuse_dit_self_attn_block`, `retarget_nodes`, `import_comfy_convrot` (rewrites
 exporter-emitted `comfy_kitchen::int8_linear` ConvRot nodes, fail-open), and GPU-free
 `validate_plugin_nodes` (`python/trt_dit_plugins/surgeon.py`; no auto

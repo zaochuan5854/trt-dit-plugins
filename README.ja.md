@@ -71,9 +71,11 @@ python -c "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
 |---|---|---|---|
 | `int8_attention` | INT8 Q/K/V attention (SageAttention)、D ∈ {64,128,256} | in f32/f16/bf16 → out f16/bf16 (f32→bf16) | cos=0.99990, 0.910 ms/layer @ S=4096,H=16,D=128 (RTX 4070 Ti) |
 | `sage_attn` | 素のdense SageAttention、GQA可、D ∈ {64,128,256}（0.4.0で新規） | in f32/f16/bf16（FP8入力は拒否） → out f16/bf16 (f32→bf16) | sm89+D∈{64,128}+S%128==0：FP8-PV Sage2 tactic（cos=0.99925、`fp8_pv=1`でopt-in）。それ以外はportable FP16-PV（cos=0.99927） |
-| `adaln` / `rms_adaln` | 融合 LayerNorm/RMSNorm AdaLN | f32/f16/bf16 in+out（統一） | cos=1.0 |
+| `rms_adaln` | 融合 RMSNorm AdaLN、2D/3D x・broadcast変調・任意のweight／residual+gate | f32/f16/bf16 in+out（統一）、変調は同一dtype | cos=1.0 |
+| `layer_norm_adaln` | 融合 LayerNorm AdaLN（0.6.0で追加）、I/Oとresidual+gateは`rms_adaln`と同じ | f32/f16/bf16 in+out（統一）、変調は同一dtype | cos=1.0 |
+| `rms_norm` | 単一テンソルRMSNorm、`layout="bshd"`でBHSD出力も生成（0.6.0で追加） | f32/f16/bf16 in+out、weightは同一dtype | cos=1.0 |
 | `apply_rope` | Strided（コピーフリー）RoPE、D偶数 | f16/bf16 in+out；freqs f32/f16/bf16 | cos=1.0 |
-| `rms_rope_split_half` | 融合 RMSNorm＋split-half/partial RoPE、Dは32の倍数 | f16/bf16 in+out；freqs/scales f32/f16/bf16 | cos=1.0 |
+| `rms_rope_split_half` | 融合 RMSNorm＋split-half/partial RoPE、Dは32の倍数、動的B/S、`rot_dim=-1`でRMSのみ（0.6.0で追加） | f16/bf16 in+out；freqs/scales f32/f16/bf16 | cos=1.0 |
 | `stochastic_round_fp8` | FP8 E4M3への確率丸め | in f32/f16/bf16, rng INT32 → out FP8 | exact match |
 | `block_sparse_sage2_attn` | Block-sparse SageAttention2、sm89のみ（kernel：SpargeAttn） | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] | cos=0.99953 |
 | `fused_int8_rope_sage_attn` | 融合INT8 RoPE+SageAttention DiT-self、D=128、S>1024（0.4.0で新規） | in INT8 [B,H,S,128]＋FP32 scales/norms → out BF16 | cos=0.99855（fp32 eager比、回転条件一致）、1.578 ms/layer @ S=4096,H=16（分離比1.29x；S=9216で1.12x、RTX 4070 Ti） |

@@ -70,9 +70,11 @@ python -c "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
 |---|---|---|---|
 | `int8_attention` | INT8 Q/K/V attention (SageAttention)，D ∈ {64,128,256} | in f32/f16/bf16 → out f16/bf16 (f32→bf16) | cos=0.99990, 0.910 ms/layer @ S=4096,H=16,D=128 (RTX 4070 Ti) |
 | `sage_attn` | 纯 dense SageAttention，支持 GQA，D ∈ {64,128,256}（0.4.0 新增） | in f32/f16/bf16（拒绝 FP8 输入） → out f16/bf16 (f32→bf16) | sm89+D∈{64,128}+S%128==0：FP8-PV Sage2 tactic（cos=0.99925，经 `fp8_pv=1` opt-in）；其余为 portable FP16-PV（cos=0.99927） |
-| `adaln` / `rms_adaln` | 融合 LayerNorm/RMSNorm AdaLN | f32/f16/bf16 in+out（统一） | cos=1.0 |
+| `rms_adaln` | 融合 RMSNorm AdaLN，支持 2D/3D x、广播调制、可选 weight / residual+gate | f32/f16/bf16 in+out（统一），调制同一 dtype | cos=1.0 |
+| `layer_norm_adaln` | 融合 LayerNorm AdaLN（0.6.0 新增），I/O 与 residual+gate 同 `rms_adaln` | f32/f16/bf16 in+out（统一），调制同一 dtype | cos=1.0 |
+| `rms_norm` | 单张量 RMSNorm，`layout="bshd"` 同时输出 BHSD（0.6.0 新增） | f32/f16/bf16 in+out，weight 同一 dtype | cos=1.0 |
 | `apply_rope` | Strided（零拷贝）RoPE，D 为偶数 | f16/bf16 in+out；freqs f32/f16/bf16 | cos=1.0 |
-| `rms_rope_split_half` | 融合 RMSNorm + split-half/partial RoPE，D 为 32 的倍数 | f16/bf16 in+out；freqs/scales f32/f16/bf16 | cos=1.0 |
+| `rms_rope_split_half` | 融合 RMSNorm + split-half/partial RoPE，D 为 32 的倍数，动态 B/S、`rot_dim=-1` 为仅 RMS（0.6.0 新增） | f16/bf16 in+out；freqs/scales f32/f16/bf16 | cos=1.0 |
 | `stochastic_round_fp8` | 随机舍入到 FP8 E4M3 | in f32/f16/bf16, rng INT32 → out FP8 | exact match |
 | `block_sparse_sage2_attn` | Block-sparse SageAttention2，仅 sm89（kernel：SpargeAttn） | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] | cos=0.99953 |
 | `fused_int8_rope_sage_attn` | 融合 INT8 RoPE+SageAttention DiT-self，D=128，S>1024（0.4.0 新增） | in INT8 [B,H,S,128] + FP32 scales/norms → out BF16 | cos=0.99855（相对 fp32 eager，旋转条件一致），1.578 ms/layer @ S=4096,H=16（相对分离路径 1.29x；S=9216 时 1.12x，RTX 4070 Ti） |
