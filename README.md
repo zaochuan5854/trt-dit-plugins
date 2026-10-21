@@ -9,11 +9,10 @@
 - `pip install` only: no system CUDA or TensorRT. Wheels bundle the two plugin
   libraries; `torch`, `tensorrt-cu13-libs` and `nvidia-cuda-runtime` come
   from pip.
-- 10 plugins under the `dit-plugins` namespace: INT8 attention, plain dense
-  SageAttention, fused INT8 RoPE+SageAttention DiT-self, RMSNorm AdaLN,
-  RoPE variants, FP8 stochastic rounding, block-sparse SageAttention2 (sm89),
-  ConvRot W8A8/W4A4 linear. LayerNorm AdaLN was removed in 0.5.0 (see
-  Migrating from 0.4.x).
+- 12 plugins under the `dit-plugins` namespace: INT8 attention, plain dense
+  SageAttention, fused INT8 RoPE+SageAttention DiT-self, RMSNorm/LayerNorm
+  AdaLN, single-tensor RMSNorm, RoPE variants, FP8 stochastic rounding,
+  block-sparse SageAttention2 (sm89), ConvRot W8A8/W4A4 linear.
 - Kernels from ComfyKitchen and SpargeAttn (see NOTICE and Kernel sources);
   handwritten TRT glue. Not affiliated with Comfy Org; ComfyKitchen
   compatibility is not a goal.
@@ -88,7 +87,7 @@ input and optional `weight` / `residual` / `gate`.
 | `sage_attn` | Plain dense SageAttention, GQA ok, D ∈ {64,128,256} (new in 0.4.0) | in f32/f16/bf16 (FP8 inputs rejected) → out f16/bf16 (f32→bf16) | sm89+D∈{64,128}+S%128==0: FP8-PV Sage2 tactic (cos=0.99925, opt-in via `fp8_pv=1`); else portable FP16-PV (cos=0.99927) |
 | `rms_adaln` | Fused RMSNorm AdaLN; 2D/3D x, broadcast modulation, optional weight / residual+gate | f32/f16/bf16 in+out (uniform); modulation one dtype | cos=1.0 |
 | `layer_norm_adaln` | Fused LayerNorm AdaLN (new in 0.6.0), same I/O and residual+gate as `rms_adaln` | f32/f16/bf16 in+out (uniform); modulation one dtype | cos=1.0 |
-| `rms_norm` | Single-tensor RMSNorm; `layout="bshd"` also emits the BHSD view (new in 0.6.0) | f32/f16/bf16 in+out; weight same dtype | cos=1.0 |
+| `rms_norm` | Single-tensor RMSNorm; `layout="bshd"` also emits the BHSD view (new in 0.6.0) | x f16/bf16 → same; weight f32/f16/bf16 | cos=1.0 |
 | `apply_rope` | Strided (copy-free) RoPE, D even | f16/bf16 in+out; freqs f32/f16/bf16 | cos=1.0 |
 | `rms_rope_split_half` | Fused RMSNorm + split-half/partial RoPE, D multiple of 32; dynamic B/S, `rot_dim=-1` = RMS-only (new in 0.6.0) | f16/bf16 in+out; freqs/scales f32/f16/bf16 | cos=1.0 |
 | `stochastic_round_fp8` | Stochastic rounding to FP8 E4M3 | in f32/f16/bf16, rng INT32 → out FP8 | exact match |
@@ -112,7 +111,8 @@ S>1024 dispatch but correct): cos 0.9968 / 0.9984 vs fp32 eager at S=512 /
 | Plugin | Kernel source |
 |---|---|
 | `int8_attention` | [comfy-kitchen `backends/cuda/sage_attention/`](https://github.com/Comfy-Org/comfy-kitchen/tree/main/comfy_kitchen/backends/cuda/sage_attention) (origin: [SageAttention](https://github.com/thu-ml/SageAttention)) |
-| `rms_adaln` | [comfy-kitchen `backends/cuda/ops/adaln.cu`](https://github.com/Comfy-Org/comfy-kitchen/blob/main/comfy_kitchen/backends/cuda/ops/adaln.cu) |
+| `rms_adaln` / `layer_norm_adaln` | [comfy-kitchen `backends/cuda/ops/adaln.cu`](https://github.com/Comfy-Org/comfy-kitchen/blob/main/comfy_kitchen/backends/cuda/ops/adaln.cu) |
+| `rms_norm` | Own `src/wrapper/rms_norm_wrapper.cpp` |
 | `apply_rope` / `rms_rope_split_half` | [comfy-kitchen `backends/cuda/ops/rms_rope.cu`](https://github.com/Comfy-Org/comfy-kitchen/blob/main/comfy_kitchen/backends/cuda/ops/rms_rope.cu) |
 | `stochastic_round_fp8` | [comfy-kitchen `backends/cuda/ops/per_tensor_quantize.cu`](https://github.com/Comfy-Org/comfy-kitchen/blob/main/comfy_kitchen/backends/cuda/ops/per_tensor_quantize.cu) |
 | `block_sparse_sage2_attn` | [SpargeAttn `csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh`](https://github.com/thu-ml/SpargeAttn/blob/main/csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh) (+ [`csrc/fused/fused.cu`](https://github.com/thu-ml/SpargeAttn/blob/main/csrc/fused/fused.cu)) |

@@ -8,9 +8,10 @@
 
 - 仅需 `pip install`：不需要系统级 CUDA 或 TensorRT。wheel 自带两个插件库；
   `torch`、`tensorrt-cu13-libs`、`nvidia-cuda-runtime` 均来自 pip。
-- `dit-plugins` 命名空间下共 9 个插件：INT8 attention、纯 dense SageAttention、
-  融合 INT8 RoPE+SageAttention DiT-self、AdaLN、RoPE 变体、FP8 随机舍入、
-  block-sparse SageAttention2（仅 sm89）。
+- `dit-plugins` 命名空间下共 12 个插件：INT8 attention、纯 dense SageAttention、
+  融合 INT8 RoPE+SageAttention DiT-self、RMSNorm/LayerNorm AdaLN、
+  单张量 RMSNorm、RoPE 变体、FP8 随机舍入、block-sparse SageAttention2
+  （仅 sm89）、ConvRot W8A8/W4A4 linear。
 - Kernel 来自 ComfyKitchen 与 SpargeAttn（见 NOTICE 与 Kernel sources）；
   TRT 胶水为手写。与 Comfy Org 无关；不以 ComfyKitchen 兼容为目标。
 
@@ -53,9 +54,9 @@ out = tdp.stochastic_rounding_fp8(x, rng)  # rng: int32，元素数与 x 相同
 
 ```bash
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.4.0-cu13/trt_dit_plugins-0.4.0-py3-none-linux_x86_64.whl   # Linux
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.6.0-cu13/trt_dit_plugins-0.6.0-py3-none-linux_x86_64.whl   # Linux
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.4.0-cu13/trt_dit_plugins-0.4.0-py3-none-win_amd64.whl      # Windows
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.6.0-cu13/trt_dit_plugins-0.6.0-py3-none-win_amd64.whl      # Windows
 ```
 
 ## Quick Start
@@ -72,32 +73,37 @@ python -c "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
 | `sage_attn` | 纯 dense SageAttention，支持 GQA，D ∈ {64,128,256}（0.4.0 新增） | in f32/f16/bf16（拒绝 FP8 输入） → out f16/bf16 (f32→bf16) | sm89+D∈{64,128}+S%128==0：FP8-PV Sage2 tactic（cos=0.99925，经 `fp8_pv=1` opt-in）；其余为 portable FP16-PV（cos=0.99927） |
 | `rms_adaln` | 融合 RMSNorm AdaLN，支持 2D/3D x、广播调制、可选 weight / residual+gate | f32/f16/bf16 in+out（统一），调制同一 dtype | cos=1.0 |
 | `layer_norm_adaln` | 融合 LayerNorm AdaLN（0.6.0 新增），I/O 与 residual+gate 同 `rms_adaln` | f32/f16/bf16 in+out（统一），调制同一 dtype | cos=1.0 |
-| `rms_norm` | 单张量 RMSNorm，`layout="bshd"` 同时输出 BHSD（0.6.0 新增） | f32/f16/bf16 in+out，weight 同一 dtype | cos=1.0 |
+| `rms_norm` | 单张量 RMSNorm，`layout="bshd"` 同时输出 BHSD（0.6.0 新增） | x f16/bf16 → 同型，weight f32/f16/bf16 | cos=1.0 |
 | `apply_rope` | Strided（零拷贝）RoPE，D 为偶数 | f16/bf16 in+out；freqs f32/f16/bf16 | cos=1.0 |
 | `rms_rope_split_half` | 融合 RMSNorm + split-half/partial RoPE，D 为 32 的倍数，动态 B/S、`rot_dim=-1` 为仅 RMS（0.6.0 新增） | f16/bf16 in+out；freqs/scales f32/f16/bf16 | cos=1.0 |
 | `stochastic_round_fp8` | 随机舍入到 FP8 E4M3 | in f32/f16/bf16, rng INT32 → out FP8 | exact match |
 | `block_sparse_sage2_attn` | Block-sparse SageAttention2，仅 sm89（kernel：SpargeAttn） | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] | cos=0.99953 |
-| `fused_int8_rope_sage_attn` | 融合 INT8 RoPE+SageAttention DiT-self，D=128，S>1024（0.4.0 新增） | in INT8 [B,H,S,128] + FP32 scales/norms → out BF16 | cos=0.99855（相对 fp32 eager，旋转条件一致），1.578 ms/layer @ S=4096,H=16（相对分离路径 1.29x；S=9216 时 1.12x，RTX 4070 Ti） |
+| `fused_int8_rope_sage_attn` | 融合 INT8 RoPE+SageAttention DiT-self，D=128（0.4.0 新增） | in INT8 [B,H,S,128] + FP32 scales/norms → out BF16 | cos=0.99855（相对 fp32 eager，旋转条件一致），1.578 ms/layer @ S=4096,H=16（相对分离路径 1.29x；S=9216 时 1.12x，RTX 4070 Ti） |
+| `convrot_linear` | ConvRot W8A8 动态量化 linear；0.6.0 新增 GELU/SiLU + residual+gate epilogue 与 BHSD/QKV 输出 | x f16/bf16/f32，weight INT8 [N,K]，scale FP32 [N]，bias [N] → f16/bf16/f32 或 `[B,H,S,D]`×3 | base 路径与 comfy-kitchen bit-exact；epilogue/layout 由 GPU 测试覆盖 |
+| `convrot_linear_w4a4` | ConvRot W4A4 linear（打包有符号 INT4 weight [N,K/2]、INT4 activation） | x f16/bf16/f32，weight INT8 打包 [N,K/2]，scale FP32 [N]，bias [N] → f16/bf16/f32 | base 路径与 comfy-kitchen bit-exact |
 
 所有插件 I/O 均为 `kLINEAR`。同一插件的 Q/K/V/scale 输入 dtype 必须一致。
 TRT 11 不支持 `UINT8` 插件 I/O。
 
-Fused 约束：q/k/v 为相同形状的 INT8 `[B,H,S,128]`（S>1024）；per-tensor
+Fused 约束：q/k/v 为相同形状的 INT8 `[B,H,S,128]`；per-tensor
 FP32 scales（单元素）；RMSNorm 权重 FP32/BF16 `[128]`（dtype 一致）；
-`inv_freq` FP32 `[64]`；仅 DiT-self（无 mask/causal）。S≤1024 在构建时
-拒绝（L≤1024 路径结果错误）。
+`inv_freq` FP32 `[64]`；仅 DiT-self（无 mask/causal）。S≤1024 使用相同的
+BLKK=128 量化布局与 `cta_k=128`（比 S>1024 慢但正确）：S=512 / 1024 相对
+fp32 eager 的 cos 为 0.9968 / 0.9984（RTX 4070 Ti）。
 
 ## Kernel sources
 
 | Plugin | Kernel source |
 |---|---|
 | `int8_attention` | [comfy-kitchen `backends/cuda/sage_attention/`](https://github.com/Comfy-Org/comfy-kitchen/tree/main/comfy_kitchen/backends/cuda/sage_attention)（源头：[SageAttention](https://github.com/thu-ml/SageAttention)） |
-| `adaln` / `rms_adaln` | [comfy-kitchen `backends/cuda/ops/adaln.cu`](https://github.com/Comfy-Org/comfy-kitchen/blob/main/comfy_kitchen/backends/cuda/ops/adaln.cu) |
+| `rms_adaln` / `layer_norm_adaln` | [comfy-kitchen `backends/cuda/ops/adaln.cu`](https://github.com/Comfy-Org/comfy-kitchen/blob/main/comfy_kitchen/backends/cuda/ops/adaln.cu) |
+| `rms_norm` | 自研 `src/wrapper/rms_norm_wrapper.cpp` |
 | `apply_rope` / `rms_rope_split_half` | [comfy-kitchen `backends/cuda/ops/rms_rope.cu`](https://github.com/Comfy-Org/comfy-kitchen/blob/main/comfy_kitchen/backends/cuda/ops/rms_rope.cu) |
 | `stochastic_round_fp8` | [comfy-kitchen `backends/cuda/ops/per_tensor_quantize.cu`](https://github.com/Comfy-Org/comfy-kitchen/blob/main/comfy_kitchen/backends/cuda/ops/per_tensor_quantize.cu) |
 | `block_sparse_sage2_attn` | [SpargeAttn `csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh`](https://github.com/thu-ml/SpargeAttn/blob/main/csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh)（+ [`csrc/fused/fused.cu`](https://github.com/thu-ml/SpargeAttn/blob/main/csrc/fused/fused.cu)） |
 | `sage_attn` | 上述 vendored `sage_attention` kernels（`fp8_pv` 路径另加 sparge sm89 kernels） |
 | `fused_int8_rope_sage_attn` | 自研 `src/kernel/fused_qk_rope_requant.cu` + vendored `sage_attention` helpers |
+| `convrot_linear` / `convrot_linear_w4a4` | vendored comfy-kitchen `backends/cuda/ops/convrot_w4a4.cu` + `int8_linear.cu`（`third_party/comfy/convrot`，0.2.39，已 patch；见 `third_party/comfy/VENDOR.md`），基于 CUTLASS INT8/INT4 GEMM（`third_party/cutlass`） |
 
 ## Requirements
 
@@ -137,7 +143,7 @@ API（`tdp.ensure_loaded()`＋`add_plugin_v3`）或
 ```bash
 pip install --extra-index-url https://pypi.nvidia.com "trt-dit-plugins[onnx]"
 python -m trt_dit_plugins.surgeon model.onnx model.trt.onnx \
-  --fuse-adaln ln_out,scale,shift,blk_out \
+  --fuse-rms-adaln ln_out,scale,shift,blk_out \
   --fuse-dit-self-attn q_i8,q_scale,k_i8,k_scale,v_i8,v_scale,rms_w_q,rms_w_k,inv_freq,attn_out \
   --retarget MyCustomAttn:int8_attention
 ```

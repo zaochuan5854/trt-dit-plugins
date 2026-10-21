@@ -9,9 +9,10 @@
 - `pip install`のみ：システムCUDA・TensorRT不要。wheelが2本のプラグイン
   ライブラリを同梱し、`torch`・`tensorrt-cu13-libs`・`nvidia-cuda-runtime`
   はpipで解決。
-- `dit-plugins`名前空間に9 plugin：INT8 attention、素のdense SageAttention、
-  融合INT8 RoPE+SageAttention DiT-self、AdaLN、RoPE変種、FP8確率丸め、
-  block-sparse SageAttention2（sm89のみ）。
+- `dit-plugins`名前空間に12 plugin：INT8 attention、素のdense SageAttention、
+  融合INT8 RoPE+SageAttention DiT-self、RMSNorm/LayerNorm AdaLN、
+  単一テンソルRMSNorm、RoPE変種、FP8確率丸め、block-sparse
+  SageAttention2（sm89のみ）、ConvRot W8A8/W4A4 linear。
 - KernelはComfyKitchenおよびSpargeAttn由来（NOTICE・Kernel sources参照）。
   TRT glueは手書き。Comfy Orgとは無関係。ComfyKitchen互換は目標ではない。
 
@@ -54,9 +55,9 @@ out = tdp.stochastic_rounding_fp8(x, rng)  # rng: int32、xと同要素数
 
 ```bash
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.4.0-cu13/trt_dit_plugins-0.4.0-py3-none-linux_x86_64.whl   # Linux
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.6.0-cu13/trt_dit_plugins-0.6.0-py3-none-linux_x86_64.whl   # Linux
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.4.0-cu13/trt_dit_plugins-0.4.0-py3-none-win_amd64.whl      # Windows
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.6.0-cu13/trt_dit_plugins-0.6.0-py3-none-win_amd64.whl      # Windows
 ```
 
 ## Quick Start
@@ -73,32 +74,37 @@ python -c "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
 | `sage_attn` | 素のdense SageAttention、GQA可、D ∈ {64,128,256}（0.4.0で新規） | in f32/f16/bf16（FP8入力は拒否） → out f16/bf16 (f32→bf16) | sm89+D∈{64,128}+S%128==0：FP8-PV Sage2 tactic（cos=0.99925、`fp8_pv=1`でopt-in）。それ以外はportable FP16-PV（cos=0.99927） |
 | `rms_adaln` | 融合 RMSNorm AdaLN、2D/3D x・broadcast変調・任意のweight／residual+gate | f32/f16/bf16 in+out（統一）、変調は同一dtype | cos=1.0 |
 | `layer_norm_adaln` | 融合 LayerNorm AdaLN（0.6.0で追加）、I/Oとresidual+gateは`rms_adaln`と同じ | f32/f16/bf16 in+out（統一）、変調は同一dtype | cos=1.0 |
-| `rms_norm` | 単一テンソルRMSNorm、`layout="bshd"`でBHSD出力も生成（0.6.0で追加） | f32/f16/bf16 in+out、weightは同一dtype | cos=1.0 |
+| `rms_norm` | 単一テンソルRMSNorm、`layout="bshd"`でBHSD出力も生成（0.6.0で追加） | x f16/bf16 → 同一、weight f32/f16/bf16 | cos=1.0 |
 | `apply_rope` | Strided（コピーフリー）RoPE、D偶数 | f16/bf16 in+out；freqs f32/f16/bf16 | cos=1.0 |
 | `rms_rope_split_half` | 融合 RMSNorm＋split-half/partial RoPE、Dは32の倍数、動的B/S、`rot_dim=-1`でRMSのみ（0.6.0で追加） | f16/bf16 in+out；freqs/scales f32/f16/bf16 | cos=1.0 |
 | `stochastic_round_fp8` | FP8 E4M3への確率丸め | in f32/f16/bf16, rng INT32 → out FP8 | exact match |
 | `block_sparse_sage2_attn` | Block-sparse SageAttention2、sm89のみ（kernel：SpargeAttn） | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] | cos=0.99953 |
-| `fused_int8_rope_sage_attn` | 融合INT8 RoPE+SageAttention DiT-self、D=128、S>1024（0.4.0で新規） | in INT8 [B,H,S,128]＋FP32 scales/norms → out BF16 | cos=0.99855（fp32 eager比、回転条件一致）、1.578 ms/layer @ S=4096,H=16（分離比1.29x；S=9216で1.12x、RTX 4070 Ti） |
+| `fused_int8_rope_sage_attn` | 融合INT8 RoPE+SageAttention DiT-self、D=128（0.4.0で新規） | in INT8 [B,H,S,128]＋FP32 scales/norms → out BF16 | cos=0.99855（fp32 eager比、回転条件一致）、1.578 ms/layer @ S=4096,H=16（分離比1.29x；S=9216で1.12x、RTX 4070 Ti） |
+| `convrot_linear` | ConvRot W8A8 動的量子化linear。0.6.0でGELU/SiLU＋residual+gate epilogueとBHSD/QKV出力を追加 | x f16/bf16/f32、weight INT8 [N,K]、scale FP32 [N]、bias [N] → f16/bf16/f32 または `[B,H,S,D]`×3 | base経路はcomfy-kitchenとbit-exact、epilogue/layoutはGPUテストで検証 |
+| `convrot_linear_w4a4` | ConvRot W4A4 linear（パック符号付きINT4 weight [N,K/2]、INT4 activation） | x f16/bf16/f32、weight INT8パック [N,K/2]、scale FP32 [N]、bias [N] → f16/bf16/f32 | base経路はcomfy-kitchenとbit-exact |
 
 全plugin I/Oは`kLINEAR`のみ。同一pluginへのQ/K/V/scale入力はdtype統一必須。
 TRT 11は`UINT8`プラグインI/O非対応。
 
-Fused制約：q/k/vは同一形状のINT8 `[B,H,S,128]`（S>1024）。per-tensor FP32
+Fused制約：q/k/vは同一形状のINT8 `[B,H,S,128]`。per-tensor FP32
 scales（単一要素）。RMSNorm重みFP32/BF16 `[128]`（dtype統一）。`inv_freq`
-FP32 `[64]`。DiT-selfのみ（mask/causalなし）。S≤1024はビルド時拒否
-（L≤1024パスは誤結果のため）。
+FP32 `[64]`。DiT-selfのみ（mask/causalなし）。S≤1024は同じBLKK=128量子化
+レイアウトを`cta_k=128`で実行（S>1024より遅いが正しい）：S=512 / 1024で
+fp32 eager比cos 0.9968 / 0.9984（RTX 4070 Ti）。
 
 ## Kernel sources
 
 | Plugin | Kernel source |
 |---|---|
 | `int8_attention` | [comfy-kitchen `backends/cuda/sage_attention/`](https://github.com/Comfy-Org/comfy-kitchen/tree/main/comfy_kitchen/backends/cuda/sage_attention)（源流：[SageAttention](https://github.com/thu-ml/SageAttention)） |
-| `adaln` / `rms_adaln` | [comfy-kitchen `backends/cuda/ops/adaln.cu`](https://github.com/Comfy-Org/comfy-kitchen/blob/main/comfy_kitchen/backends/cuda/ops/adaln.cu) |
+| `rms_adaln` / `layer_norm_adaln` | [comfy-kitchen `backends/cuda/ops/adaln.cu`](https://github.com/Comfy-Org/comfy-kitchen/blob/main/comfy_kitchen/backends/cuda/ops/adaln.cu) |
+| `rms_norm` | 自作 `src/wrapper/rms_norm_wrapper.cpp` |
 | `apply_rope` / `rms_rope_split_half` | [comfy-kitchen `backends/cuda/ops/rms_rope.cu`](https://github.com/Comfy-Org/comfy-kitchen/blob/main/comfy_kitchen/backends/cuda/ops/rms_rope.cu) |
 | `stochastic_round_fp8` | [comfy-kitchen `backends/cuda/ops/per_tensor_quantize.cu`](https://github.com/Comfy-Org/comfy-kitchen/blob/main/comfy_kitchen/backends/cuda/ops/per_tensor_quantize.cu) |
 | `block_sparse_sage2_attn` | [SpargeAttn `csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh`](https://github.com/thu-ml/SpargeAttn/blob/main/csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh)（＋[`csrc/fused/fused.cu`](https://github.com/thu-ml/SpargeAttn/blob/main/csrc/fused/fused.cu)） |
 | `sage_attn` | 上記vendored `sage_attention` kernels（`fp8_pv`パス用にsparge sm89 kernelsを追加） |
 | `fused_int8_rope_sage_attn` | 自作 `src/kernel/fused_qk_rope_requant.cu`＋vendored `sage_attention` helpers |
+| `convrot_linear` / `convrot_linear_w4a4` | comfy-kitchen `backends/cuda/ops/convrot_w4a4.cu` + `int8_linear.cu`（`third_party/comfy/convrot`、0.2.39、パッチ済み。`third_party/comfy/VENDOR.md`）をCUTLASS INT8/INT4 GEMM（`third_party/cutlass`）上で使用 |
 
 ## Requirements
 
@@ -138,7 +144,7 @@ Python builder API（`tdp.ensure_loaded()`＋`add_plugin_v3`）または
 ```bash
 pip install --extra-index-url https://pypi.nvidia.com "trt-dit-plugins[onnx]"
 python -m trt_dit_plugins.surgeon model.onnx model.trt.onnx \
-  --fuse-adaln ln_out,scale,shift,blk_out \
+  --fuse-rms-adaln ln_out,scale,shift,blk_out \
   --fuse-dit-self-attn q_i8,q_scale,k_i8,k_scale,v_i8,v_scale,rms_w_q,rms_w_k,inv_freq,attn_out \
   --retarget MyCustomAttn:int8_attention
 ```

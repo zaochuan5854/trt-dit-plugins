@@ -10,9 +10,10 @@ external handoff gate; this repo verifies the op-level contracts only.
   (cross-attention).
 - Dynamic `B` and `S` are accepted: the wrapper takes them from the input
   shape and `getOutputDimensions` mirrors Q/K.
-- `D` is fixed at 128 for the fused path. `freqs` keeps the `[1,1,S,r,2,2]`
-  layout (fp32/f16/bf16); its `S` must equal the Q/K `S` when `rot_dim > 0`
-  (mismatch is rejected in shape resolution/enqueue).
+- `D` must be a multiple of 32 (128 in Anima). `freqs` keeps the
+  `[fb,f1,S,r,2,2]` layout (fp32/f16/bf16); each of its first three dims may
+  be 1 or match Q/K, and `r` must equal `rot_dim/2` (mismatch is rejected in
+  shape resolution/enqueue).
 - Q/K are physical `[B,H,S,D]` (D contiguous). Use
   `fuse_rope_blocks(..., qk_layout="bhsd")` to skip the BSHD transposes.
 
