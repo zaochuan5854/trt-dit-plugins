@@ -110,14 +110,24 @@ def apply_rope(q, k, freqs):
     return outs["qo"], outs["ko"]
 
 
-def rms_rope_split_half(q, k, freqs, q_scale, k_scale, epsilon=1e-6, rot_dim=0):
-    """RMSNorm (full D) + split-half RoPE (rot_dim prefix, 0 = all)."""
+def rms_rope_split_half(q, k, freqs, q_scale, k_scale, epsilon=1e-6, rot_dim=0,
+                        profile=None):
+    """RMSNorm (full D) + split-half RoPE (rot_dim prefix, 0 = all).
+
+    ``rot_dim=-1`` skips rotation entirely (RMS-only); ``freqs`` is still
+    required by this pair op and may be a 1x1x1x1x2x2 dummy. Use
+    ``rms_norm`` instead when q and k have different S (cross-attention).
+
+    ``profile``: {"q": (min, opt, max), ...} makes B/S dynamic, same form as
+    ``_engine.run_plugin``.
+    """
     _require_cuda(q, k, freqs, q_scale, k_scale)
     outs = E.run_plugin(
         PluginOp.RMS_ROPE_SPLIT_HALF,
         {"q": q, "k": k, "f": freqs, "qs": q_scale, "ks": k_scale},
         [("qo", q.dtype, tuple(q.shape)), ("ko", k.dtype, tuple(k.shape))],
         {"epsilon": float(epsilon), "rot_dim": int(rot_dim)},
+        profile=profile,
     )
     return outs["qo"], outs["ko"]
 

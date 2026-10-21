@@ -120,6 +120,71 @@ def test_dynamic_profile():
         assert _cos(out, ref) > 0.99
 
 
+def _rms_rope_ref(q, k, freqs, qs, ks, rot):
+    """Reference for split-half RMS+RoPE; rot=0 means RMS-only."""
+    def norm(x, w):
+        xf = x.float()
+        rr = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)
+        return xf * rr * w.float()
+
+    nq, nk = norm(q, qs), norm(k, ks)
+    if rot == 0:
+        return nq.to(q.dtype), nk.to(k.dtype)
+    half = rot // 2
+    q0, q1 = nq[..., :half], nq[..., half:rot]
+    k0, k1 = nk[..., :half], nk[..., half:rot]
+    c, s = freqs[..., 0, 0].float(), freqs[..., 1, 0].float()
+    qo = torch.cat([q0 * c - q1 * s, q0 * s + q1 * c,
+                    nq[..., rot:]], dim=-1)
+    ko = torch.cat([k0 * c - k1 * s, k0 * s + k1 * c,
+                    nk[..., rot:]], dim=-1)
+    return qo.to(q.dtype), ko.to(k.dtype)
+
+
+def _freqs(B, H, S_, D):
+    ang = torch.rand(B, H, S_, D // 2, device="cuda") * 0.05
+    f = torch.empty(B, H, S_, D // 2, 2, 2, device="cuda")
+    c, s = ang.cos(), ang.sin()
+    f[..., 0, 0], f[..., 0, 1] = c, -s
+    f[..., 1, 0], f[..., 1, 1] = s, c
+    return f
+
+
+def test_rms_rope_dynamic_b_s():
+    H, D = 2, 128
+    profile = {
+        "q": ((1, H, 256, D), (2, H, 1024, D), (2, H, 4096, D)),
+        "k": ((1, H, 256, D), (2, H, 1024, D), (2, H, 4096, D)),
+        "f": ((1, 1, 256, D // 2, 2, 2), (1, 1, 1024, D // 2, 2, 2),
+              (1, 1, 4096, D // 2, 2, 2)),
+    }
+    for B, S_ in ((1, 256), (2, 1024), (1, 4096)):
+        q = torch.randn(B, H, S_, D, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(B, H, S_, D, device="cuda", dtype=torch.bfloat16)
+        fq = _freqs(1, 1, S_, D)
+        qs = torch.rand(D, device="cuda")
+        ks = torch.rand(D, device="cuda")
+        qo, ko = tdp.rms_rope_split_half(
+            q, k, fq, qs, ks, profile=profile)
+        rq, rk = _rms_rope_ref(q, k, fq, qs, ks, D)
+        assert _cos(qo, rq) > 0.9999
+        assert _cos(ko, rk) > 0.9999
+
+
+def test_rms_rope_rms_only_rot_minus_one():
+    B, H, S_, D = 1, 2, 512, 128
+    q = torch.randn(B, H, S_, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, H, S_, D, device="cuda", dtype=torch.bfloat16)
+    dummy = torch.zeros(1, 1, 1, 1, 2, 2, device="cuda")
+    qs = torch.rand(D, device="cuda")
+    ks = torch.rand(D, device="cuda")
+    qo, ko = tdp.rms_rope_split_half(
+        q, k, dummy, qs, ks, rot_dim=-1)
+    rq, rk = _rms_rope_ref(q, k, dummy, qs, ks, 0)
+    assert _cos(qo, rq) > 0.9999
+    assert _cos(ko, rk) > 0.9999
+
+
 def test_fused_short_seq():
     S_ = 512
     qi = torch.randint(-127, 127, (B, H, S_, D), device="cuda", dtype=torch.int8)

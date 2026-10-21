@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -30,8 +31,9 @@ float frand() {
 
 int run(int S, int D, int rotArg, float eps, int dt) {
     const int B = 1, H = 4, P = D / 2;
-    const int rot = rotArg > 0 ? rotArg : D;
-    const int N = B * H * S * D, NF = B * H * S * (rot / 2) * 4;
+    // rotArg < 0 is the explicit RMS-only spelling accepted by the plugin.
+    const int rot = rotArg < 0 ? 0 : (rotArg > 0 ? rotArg : D);
+    const int N = B * H * S * D, NF = std::max(1, B * H * S * (rot / 2) * 4);
     auto* cre = getPluginRegistry()->getCreator(
         "rms_rope_split_half", "1", "dit-plugins");
     if (!cre) {

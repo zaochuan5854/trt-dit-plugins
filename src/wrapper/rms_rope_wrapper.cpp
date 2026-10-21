@@ -4,8 +4,9 @@
 // Registration: comfy_kitchen::rms_rope_split_half. Base precision BF16.
 // Contract: q,k[B,H,S,D] (D multiple of 32), freqs[fb,f1,f2,rot/2,2,2],
 //   q_scale,k_scale[D] (FP32/FP16/BF16) -> qo, ko (same shape).
-// Fields: epsilon(float, default 1e-6), rot_dim(int32, default 0=all).
-// Norm spans full head_dim; only the rot_dim prefix is rotated (split-half layout).
+// Fields: epsilon(float, default 1e-6), rot_dim(int32, default 0=all;
+// -1 = RMS-only). Norm spans full head_dim; only the rot_dim prefix is
+// rotated (split-half layout). q/k B and S may be dynamic (-1 at build time).
 #include <NvInfer.h>
 #include <NvInferRuntime.h>
 
@@ -131,6 +132,13 @@ public:
         fb_ = in[2].dims.d[0];
         f1_ = in[2].dims.d[1];
         f2_ = in[2].dims.d[2];
+        if (B_ <= 0 || H_ <= 0 || S_ <= 0)
+            return -1;
+        const int64_t rot = rotDim_ < 0 ? 0 : (rotDim_ > 0 ? rotDim_ : D_);
+        if (rot > 0) {
+            if (f2_ != S_ || (f1_ != 1 && f1_ != H_) || (fb_ != 1 && fb_ != B_))
+                return -1;
+        }
         if (in[1].type != in[0].type)
             return -1;
         icode_ = dtypeCode(in[0].type);
@@ -142,7 +150,9 @@ public:
     int32_t enqueue(nvinfer1::PluginTensorDesc const*, nvinfer1::PluginTensorDesc const*,
         void const* const* in, void* const* out, void*, cudaStream_t stream) noexcept override {
         try {
-            int64_t rot = rotDim_ > 0 ? rotDim_ : D_;
+            const int64_t rot = rotDim_ < 0 ? 0 : (rotDim_ > 0 ? rotDim_ : D_);
+            if (rot > 0 && f2_ != S_)
+                return -1;
             int64_t st[4]{(int64_t)H_ * S_ * D_, (int64_t)S_ * D_, D_, 1};
             int64_t f3 = rot / 2;
             int64_t fst[6]{};
@@ -191,10 +201,18 @@ private:
         int64_t D = q.d[3];
         if (D < 32 || D % 32 != 0)
             return false;
-        int64_t rot = rotDim_ > 0 ? rotDim_ : D;
+        // -1 is TensorRT's build-time dynamic marker; 0 is never an extent.
+        for (int i = 0; i < 3; ++i)
+            if (q.d[i] < -1 || q.d[i] == 0)
+                return false;
+        // rot_dim < 0 is the explicit RMS-only spelling. rot_dim == 0 keeps
+        // the historical "all dimensions" meaning for the pair op.
+        const int64_t rot = rotDim_ < 0 ? 0 : (rotDim_ > 0 ? rotDim_ : D);
         if (rot % 2 != 0 || rot > D)
             return false;
-        if (f.d[3] != rot / 2 || f.d[4] != 2 || f.d[5] != 2)
+        if (rot > 0 && f.d[3] != rot / 2)
+            return false;
+        if (f.d[4] != 2 || f.d[5] != 2)
             return false;
         int64_t qd[3]{q.d[0], q.d[1], q.d[2]}, fd[3]{f.d[0], f.d[1], f.d[2]};
         for (int i = 0; i < 3; ++i)
@@ -202,7 +220,7 @@ private:
                 return false;
         if (qs.nbDims != 1 || ks.nbDims != 1 || qs.d[0] != D || ks.d[0] != D)
             return false;
-        return q.d[0] > 0 && q.d[1] > 0 && q.d[2] > 0;
+        return true;
     }
 
     float eps_;
