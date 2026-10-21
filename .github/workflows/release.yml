@@ -5,6 +5,8 @@
 name: release
 
 on:
+  push:
+    tags: ["v*"]
   release:
     types: [published]
   workflow_dispatch:
@@ -24,6 +26,8 @@ defaults:
 env:
   ARCHS: "80-real;86-real;89-real;90-real;100-real;120-real;90-virtual"
   NVCC_APPEND_FLAGS: "-allow-unsupported-compiler"
+  # Tag push -> release creation; release event / dispatch keep their tag.
+  TAG: ${{ github.event.release.tag_name || inputs.tag_name || github.ref_name }}
 
 jobs:
   fast-release:
@@ -33,11 +37,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag_name }}
+          ref: ${{ env.TAG }}
 
       - name: Check version matches tag
         env:
-          TAG: ${{ github.event.release.tag_name || inputs.tag_name }}
+          TAG: ${{ env.TAG }}
         run: |
           python3 - <<'PY' > /tmp/version
           import pathlib, re
@@ -55,7 +59,7 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name || inputs.tag_name }}
+          TAG: ${{ env.TAG }}
         run: |
           set -e
           echo "Checking CI artifacts for release: $TAG"
@@ -77,8 +81,13 @@ jobs:
                gh run download "$WIN_RUN_ID" --repo "${{ github.repository }}" -n wheel-windows -D wheels; then
               echo "Both CI wheels downloaded successfully."
               ls -la wheels/
-              echo "Uploading wheels to GitHub Release $TAG..."
-              gh release upload "$TAG" wheels/*.whl --repo "${{ github.repository }}" --clobber
+              echo "Publishing wheels to GitHub Release $TAG..."
+              if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+                gh release upload "$TAG" wheels/*.whl --repo "${{ github.repository }}" --clobber
+              else
+                gh release create "$TAG" wheels/*.whl --repo "${{ github.repository }}" \
+                  --title "$TAG" --generate-notes
+              fi
               echo "Successfully published CI wheels to release!"
               echo "reused=true" >> "$GITHUB_OUTPUT"
               exit 0
@@ -230,5 +239,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${{ github.event.release.tag_name || inputs.tag_name }}" wheels/*.whl \
-            --clobber
+          TAG="${{ env.TAG }}"
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" wheels/*.whl --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$TAG" wheels/*.whl --repo "${{ github.repository }}" \
+              --title "$TAG" --generate-notes
+          fi
