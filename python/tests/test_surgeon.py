@@ -1058,3 +1058,39 @@ def test_add_rms_norm_bshd_has_no_transpose():
     assert y.shape == [1, 2, 64, 128]
     assert not [n for n in g.nodes if n.op == "Transpose"]
     assert S.validate_plugin_nodes(g) == []
+
+
+def test_fuse_layer_norm_adaln_3d_residual_gate():
+    B, S_, D = 2, 16, 128
+    x = gs.Variable("x", dtype=F32, shape=[B, S_, D])
+    sc = gs.Variable("sc", dtype=F32, shape=[B, 1, D])
+    sh = gs.Variable("sh", dtype=F32, shape=[B, 1, D])
+    gate = gs.Variable("gate", dtype=F32, shape=[B, 1, D])
+    res = gs.Variable("res", dtype=F32, shape=[B, S_, D])
+    w = gs.Variable("w", dtype=F32, shape=[D])
+    n = gs.Variable("n", dtype=F32, shape=[B, S_, D])
+    y1 = gs.Variable("y1", dtype=F32, shape=[B, S_, D])
+    y2 = gs.Variable("y2", dtype=F32, shape=[B, S_, D])
+    y3 = gs.Variable("y3", dtype=F32, shape=[B, S_, D])
+    y4 = gs.Variable("y4", dtype=F32, shape=[B, S_, D])
+    out = gs.Variable("out", dtype=F32, shape=[B, S_, D])
+    one = gs.Constant("one", values=np.ones((1,), dtype=F32))
+    g = gs.Graph(nodes=[
+        gs.Node("LayerNormalization", inputs=[x], outputs=[n],
+                attrs={"epsilon": 1e-6}),
+        gs.Node("Mul", inputs=[n, one], outputs=[y1]),
+        gs.Node("Add", inputs=[y1, sc], outputs=[y2]),
+        gs.Node("Add", inputs=[y2, sh], outputs=[y3]),
+        gs.Node("Mul", inputs=[gate, y3], outputs=[y4]),
+        gs.Node("Add", inputs=[res, y4], outputs=[out]),
+    ], inputs=[x, sc, sh, gate, res, w], outputs=[out])
+    g.opset = 23
+
+    node = S.fuse_norm_affine(
+        g, norm="n", scale="sc", shift="sh", out="out", weight="w",
+        residual="res", gate="gate", plugin=PluginOp.LAYER_NORM_ADALN)
+    assert node.op == PluginOp.LAYER_NORM_ADALN
+    assert len(node.inputs) == 6
+    assert node.attrs["has_weight"] == 1
+    assert node.attrs["residual_gate"] == 1
+    assert S.validate_plugin_nodes(g) == []

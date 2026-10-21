@@ -37,6 +37,11 @@ Every change is marked `DIT-PLUGINS-PATCH` in place. Patches exist only to
 fit a TensorRT plugin: no cuBLAS dependency, no autotune inside `enqueue`,
 bias and all output dtypes on the fixed-config entry point.
 
+`ops/adaln.cu`
+- Added optional affine weight, residual+gate, and a separate modulation
+  dtype for the TRT wrapper (`DIT-PLUGINS-PATCH`). Null/false arguments keep
+  the upstream path unchanged.
+
 `convrot/cutlass_gemm_int8.cu`
 - `launch_cutlass_int8_dequant_config` takes `bias` and supports FP32 / FP16 /
   BF16 outputs (upstream was FP16/BF16 without bias).

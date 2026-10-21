@@ -226,7 +226,7 @@ def test_arch_optional_defaults_to_unknown():
 
 def test_norm_and_rope():
     assert C.select_norm(base=BasePrecision.F16, norm=NormKind.RMS)["op"] == "rms_adaln"
-    assert C.select_norm(base=BasePrecision.BF16, norm=NormKind.LAYER)["op"] is None
+    assert C.select_norm(base=BasePrecision.BF16, norm=NormKind.LAYER)["op"] == "layer_norm_adaln"
     qn = C.select_norm(base=BasePrecision.F16, quant=QuantKind.INT8, norm=NormKind.RMS)
     assert qn["op"] is None and qn["trt_flags"]["builder"] == ["FP16", "INT8"]
     r = C.select_rope(base=BasePrecision.F16, style=RopeStyle.SPLIT_HALF, fuse_norm=True,

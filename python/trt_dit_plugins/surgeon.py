@@ -53,7 +53,8 @@ _uid = itertools.count()
 _SPECS: dict[str, tuple[int, int, frozenset[str]]] = {
     PluginOp.INT8_ATTENTION: (3, 1, frozenset()),
     PluginOp.SAGE_ATTN: (3, 1, frozenset({"fp8_pv"})),
-    PluginOp.RMS_ADALN: (3, 1, frozenset({"eps"})),
+    PluginOp.RMS_ADALN: (3, 1, frozenset({"eps", "has_weight", "residual_gate"})),
+    PluginOp.LAYER_NORM_ADALN: (3, 1, frozenset({"eps", "has_weight", "residual_gate"})),
     PluginOp.APPLY_ROPE: (3, 2, frozenset()),
     PluginOp.RMS_ROPE_SPLIT_HALF: (5, 2, frozenset({"epsilon", "rot_dim"})),
     PluginOp.RMS_NORM: (2, 1, frozenset({"eps", "in_layout"})),
@@ -120,6 +121,11 @@ def _add_adaln(op, graph, x, scale, shift, eps=1e-6, name=None):
 def add_rms_adaln(graph, x, scale, shift, eps=1e-6, name=None):
     """Fused RMSNorm AdaLN: rmsnorm(x) * (1 + scale) + shift."""
     return _add_adaln(PluginOp.RMS_ADALN, graph, x, scale, shift, eps, name)
+
+
+def add_layer_norm_adaln(graph, x, scale, shift, eps=1e-6, name=None):
+    """Fused LayerNorm AdaLN: layernorm(x) * (1 + scale) + shift."""
+    return _add_adaln(PluginOp.LAYER_NORM_ADALN, graph, x, scale, shift, eps, name)
 
 
 def add_apply_rope(graph, q, k, f, name=None):
@@ -1133,26 +1139,41 @@ def _last_dim(t):
 
 
 def fuse_norm_affine(graph, *, norm: str, scale: str, shift: str, out: str,
-                     plugin: str | PluginOp = PluginOp.RMS_ADALN,
-                     eps: float = 1e-6):
-    """Replace ``norm*(1+scale)+shift`` ending at tensor ``out`` with one plugin node.
-
-    ``norm`` may come from any norm lowering (LayerNorm node, decomposed RMS,
-    ...); only the 4 anchor tensor names matter. Dead producers are pruned by
-    cleanup unless shared with other live tensors. Returns the plugin node.
-    """
-    if plugin is not PluginOp.RMS_ADALN:
-        raise TypeError(f"plugin must be PluginOp.RMS_ADALN, got {plugin!r}")
+                     plugin: str | PluginOp | None = None,
+                     eps: float = 1e-6, weight: str | None = None,
+                     residual: str | None = None, gate: str | None = None):
+    """Replace norm*(1+scale)+shift (or residual+gate*that) with one node."""
     tensors = graph.tensors()
     for n in (norm, scale, shift, out):
         if n not in tensors:
             raise KeyError(f"tensor not in graph: {n!r}")
+    if residual is not None and (gate is None or residual not in tensors or gate not in tensors):
+        raise ValueError("residual and gate must both name graph tensors")
+    if gate is not None and residual is None:
+        raise ValueError("gate requires residual")
+    if weight is not None and weight not in tensors:
+        raise KeyError(f"tensor not in graph: {weight!r}")
+    if plugin is None:
+        producer = next((p for p in tensors[norm].inputs
+                         if p.op == "LayerNormalization"), None)
+        plugin = PluginOp.LAYER_NORM_ADALN if producer is not None else PluginOp.RMS_ADALN
+    plugin = PluginOp(plugin)
+    if plugin not in (PluginOp.RMS_ADALN, PluginOp.LAYER_NORM_ADALN):
+        raise TypeError(f"unsupported AdaLN plugin: {plugin!r}")
+
     tn, ts, tsh, to = (tensors[n] for n in (norm, scale, shift, out))
     ds = {_last_dim(t) for t in (tn, ts, tsh) if _last_dim(t) is not None}
     if len(ds) > 1:
         raise ValueError(f"last-dim mismatch in fuse anchors: {norm, scale, shift}")
-    node = _plugin_node(graph, plugin, [tn, ts, tsh], [to],
-                        {"eps": float(eps)}, name=f"{plugin}_{out}")
+    ins = [tn, ts, tsh]
+    fields = {"eps": float(eps), "has_weight": int(weight is not None),
+              "residual_gate": int(residual is not None)}
+    if weight is not None:
+        ins.append(tensors[weight])
+    if residual is not None:
+        ins.extend([tensors[residual], tensors[gate]])
+    node = _plugin_node(graph, plugin, ins, [to], fields,
+                        name=f"{plugin}_{out}")
     for prod in list(to.inputs):
         if prod is not node and to in prod.outputs:
             prod.outputs.remove(to)
@@ -1220,6 +1241,9 @@ def validate_plugin_nodes(graph) -> list[str]:
             errs.append(f"{node.name or '?'}: unknown dit-plugins op {node.op!r}")
             continue
         want_in, want_out, fields = spec
+        if node.op in (PluginOp.RMS_ADALN, PluginOp.LAYER_NORM_ADALN):
+            want_in = 3 + int(node.attrs.get("has_weight", 0)) \
+                         + 2 * int(node.attrs.get("residual_gate", 0))
         if len(node.inputs) != want_in:
             errs.append(f"{node.name or node.op}: want {want_in} inputs, got {len(node.inputs)}")
         if len(node.outputs) != want_out:

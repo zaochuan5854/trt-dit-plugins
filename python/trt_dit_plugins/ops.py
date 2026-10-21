@@ -81,22 +81,48 @@ def sage_attn(q, k, v, fp8_pv=False):
     return outs["o"]
 
 
-def _adaln(name, x, scale, shift, eps=1e-6):
+def _adaln(name, x, scale, shift, eps=1e-6, weight=None, residual=None, gate=None,
+           profile=None):
     _require_cuda(x, scale, shift)
-    if not (x.dim() == 2 and scale.dim() == 2 and shift.dim() == 2):
-        raise ValueError(f"{name} expects flat [N,D] inputs")
+    if x.dim() not in (2, 3) or scale.dim() not in (2, 3) or shift.dim() not in (2, 3):
+        raise ValueError(f"{name} expects x [N,D]/[B,S,D] and scale/shift [R,D]/[B,1,D]")
+    d = x.shape[-1]
+    if scale.shape[-1] != d or shift.shape[-1] != d:
+        raise ValueError(f"{name} last-dim mismatch")
+    if scale.dtype != shift.dtype:
+        raise ValueError(f"{name} scale/shift dtype mismatch")
+    mod_dtype = scale.dtype
+    tensors = {"x": x, "scale": scale, "shift": shift}
+    fields = {"eps": float(eps), "has_weight": int(weight is not None),
+              "residual_gate": int(residual is not None)}
+    if weight is not None:
+        if weight.dim() != 1 or weight.numel() != d or weight.dtype != mod_dtype:
+            raise ValueError("weight must be [D] in the modulation dtype")
+        tensors["weight"] = weight
+    if residual is not None:
+        if gate is None or residual.shape != x.shape or residual.dtype != x.dtype:
+            raise ValueError("residual needs gate and the same shape/dtype as x")
+        if gate.dim() not in (2, 3) or gate.shape[-1] != d or gate.dtype != mod_dtype:
+            raise ValueError("gate must be [B,D]/[B,1,D] in the modulation dtype")
+        tensors["residual"] = residual
+        tensors["gate"] = gate
     outs = E.run_plugin(
-        name,
-        {"x": x, "scale": scale, "shift": shift},
-        [("o", x.dtype, tuple(x.shape))],
-        {"eps": float(eps)},
-    )
+        name, tensors, [("o", x.dtype, tuple(x.shape))], fields, profile=profile)
     return outs["o"]
 
 
-def rms_adaln(x, scale, shift, eps=1e-6):
-    """Fused RMSNorm AdaLN: rmsnorm(x) * (1 + scale) + shift."""
-    return _adaln(PluginOp.RMS_ADALN, x, scale, shift, eps)
+def rms_adaln(x, scale, shift, eps=1e-6, weight=None, residual=None, gate=None,
+              profile=None):
+    """rmsnorm(x) * (1 + scale) + shift, optional weight / residual+gate."""
+    return _adaln(PluginOp.RMS_ADALN, x, scale, shift, eps, weight, residual, gate,
+                  profile)
+
+
+def layer_norm_adaln(x, scale, shift, eps=1e-6, weight=None, residual=None, gate=None,
+                     profile=None):
+    """layernorm(x) * (1 + scale) + shift, optional weight / residual+gate."""
+    return _adaln(PluginOp.LAYER_NORM_ADALN, x, scale, shift, eps, weight, residual,
+                  gate, profile)
 
 
 def apply_rope(q, k, freqs):

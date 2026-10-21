@@ -214,6 +214,53 @@ def test_rms_norm_bhsd_matches_bshd():
     assert _cos(y, z) > 0.9999
 
 
+def test_rms_adaln_mixed_mod_dtype():
+    B, S_, D = 2, 8, 128
+    x = torch.randn(B, S_, D, device="cuda", dtype=torch.bfloat16)
+    sc = torch.randn(B, 1, D, device="cuda", dtype=torch.float32)
+    sh = torch.randn(B, 1, D, device="cuda", dtype=torch.float32)
+    out = tdp.rms_adaln(x, sc, sh)
+    xf = x.float()
+    ref = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)
+           * (1 + sc.float()) + sh.float()).to(torch.bfloat16)
+    assert _cos(out, ref) > 0.999
+
+
+def test_layer_norm_adaln_3d_residual_gate():
+    B, S_, D = 2, 16, 256
+    x = torch.randn(B, S_, D, device="cuda", dtype=torch.bfloat16)
+    sc = torch.randn(B, 1, D, device="cuda", dtype=torch.float32)
+    sh = torch.randn(B, 1, D, device="cuda", dtype=torch.float32)
+    w = torch.randn(D, device="cuda", dtype=torch.float32)
+    res = torch.randn(B, S_, D, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn(B, 1, D, device="cuda", dtype=torch.float32)
+
+    xf = x.float()
+    mean = xf.mean(-1, keepdim=True)
+    var = xf.var(-1, keepdim=True, unbiased=False)
+    y = (xf - mean) * torch.rsqrt(var + 1e-6) * w.float()
+    y = y * (1 + sc.float()) + sh.float()
+    ref = (res.float() + gate.float() * y).to(torch.bfloat16)
+
+    out = tdp.layer_norm_adaln(x, sc, sh, weight=w, residual=res, gate=gate)
+    assert out.shape == x.shape
+    assert _cos(out, ref) > 0.999
+
+
+def test_rms_adaln_residual_gate_2d():
+    N, D = 64, 128
+    x = torch.randn(N, D, device="cuda", dtype=torch.bfloat16)
+    sc = torch.randn(N, D, device="cuda", dtype=torch.float32)
+    sh = torch.randn(N, D, device="cuda", dtype=torch.float32)
+    res = torch.randn(N, D, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn(N, D, device="cuda", dtype=torch.float32)
+    out = tdp.rms_adaln(x, sc, sh, residual=res, gate=gate)
+    xf = x.float()
+    y = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)
+    ref = (res.float() + gate.float() * (y * (1 + sc.float()) + sh.float())).to(torch.bfloat16)
+    assert _cos(out, ref) > 0.999
+
+
 def test_fused_short_seq():
     S_ = 512
     qi = torch.randint(-127, 127, (B, H, S_, D), device="cuda", dtype=torch.int8)

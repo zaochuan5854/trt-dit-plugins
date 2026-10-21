@@ -116,11 +116,18 @@ __device__ __forceinline__ void norm_stats(float2 acc, float inv_d, float eps,
     }
 }
 
-template<typename T, bool kSubtractMean>
+// DIT-PLUGINS-PATCH: optional affine weight, residual+gate, and independent
+// modulation dtype for the TRT wrapper. Upstream callers that pass null/false
+// take the original path bit-for-bit.
+template<typename T, typename TMod, bool kSubtractMean, bool kHasWeight,
+         bool kResidualGate>
 __global__ void adaln_kernel(
     const T* __restrict__ x,
-    const T* __restrict__ scale,
-    const T* __restrict__ shift,
+    const TMod* __restrict__ scale,
+    const TMod* __restrict__ shift,
+    const TMod* __restrict__ weight,
+    const T* __restrict__ residual,
+    const TMod* __restrict__ gate,
     T* __restrict__ out,
     int D,
     int scale_group,
@@ -128,6 +135,7 @@ __global__ void adaln_kernel(
     float eps)
 {
     constexpr int VEC = VecWidth<T>::value;
+    constexpr int VECM = VecWidth<TMod>::value;
     const int row = static_cast<int>(blockIdx.x);
     const int n_rows = static_cast<int>(gridDim.x);
     const int tid = threadIdx.x;
@@ -141,14 +149,17 @@ __global__ void adaln_kernel(
         : modulation_row(row, shift_group, n_rows);
 
     const T* x_row  = x     + row * D;
-    const T* s_row  = scale + scale_row * D;
-    const T* sh_row = shift + shift_row * D;
+    const TMod* s_row  = scale + scale_row * D;
+    const TMod* sh_row = shift + shift_row * D;
+    const TMod* w_row = kHasWeight ? weight : nullptr;
+    const T* r_row = kResidualGate ? residual + row * D : nullptr;
+    const TMod* g_row = kResidualGate ? gate + scale_row * D : nullptr;
     T*       o_row  = out   + row * D;
 
     // Vectorize only when every row starts on a 16-byte boundary, i.e.
-    // D * sizeof(T) is a multiple of 16. Otherwise n_vec == 0 and the whole
-    // row is handled by the scalar tail loops below.
-    const int n_vec   = (D % VEC == 0) ? (D / VEC) : 0;
+    // D * sizeof(T) is a multiple of 16. The modulation vectors use the
+    // same element width; mixed-width modulations take the scalar path.
+    const int n_vec = (D % VEC == 0 && VEC == VECM) ? (D / VEC) : 0;
     const int vec_end = n_vec * VEC;
 
     const Vec<T>* x_vec = reinterpret_cast<const Vec<T>*>(x_row);
@@ -176,34 +187,56 @@ __global__ void adaln_kernel(
     norm_stats<kSubtractMean>(acc, inv_d, eps, mean, rstd);
 
     // ---- Pass 3: normalize + modulate ----
-    const Vec<T>* s_vec  = reinterpret_cast<const Vec<T>*>(s_row);
-    const Vec<T>* sh_vec = reinterpret_cast<const Vec<T>*>(sh_row);
+    const Vec<TMod>* s_vec  = reinterpret_cast<const Vec<TMod>*>(s_row);
+    const Vec<TMod>* sh_vec = reinterpret_cast<const Vec<TMod>*>(sh_row);
+    const Vec<TMod>* w_vec  = kHasWeight
+        ? reinterpret_cast<const Vec<TMod>*>(w_row) : nullptr;
+    const Vec<T>* r_vec = kResidualGate
+        ? reinterpret_cast<const Vec<T>*>(r_row) : nullptr;
+    const Vec<TMod>* g_vec = kResidualGate
+        ? reinterpret_cast<const Vec<TMod>*>(g_row) : nullptr;
     Vec<T>*       o_vec  = reinterpret_cast<Vec<T>*>(o_row);
     for (int v = tid; v < n_vec; v += nthreads) {
         Vec<T> xv  = x_vec[v];
-        Vec<T> sv  = s_vec[v];
-        Vec<T> shv = sh_vec[v];
+        Vec<TMod> sv  = s_vec[v];
+        Vec<TMod> shv = sh_vec[v];
+        Vec<TMod> wv{};
+        Vec<T> rv{};
+        Vec<TMod> gv{};
+        if constexpr (kHasWeight) wv = w_vec[v];
+        if constexpr (kResidualGate) { rv = r_vec[v]; gv = g_vec[v]; }
         Vec<T> ov;
         #pragma unroll
         for (int j = 0; j < VEC; ++j) {
-            float result = (to_float(xv.elts[j]) - mean) * rstd
-                           * (1.0f + to_float(sv.elts[j])) + to_float(shv.elts[j]);
+            float nv = (to_float(xv.elts[j]) - mean) * rstd;
+            if constexpr (kHasWeight) nv *= to_float(wv.elts[j]);
+            float result = nv * (1.0f + to_float(sv.elts[j]))
+                           + to_float(shv.elts[j]);
+            if constexpr (kResidualGate)
+                result = to_float(rv.elts[j]) + to_float(gv.elts[j]) * result;
             ov.elts[j] = from_float<T>(result);
         }
         o_vec[v] = ov;
     }
     for (int i = vec_end + tid; i < D; i += nthreads) {
-        float result = (to_float(x_row[i]) - mean) * rstd
-                       * (1.0f + to_float(s_row[i])) + to_float(sh_row[i]);
+        float nv = (to_float(x_row[i]) - mean) * rstd;
+        if constexpr (kHasWeight) nv *= to_float(w_row[i]);
+        float result = nv * (1.0f + to_float(s_row[i])) + to_float(sh_row[i]);
+        if constexpr (kResidualGate)
+            result = to_float(r_row[i]) + to_float(g_row[i]) * result;
         o_row[i] = from_float<T>(result);
     }
 }
 
-template<typename T, bool kSubtractMean>
+template<typename T, typename TMod, bool kSubtractMean, bool kHasWeight,
+         bool kResidualGate>
 __global__ void adaln_warp_kernel(
     const T* __restrict__ x,
-    const T* __restrict__ scale,
-    const T* __restrict__ shift,
+    const TMod* __restrict__ scale,
+    const TMod* __restrict__ shift,
+    const TMod* __restrict__ weight,
+    const T* __restrict__ residual,
+    const TMod* __restrict__ gate,
     T* __restrict__ out,
     int N,
     int D,
@@ -222,8 +255,8 @@ __global__ void adaln_warp_kernel(
         : modulation_row(row, shift_group, N);
 
     const T* x_row  = x     + row * D;
-    const T* s_row  = scale + scale_row * D;
-    const T* sh_row = shift + shift_row * D;
+    const TMod* s_row  = scale + scale_row * D;
+    const TMod* sh_row = shift + shift_row * D;
     T*       o_row  = out   + row * D;
 
     float2 acc = make_float2(0.0f, 0.0f);
@@ -241,8 +274,12 @@ __global__ void adaln_warp_kernel(
     norm_stats<kSubtractMean>(acc, inv_d, eps, mean, rstd);
 
     for (int i = lane; i < D; i += kThreadsPerWarp) {
-        float result = (to_float(x_row[i]) - mean) * rstd
-                       * (1.0f + to_float(s_row[i])) + to_float(sh_row[i]);
+        float nv = (to_float(x_row[i]) - mean) * rstd;
+        if constexpr (kHasWeight) nv *= to_float(weight[i]);
+        float result = nv * (1.0f + to_float(s_row[i])) + to_float(sh_row[i]);
+        if constexpr (kResidualGate)
+            result = to_float(residual[row * D + i])
+                     + to_float(gate[scale_row * D + i]) * result;
         o_row[i] = from_float<T>(result);
     }
 }
@@ -258,6 +295,9 @@ void launch_adaln_kernel(
     const void* x,
     const void* scale,
     const void* shift,
+    const void* weight,
+    const void* residual,
+    const void* gate,
     void*       out,
     int64_t     N,
     int64_t     D,
@@ -265,7 +305,11 @@ void launch_adaln_kernel(
     int64_t     shift_group,
     float       eps,
     int         dtype_code,
+    int         mod_dtype_code,
+    int         weight_dtype_code,
     bool        subtract_mean,
+    bool        has_weight,
+    bool        residual_gate,
     cudaStream_t stream)
 {
     if (N > std::numeric_limits<int>::max() ||
@@ -274,42 +318,58 @@ void launch_adaln_kernel(
         shift_group > std::numeric_limits<int>::max()) {
         throw std::runtime_error("adaln dimensions exceed CUDA kernel int32 indexing limits");
     }
+    if (weight_dtype_code != mod_dtype_code)
+        throw std::runtime_error("adaln weight dtype must match the modulation dtype");
 
     dim3 grid(static_cast<unsigned int>(N));
     dim3 block(comfy::kAdaLNThreads);
 
     DISPATCH_FP_DTYPE(dtype_code, T, [&]() {
+      DISPATCH_FP_DTYPE(mod_dtype_code, TMod, [&]() {
         DISPATCH_BOOL(subtract_mean, kSubtractMean, [&]() {
-            if (N <= 1024) {
+          DISPATCH_BOOL(has_weight, kHasWeight, [&]() {
+            DISPATCH_BOOL(residual_gate, kResidualGate, [&]() {
+              if (N <= 1024) {
                 dim3 warp_grid(
                     static_cast<unsigned int>((N + comfy::kAdaLNRowsPerWarpBlock - 1) /
                                               comfy::kAdaLNRowsPerWarpBlock));
-                comfy::adaln_warp_kernel<T, kSubtractMean><<<warp_grid, block, 0, stream>>>(
+                comfy::adaln_warp_kernel<T, TMod, kSubtractMean, kHasWeight,
+                                         kResidualGate><<<warp_grid, block, 0, stream>>>(
                     static_cast<const T*>(x),
-                    static_cast<const T*>(scale),
-                    static_cast<const T*>(shift),
+                    static_cast<const TMod*>(scale),
+                    static_cast<const TMod*>(shift),
+                    static_cast<const TMod*>(weight),
+                    static_cast<const T*>(residual),
+                    static_cast<const TMod*>(gate),
                     static_cast<T*>(out),
                     static_cast<int>(N),
                     static_cast<int>(D),
                     static_cast<int>(scale_group),
                     static_cast<int>(shift_group),
                     eps);
-            } else {
-                comfy::adaln_kernel<T, kSubtractMean><<<grid, block, 0, stream>>>(
+              } else {
+                comfy::adaln_kernel<T, TMod, kSubtractMean, kHasWeight,
+                                    kResidualGate><<<grid, block, 0, stream>>>(
                     static_cast<const T*>(x),
-                    static_cast<const T*>(scale),
-                    static_cast<const T*>(shift),
+                    static_cast<const TMod*>(scale),
+                    static_cast<const TMod*>(shift),
+                    static_cast<const TMod*>(weight),
+                    static_cast<const T*>(residual),
+                    static_cast<const TMod*>(gate),
                     static_cast<T*>(out),
                     static_cast<int>(D),
                     static_cast<int>(scale_group),
                     static_cast<int>(shift_group),
                     eps);
-            }
+              }
+            });
+          });
         });
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-            throw std::runtime_error(std::string("adaln kernel launch failed: ") + cudaGetErrorString(err));
+      });
     });
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("adaln kernel launch failed: ") + cudaGetErrorString(err));
 }
 
 }  // extern "C"

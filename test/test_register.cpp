@@ -16,6 +16,7 @@ const char* kNames[] = {
     "int8_attention",
     "sage_attn",
     "rms_adaln",
+    "layer_norm_adaln",
     "apply_rope",
     "rms_rope_split_half",
     "rms_norm",

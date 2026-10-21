@@ -91,6 +91,7 @@ class PluginOp(str, Enum):
     INT8_ATTENTION = "int8_attention"
     SAGE_ATTN = "sage_attn"
     RMS_ADALN = "rms_adaln"
+    LAYER_NORM_ADALN = "layer_norm_adaln"
     APPLY_ROPE = "apply_rope"
     RMS_ROPE_SPLIT_HALF = "rms_rope_split_half"
     RMS_NORM = "rms_norm"
@@ -608,22 +609,20 @@ def select_norm(*, base: BasePrecision, quant: QuantKind | None = None,
                 norm: NormKind,
                 shape: tuple | None = None, eps: float = 1e-6,
                 min_cos: float | None = None) -> dict[str, Any]:
-    """``NormKind.RMS`` -> ``rms_adaln``; ``NormKind.LAYER`` has no plugin (native)."""
+    """``NormKind.RMS`` -> ``rms_adaln``; ``NormKind.LAYER`` -> ``layer_norm_adaln``."""
     base = require_enum("base", base, BasePrecision)
     quant = require_opt("quant", quant, QuantKind)
     norm = require_enum("norm", norm, NormKind)
-    op = PluginOp.RMS_ADALN
+    op = PluginOp.LAYER_NORM_ADALN if norm is NormKind.LAYER else PluginOp.RMS_ADALN
 
     def native(reason: str) -> dict[str, Any]:
         return {"op": NATIVE_OP, "fields": {}, "reason": reason,
                 "cos": None, "trt_flags": _trt_flags(base, GemmKind.AUTO, quant)}
 
-    if norm is NormKind.LAYER:
-        return native("layernorm AdaLN plugin was removed; plain TRT")
     if quant is not None:
         return native(f"{op}: no quantized-norm plugin; plain TRT")
-    if shape is not None and len(shape) != 2:
-        return native(f"{op}: needs flat [N,D], got rank-{len(shape)}; plain TRT")
+    if shape is not None and len(shape) not in (2, 3):
+        return native(f"{op}: needs flat [N,D] or [B,S,D], got rank-{len(shape)}; plain TRT")
     if min_cos is not None and 1.0 < min_cos:
         return native(f"{op}: exact cos 1.0 < min_cos {min_cos}; plain TRT")
     return {"op": op, "fields": {"eps": float(eps)}, "reason": f"{op} fits",
