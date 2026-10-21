@@ -12,6 +12,13 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     # No GPU on hosted runners: compile + CPU-side checks only
@@ -28,10 +35,22 @@ jobs:
       ARCHS: "80-real;86-real;89-real;90-real;100-real;120-real;90-virtual"
       DEBIAN_FRONTEND: noninteractive
       TENSORRT_ROOT: /tmp/trt
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 2G
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('src/**', 'CMakeLists.txt', 'test/**') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
 
       - name: Install deps
         run: |
@@ -65,7 +84,9 @@ jobs:
           # and a half-configured tree slides into the build.
           set -o pipefail
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CUDA_ARCHITECTURES="${{ env.ARCHS }}" 2>&1 | tee /tmp/cmake.log
+            -DCMAKE_CUDA_ARCHITECTURES="${{ env.ARCHS }}" \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache 2>&1 | tee /tmp/cmake.log
 
       - name: Build (2 jobs, hosted RAM is 16 GB)
         run: |
@@ -127,12 +148,35 @@ jobs:
           cp LICENSE NOTICE python/trt_dit_plugins/
           pip3 wheel . -w dist --no-deps --no-build-isolation
 
+      - name: Verify wheel contents
+        run: |
+          python3 - <<'PY'
+          import glob, zipfile
+          whl = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          need = ("trt_dit_plugins/lib/libtrt_dit_plugins.so",
+                  "trt_dit_plugins/lib/libck_kernels.so")
+          for n in need:
+              assert any(x.endswith(n) for x in names), (whl, n)
+          print("wheel ok:", whl)
+          PY
+
+      - name: Test the installed wheel (CPU-only)
+        run: |
+          # Tests must exercise the wheel, not the source tree: install it and
+          # run from outside the repo so no PYTHONPATH can shadow the package.
+          pip3 install --break-system-packages -q --no-deps --force-reinstall dist/*.whl
+          cd "$RUNNER_TEMP"
+          python3 -m pytest "$GITHUB_WORKSPACE/python/tests" -q \
+            --ignore="$GITHUB_WORKSPACE/python/tests/test_smoke.py"
+
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
           name: wheel-linux
           retention-days: 7
           path: dist/*.whl
+          if-no-files-found: error
 
       - name: Debug session (tmate)
         if: failure() && inputs.debug

@@ -31,6 +31,26 @@ jobs:
     outputs:
       reused: ${{ steps.check.outputs.reused }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag_name }}
+
+      - name: Check version matches tag
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag_name }}
+        run: |
+          python3 - <<'PY' > /tmp/version
+          import pathlib, re
+          src = pathlib.Path("python/trt_dit_plugins/__init__.py").read_text()
+          print(re.search(r'__version__\s*=\s*"([^"]+)"', src).group(1))
+          PY
+          ver=$(cat /tmp/version)
+          tag="${TAG#v}"
+          case "$tag" in
+            "$ver"|"$ver"-*) echo "tag $TAG matches version $ver" ;;
+            *) echo "::error::tag $TAG does not match __version__ $ver"; exit 1 ;;
+          esac
+
       - name: Check and reuse CI wheels
         id: check
         env:
@@ -120,11 +140,17 @@ jobs:
           cp build/libck_kernels.so build/libtrt_dit_plugins.so python/trt_dit_plugins/lib/
           cp LICENSE NOTICE python/trt_dit_plugins/
           pip3 wheel . -w dist --no-deps --no-build-isolation
+      - name: Verify the wheel installs and imports
+        run: |
+          pip3 install --break-system-packages -q --no-deps --force-reinstall dist/*.whl
+          cd /tmp
+          python3 -c "import trt_dit_plugins as t; print('wheel version:', t.__version__)"
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-linux
           retention-days: 7
           path: dist/*.whl
+          if-no-files-found: error
 
   wheel-windows:
     needs: [fast-release]
@@ -169,11 +195,19 @@ jobs:
           Copy-Item LICENSE, NOTICE python\trt_dit_plugins\
           python -m pip install -U setuptools wheel
           python -m pip wheel . -w dist --no-deps --no-build-isolation
+      - name: Verify the wheel installs and imports
+        run: |
+          $env:PATH = "$env:TENSORRT_ROOT\bin;$env:CUDA_PATH\bin;$env:PATH"
+          $whl = (Get-ChildItem dist\*.whl)[0].FullName
+          python -m pip install -q --no-deps --force-reinstall $whl
+          Set-Location $env:RUNNER_TEMP
+          python -c "import trt_dit_plugins as t; print('wheel version:', t.__version__)"
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-windows
           retention-days: 7
           path: dist/*.whl
+          if-no-files-found: error
 
   release:
     needs: [fast-release, wheel-linux, wheel-windows]
