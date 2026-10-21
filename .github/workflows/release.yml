@@ -22,7 +22,7 @@ defaults:
     shell: bash
 
 env:
-  ARCHS: "80-real;86-real;89-real;90-real;90-virtual"
+  ARCHS: "80-real;86-real;89-real;90-real;100-real;120-real;90-virtual"
   NVCC_APPEND_FLAGS: "-allow-unsupported-compiler"
 
 jobs:
