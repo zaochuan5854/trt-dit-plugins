@@ -445,6 +445,80 @@ def _quantizable_graph():
     return g, inv
 
 
+def _qdq_quantizable_graph():
+    """Same block with float q/k/v followed by symmetric Q -> DQ."""
+    rng = np.random.default_rng(2)
+    inv = (rng.random(64).astype(np.float32) * 0.5 + 0.001)
+    B, H, Sv, D = 1, 2, 2048, 128
+    qf = gs.Variable("qf", dtype=F32, shape=[B, H, Sv, D])
+    kf = gs.Variable("kf", dtype=F32, shape=[B, H, Sv, D])
+    vf = gs.Variable("vf", dtype=F32, shape=[B, H, Sv, D])
+    fq = gs.Constant("fq", values=_baked_freqs(inv, Sv))
+    qsc = gs.Variable("qsc", dtype=F32, shape=[D])
+    ksc = gs.Variable("ksc", dtype=F32, shape=[D])
+    nodes = []
+    dq_out = {}
+    for stem, src, scale in (("q", qf, 0.02), ("k", kf, 0.03), ("v", vf, 0.04)):
+        s = gs.Constant(f"{stem}_s", values=np.array([scale], F32))
+        zp = gs.Constant(f"{stem}_zp", values=np.array([0], np.int8))
+        qi = gs.Variable(f"{stem}i", dtype=np.int8, shape=[B, H, Sv, D])
+        out = gs.Variable(f"{stem}dq", dtype=F32, shape=[B, H, Sv, D])
+        nodes += [
+            gs.Node("QuantizeLinear", inputs=[src, s, zp], outputs=[qi],
+                    attrs={"output_dtype": 3}, name=f"{stem}Q"),
+            gs.Node("DequantizeLinear", inputs=[qi, s, zp], outputs=[out],
+                    name=f"{stem}DQ"),
+        ]
+        dq_out[stem] = out
+    rq = gs.Variable("rq", dtype=F32, shape=[B, H, Sv, D])
+    rk = gs.Variable("rk", dtype=F32, shape=[B, H, Sv, D])
+    ao = gs.Variable("ao", dtype=F32, shape=[B, H, Sv, D])
+    out = gs.Variable("out", dtype=F32, shape=[B, H, Sv, D])
+    nodes += [
+        gs.Node("rms_rope_split_half",
+                inputs=[dq_out["q"], dq_out["k"], fq, qsc, ksc],
+                outputs=[rq, rk], domain="dit-plugins"),
+        gs.Node("SageInt8Attn", inputs=[rq, rk, dq_out["v"]], outputs=[ao]),
+        gs.Node("Relu", inputs=[ao], outputs=[out]),
+    ]
+    g = gs.Graph(nodes=nodes, inputs=[qf, kf, vf, qsc, ksc], outputs=[out])
+    g.opset = 23
+    return g, inv
+
+
+def test_qdq_scale_for_reads_symmetric_qdq():
+    g, _ = _qdq_quantizable_graph()
+    assert S.qdq_scale_for(g, "qdq") == pytest.approx(0.02)
+    assert S.qdq_anchor_for(g, "qdq") == ("qi", "q_s")
+    scales = S.collect_dit_self_scales(g)
+    assert scales["qdq"] == pytest.approx(0.02)
+    assert scales["kdq"] == pytest.approx(0.03)
+    assert scales["vdq"] == pytest.approx(0.04)
+
+
+def test_apply_dit_self_fused_auto_reuses_qdq():
+    g, _ = _qdq_quantizable_graph()
+    rep = S.apply_dit_self_fused(g)  # no explicit scales
+    assert rep["applied"] == 1 and rep["by_reason"] == {"ok": 1}
+    node = next(n for n in g.nodes
+                if n.op == "fused_int8_rope_sage_attn")
+    assert [t.name for t in node.inputs[:6]] == [
+        "qi", "q_s", "ki", "k_s", "vi", "v_s",
+    ]
+    assert not [n for n in g.nodes if n.op == "DequantizeLinear"]
+    assert len([n for n in g.nodes if n.op == "QuantizeLinear"]) == 3
+    _check_ok(g)
+
+
+def test_apply_dit_self_fused_rejects_nonzero_zero_point():
+    g, _ = _qdq_quantizable_graph()
+    zp = next(t for t in g.tensors().values() if t.name == "q_zp")
+    zp.values = np.array([1], np.int8)
+    rep = S.apply_dit_self_fused(g)
+    assert rep == {"applied": 0, "skipped": 1,
+                   "by_reason": {"missing-scales": 1}}
+
+
 def test_quantize_dit_self_anchors():
     g, inv = _quantizable_graph()
     rep = S.quantize_dit_self_anchors(g, {"qt": 0.02, "kt": 0.03, "vi": 0.04})

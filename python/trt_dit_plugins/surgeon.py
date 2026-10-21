@@ -522,12 +522,99 @@ def _block_scales_ok(b: dict[str, Any], scales: dict[str, float]) -> bool:
     return all(k in scales and scales[k] > 0 for k in need)
 
 
-def quantize_dit_self_anchors(graph, scales: dict[str, float], *,
+def _scalar_scale(t: Any) -> float | None:
+    """Static positive per-tensor scale from a GS constant, else None."""
+    import numpy as np
+
+    gs = _gs()
+    if not isinstance(t, gs.Constant) or t.values is None:
+        return None
+    v = np.asarray(t.values).reshape(-1)
+    if v.size != 1 or not np.isfinite(v[0]) or v[0] <= 0:
+        return None
+    return float(v[0])
+
+
+def _qdq_parts(graph, edge: str):
+    """Return (Quantize/Dequantize node, int8 tensor, scale tensor) or None."""
+    import numpy as np
+
+    gs = _gs()
+    t = graph.tensors().get(edge)
+    prod = t.inputs[0] if t is not None and len(t.inputs) == 1 else None
+    if prod is None:
+        return None
+    if prod.op == "QuantizeLinear":
+        q, i8 = prod, prod.outputs[0]
+    elif prod.op == "DequantizeLinear":
+        src = prod.inputs[0] if prod.inputs else None
+        if src is not None and src.inputs and src.inputs[0].op == "QuantizeLinear":
+            q, i8 = src.inputs[0], src
+        else:
+            q, i8 = prod, src
+    else:
+        return None
+    if q is None or i8 is None or len(q.inputs) < 2:
+        return None
+    dt = i8.dtype
+    if dt not in (np.int8, "int8", "INT8"):
+        if q.attrs.get("output_dtype") != 3:
+            return None
+    if len(q.inputs) > 2:
+        zp = q.inputs[2]
+        if not isinstance(zp, gs.Constant) or zp.values is None:
+            return None
+        if np.any(np.asarray(zp.values) != 0):
+            return None
+    return q, i8, q.inputs[1]
+
+
+def qdq_anchor_for(graph, edge: str) -> tuple[str, str] | None:
+    """Return existing (INT8 tensor, scalar scale) at ``edge``, else None."""
+    parts = _qdq_parts(graph, edge)
+    if parts is None:
+        return None
+    _, i8, scale_t = parts
+    if _scalar_scale(scale_t) is None:
+        return None
+    return i8.name, scale_t.name
+
+
+def qdq_scale_for(graph, edge: str) -> float | None:
+    """Return the per-tensor symmetric INT8 scale already present at ``edge``.
+
+    Accepts the Q output (INT8), the DQ output (float), or a quantized graph
+    input followed by DQ. Returns None for dynamic / per-channel / uint8 /
+    non-zero-zero-point scales, so callers fall back to explicit calibration.
+    """
+    parts = _qdq_parts(graph, edge)
+    return None if parts is None else _scalar_scale(parts[2])
+
+
+def collect_dit_self_scales(graph, scales: dict[str, float] | None = None
+                            ) -> dict[str, float]:
+    """Merge explicit scales with Q/DQ scales found at eligible block edges."""
+    out = dict(scales or {})
+    for b in discover_dit_self_blocks(graph):
+        if not b.get("eligible"):
+            continue
+        for edge in (b["q"], b["k"], b["v"]):
+            if edge not in out:
+                s = qdq_scale_for(graph, edge)
+                if s is not None:
+                    out[edge] = s
+    return out
+
+
+def quantize_dit_self_anchors(graph, scales: dict[str, float] | None = None, *,
                               inv_freq=None) -> dict[str, Any]:
     """Insert ``QuantizeLinear`` anchors for fused blocks from calibrated scales.
 
     ``scales`` maps ONNX tensor name (``q``/``k``/``v`` as reported by
     :func:`discover_dit_self_blocks`) to the per-tensor FP32 INT8 scale.
+    Missing entries are filled from an existing Q/DQ at that edge
+    (:func:`collect_dit_self_scales`); per-channel / dynamic scales are not
+    guessed.
     Per anchored block this appends three ``QuantizeLinear`` nodes (INT8,
     symmetric, no zero-point) plus FP32 scalar scale constants, and picks
     one shared ``[64]`` ``inv_freq`` for all blocks (they share one capture;
@@ -555,6 +642,7 @@ def quantize_dit_self_anchors(graph, scales: dict[str, float], *,
     import numpy as np
     from onnx import TensorProto
     gs = _gs()
+    scales = collect_dit_self_scales(graph, scales)
     tensors = graph.tensors()
     inv_name: str | None = None
     inv_values = None
@@ -576,6 +664,10 @@ def quantize_dit_self_anchors(graph, scales: dict[str, float], *,
         a: dict[str, str] = {}
         for stem, edge in (("q", b["q"]), ("k", b["k"]), ("v", b["v"])):
             edge_var = tensors[edge]
+            reuse = qdq_anchor_for(graph, edge)
+            if reuse is not None:
+                a[f"{stem}_i8"], a[f"{stem}_scale"] = reuse
+                continue
             sname = f"{b['attn_out']}_fused_{stem}s"
             sconst = gs.Constant(sname, values=np.asarray(scales[edge], dtype=np.float32))
             qi = gs.Variable(f"{b['attn_out']}_fused_{stem}i", dtype=np.int8,
@@ -606,17 +698,21 @@ def quantize_dit_self_anchors(graph, scales: dict[str, float], *,
             "inv_freq": inv_name}
 
 
-def apply_dit_self_fused(graph, scales: dict[str, float]) -> dict[str, Any]:
+def apply_dit_self_fused(graph, scales: dict[str, float] | None = None
+                         ) -> dict[str, Any]:
     """Discover + quantize + fuse every eligible DiT-self block.
 
     ``scales`` maps ONNX tensor name to per-tensor FP32 INT8 scale (see
-    :func:`quantize_dit_self_anchors`). Returns ``{"applied": n,
-    "skipped": m, "by_reason": {reason: count}}`` with ``missing-scales``
-    counted separately from structural rejects. Raises nothing on zero
-    matches (check ``applied``); per-block fusion errors propagate from
-    :func:`fuse_dit_self_attn_block`.
+    :func:`quantize_dit_self_anchors`). Missing entries are filled from an
+    existing Q/DQ at that edge (:func:`collect_dit_self_scales`); pass
+    explicit calibration values when the graph has no Q/DQ there.
+    Returns ``{"applied": n, "skipped": m, "by_reason": {reason: count}}``
+    with ``missing-scales`` counted separately from structural rejects.
+    Raises nothing on zero matches (check ``applied``); per-block fusion
+    errors propagate from :func:`fuse_dit_self_attn_block`.
     """
     blocks = discover_dit_self_blocks(graph)
+    scales = collect_dit_self_scales(graph, scales)
     by_reason: dict[str, int] = {}
     for b in blocks:
         reason = b["reason"] if b["eligible"] and _block_scales_ok(b, scales) \
@@ -881,7 +977,7 @@ def apply_attention_plugins(graph, *, base: BasePrecision | None = None,
     "base": ..., "arch": ..., "dry_run": bool}``.
     """
     from . import select as _sel
-    scales = dict(scales or {})
+    scales = collect_dit_self_scales(graph, scales)
     samples = dict(samples or {})
     if base is None:
         base = _infer_base(graph)
