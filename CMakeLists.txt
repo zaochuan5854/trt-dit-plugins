@@ -86,6 +86,8 @@ add_library(ck_kernels SHARED
     third_party/comfy/ops/per_tensor_quantize.cu
     src/kernel/sparge/sparge_pre.cu
     src/kernel/sparge/sparge_sm89_inst.cu
+    src/kernel/convrot/epilogue.cu
+    src/kernel/convrot/layout.cu
     src/kernel/prime.cu
     ${CONVROT_SOURCES})
 # ConvRot (comfy-kitchen v0.2.39): the vendor TUs keep upstream's nvcc flags

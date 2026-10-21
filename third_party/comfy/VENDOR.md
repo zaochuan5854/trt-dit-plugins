@@ -63,3 +63,17 @@ bias and all output dtypes on the fixed-config entry point.
 
 No kernel math or quantization code was changed, so results match upstream
 for the shapes upstream routes to the same kernel.
+
+`convrot/cutlass_gemm_int8.cu` (fusion/layout extension, plan 4.1-4.3)
+- Exact erf GELU / SiLU fused into the dequant epilogue via a unary EVT node
+  (`FusedInt8GemmAct`); the custom `SiluFn` keeps the same elementwise shape
+  as CUTLASS's `GELU<Array<T,N>>`.
+- `FusedInt8GemmActResidualGate` fuses `residual + gate * act(...)`; gate is
+  row-broadcast because the wrapper launches one GEMM per batch.
+- `VisitorQkvStore` + `FusedInt8GemmQkv` write `[B,H,S,D]` (single view or
+  separate q/k/v) directly from the epilogue, with no BSC temporary. The
+  M<3 / unsupported-shape fallback uses `convrot_layout_bhsd` in
+  `src/kernel/convrot/layout.cu`.
+- Added `launch_cutlass_int8_qkv`, `launch_cutlass_int8_dequant_act*`, and
+  `launch_cutlass_int8_dequant_act_residual_gate`; pinned config `>= 0`
+  selects one tile, otherwise the existing shape heuristic runs.

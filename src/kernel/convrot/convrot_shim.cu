@@ -40,6 +40,24 @@ bool launch_cutlass_int8_dequant(
 bool launch_cutlass_int8_dequant_config(
     const void* A, const void* B, const void* xs, const void* ws, const void* bias, void* D,
     int64_t M, int64_t N, int64_t K, int out_dtype_code, int config, cudaStream_t stream);
+bool launch_cutlass_int8_dequant_act(
+    const void* A, const void* B, const void* xs, const void* ws, const void* bias, void* D,
+    int64_t M, int64_t N, int64_t K, int out_dtype_code, int epilogue, cudaStream_t stream);
+bool launch_cutlass_int8_dequant_act_config(
+    const void* A, const void* B, const void* xs, const void* ws, const void* bias, void* D,
+    int64_t M, int64_t N, int64_t K, int out_dtype_code, int epilogue, int config,
+    cudaStream_t stream);
+bool launch_cutlass_int8_dequant_act_residual_gate(
+    const void* A, const void* B, const void* xs, const void* ws, const void* bias,
+    const void* gate, const void* residual, void* D, int64_t M, int64_t N, int64_t K,
+    int out_dtype_code, int epilogue, int config, cudaStream_t stream);
+bool launch_cutlass_int8_qkv(
+    const void* A, const void* B, const void* xs, const void* ws, const void* bias,
+    void* q, void* k, void* v, int64_t M, int64_t N, int64_t K, int64_t S, int H, int D,
+    int out_dtype_code, int config, cudaStream_t stream);
+int convrot_layout_bhsd(const void* src, void* q, void* k, void* v, int64_t B, int64_t S,
+                        int64_t H, int64_t D, int qkv_count, int dtype_code,
+                        cudaStream_t stream);
 bool launch_cutlass_int4_dequant(
     const void* A, const void* B, const void* xs, const void* ws, const void* bias, void* D,
     int64_t M, int64_t N, int64_t K, int out_dtype_code, cudaStream_t stream);
@@ -185,6 +203,7 @@ int convrot_quant(const void* x, int8_t* q, float* scales, int64_t M, int64_t K,
 int convrot_gemm(void* y, const int8_t* w, const float* ws, const void* bias,
                  const int8_t* xq, const float* xs, int64_t M, int64_t N, int64_t K,
                  int weight_bits, int act_bits, int out_dtype, int bias_dtype, int config,
+                 int epilogue, const void* residual, const void* gate,
                  void* ws_scratch, size_t ws_scratch_bytes, cudaStream_t stream) {
     try {
         if (M <= 0 || N <= 0 || K <= 0) return 0;
@@ -195,14 +214,46 @@ int convrot_gemm(void* y, const int8_t* w, const float* ws, const void* bias,
             if (M == 2) {
                 launch_int8_gemv_dequant_kernel(xq, w, xs, ws, bias, y, M, N, K, wss, hasBias,
                                                 out_dtype, bias_dtype, nullptr, nullptr, stream);
-                return tri(cudaGetLastError() == cudaSuccess);
+                if (cudaGetLastError() != cudaSuccess) return -1;
+                return convrot_apply_epilogue(y, residual, gate, M, N, epilogue, out_dtype,
+                                              stream);
+            }
+            if ((residual != nullptr) != (gate != nullptr)) return -1;
+            // shortcut: M<3 stays on gemv + post-pass; the fused EVT needs a tile.
+            if (M >= 3 && residual != nullptr && epilogue != 0) {
+                bool ok = launch_cutlass_int8_dequant_act_residual_gate(
+                    xq, w, xs, ws, bias, gate, residual, y, M, N, K, out_dtype, epilogue,
+                    config, stream);
+                if (!ok && config >= 0) {
+                    (void)cudaGetLastError();
+                    ok = launch_cutlass_int8_dequant_act_residual_gate(
+                        xq, w, xs, ws, bias, gate, residual, y, M, N, K, out_dtype, epilogue,
+                        -1, stream);
+                }
+                if (ok) return 0;
+                (void)cudaGetLastError();
+            }
+            if (epilogue != 0 && residual == nullptr) {
+                bool ok = config >= 0
+                    ? launch_cutlass_int8_dequant_act_config(xq, w, xs, ws, bias, y, M, N, K,
+                                                             out_dtype, epilogue, config, stream)
+                    : launch_cutlass_int8_dequant_act(xq, w, xs, ws, bias, y, M, N, K,
+                                                      out_dtype, epilogue, stream);
+                if (!ok && config >= 0) {
+                    (void)cudaGetLastError();
+                    ok = launch_cutlass_int8_dequant_act(xq, w, xs, ws, bias, y, M, N, K,
+                                                         out_dtype, epilogue, stream);
+                }
+                if (ok) return 0;
+                (void)cudaGetLastError();
             }
             const bool ok = config >= 0
                 ? launch_cutlass_int8_dequant_config(xq, w, xs, ws, bias, y, M, N, K, out_dtype,
                                                      config, stream)
                 : launch_cutlass_int8_dequant(xq, w, xs, ws, bias, y, M, N, K, out_dtype, stream);
             if (!ok) (void)cudaGetLastError();  // failed launch leaves a sticky error
-            return tri(ok);
+            if (!ok) return -1;
+            return convrot_apply_epilogue(y, residual, gate, M, N, epilogue, out_dtype, stream);
         }
 
         if (weight_bits == 4 && act_bits == 4) {
@@ -263,16 +314,63 @@ int convrot_gemm(void* y, const int8_t* w, const float* ws, const void* bias,
 
 int convrot_gemv_m1(void* y, const void* x, const int8_t* w, const float* ws, const void* bias,
                     int64_t N, int64_t K, int in_dtype, int out_dtype, int bias_dtype,
+                    int epilogue, const void* residual, const void* gate,
                     cudaStream_t stream) {
     try {
         if (!fusedGemvM1Fits(K, w)) return 1;
         launch_int8_gemv_convrot_fused_kernel(x, in_dtype, 0, nullptr, 0.f, w, ws, bias,
                                               bias != nullptr, bias_dtype, y, out_dtype, N, K, N,
                                               nullptr, nullptr, stream);
-        return tri(cudaGetLastError() == cudaSuccess);
+        if (cudaGetLastError() != cudaSuccess) return -1;
+        return convrot_apply_epilogue(y, residual, gate, 1, N, epilogue, out_dtype, stream);
     } catch (...) {
         return -1;
     }
+}
+
+int convrot_gemm_layout(void* const* y, const int8_t* w, const float* ws, const void* bias,
+                        const int8_t* xq, const float* xs, int64_t M, int64_t N, int64_t K,
+                        int64_t S, int H, int D, int out_layout, int config, int out_dtype,
+                        int bias_dtype, cudaStream_t stream) {
+    if (out_layout != 1 || !y || !y[0] || H <= 0 || D <= 0 || S <= 0) return -1;
+    const int qkv = (y[1] != nullptr || y[2] != nullptr) ? 3 : 1;
+    if (qkv == 3 && (!y[1] || !y[2])) return -1;
+    const int64_t C = int64_t(H) * D;
+    if (N != int64_t(qkv) * C) return -1;
+
+    if (M >= 3) {
+        bool ok = launch_cutlass_int8_qkv(xq, w, xs, ws, bias, y[0], y[1], y[2], M, N, K, S, H,
+                                          D, out_dtype, config, stream);
+        if (!ok && config >= 0) {
+            (void)cudaGetLastError();
+            ok = launch_cutlass_int8_qkv(xq, w, xs, ws, bias, y[0], y[1], y[2], M, N, K, S, H,
+                                         D, out_dtype, -1, stream);
+        }
+        if (ok) return 0;
+        (void)cudaGetLastError();
+    }
+
+    // Fallback: one BSC GEMM into a temporary, then a single layout kernel.
+    const size_t elem = out_dtype == 0 ? sizeof(float) : sizeof(uint16_t);
+    const size_t bytes = size_t(M) * size_t(N) * elem;
+    void* tmp = nullptr;
+    if (cudaMallocAsync(&tmp, bytes, stream) != cudaSuccess) return -1;
+    bool ok = config >= 0
+        ? launch_cutlass_int8_dequant_config(xq, w, xs, ws, bias, tmp, M, N, K, out_dtype,
+                                             config, stream)
+        : launch_cutlass_int8_dequant(xq, w, xs, ws, bias, tmp, M, N, K, out_dtype, stream);
+    if (!ok && config >= 0) {
+        (void)cudaGetLastError();
+        ok = launch_cutlass_int8_dequant(xq, w, xs, ws, bias, tmp, M, N, K, out_dtype, stream);
+    }
+    int rc = -1;
+    if (ok) {
+        rc = convrot_layout_bhsd(tmp, y[0], y[1], y[2], M / S, S, H, D, qkv, out_dtype, stream);
+    } else {
+        (void)cudaGetLastError();
+    }
+    if (cudaFreeAsync(tmp, stream) != cudaSuccess) rc = -1;
+    return rc;
 }
 
 }  // extern "C"

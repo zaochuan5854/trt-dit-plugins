@@ -60,6 +60,120 @@ struct WeightScaleBroadcast<ThreadMap, true> {
     }
 };
 
+// DIT-PLUGINS-PATCH: BHSD/QKV store. Writes each GEMM element once, with no
+// transpose kernel and no intermediate BSC tensor. q/k/v are separate because
+// the three views are not contiguous in the BHSD layout.
+template <class ThreadMap, class Element>
+struct VisitorQkvStore {
+    struct Arguments {
+        Element* q = nullptr;
+        Element* k = nullptr;
+        Element* v = nullptr;
+        int64_t S = 0;
+        int64_t C = 0;  // N per q/k/v (H*D)
+        int H = 0;
+        int D = 0;
+        int64_t N = 0;
+    };
+    using Params = Arguments;
+
+    template <class ProblemShape>
+    static constexpr Params to_underlying_arguments(ProblemShape const&, Arguments const& args,
+                                                    void*) {
+        return args;
+    }
+    template <class ProblemShape>
+    static size_t get_workspace_size(ProblemShape const&, Arguments const&) { return 0; }
+    struct SharedStorage {};
+
+    static int constexpr vec_bits = ThreadMap::kElementsPerAccess * sizeof_bits<Element>::value;
+    using VecType = uint_bit_t<cute::min(128, vec_bits)>;
+    static int constexpr VecLength = sizeof(VecType) / sizeof(Element);
+
+    CUTLASS_HOST_DEVICE VisitorQkvStore() {}
+    CUTLASS_HOST_DEVICE VisitorQkvStore(Params const& params, SharedStorage const&)
+        : params_ptr(&params) {}
+    Params const* params_ptr;
+
+    template <class GTensor, class RTensor, class CTensor, class ProblemShape>
+    struct Callbacks : cutlass::epilogue::threadblock::EmptyCallbacks {
+        CUTLASS_DEVICE
+        Callbacks(GTensor&& tC_g, RTensor&& tC_r, CTensor&& tC_c, ProblemShape problem_shape,
+                  Params const* params_ptr)
+            : tC_gAux(cute::forward<GTensor>(tC_g)),
+              tC_rAux(cute::forward<RTensor>(tC_r)),
+              tC_cAux(cute::forward<CTensor>(tC_c)),
+              problem_shape(problem_shape),
+              params_ptr(params_ptr) {}
+
+        GTensor tC_gAux;
+        RTensor tC_rAux;
+        CTensor tC_cAux;
+        ProblemShape problem_shape;
+        Params const* params_ptr;
+
+        CUTLASS_DEVICE void begin_step(int step_idx) { clear(tC_rAux); }
+
+        template <class ElementAccumulator, class ElementInput, int FragmentSize>
+        CUTLASS_DEVICE auto visit(int, int, int, int frg_idx,
+                                  cutlass::Array<ElementAccumulator, FragmentSize> const&,
+                                  cutlass::Array<ElementInput, FragmentSize> const& frg_input) {
+            using ConvertInput =
+                cutlass::NumericArrayConverter<Element, ElementInput, FragmentSize,
+                                               cutlass::FloatRoundStyle::round_to_nearest>;
+            ConvertInput convert_input{};
+            Tensor tC_rAux_frg =
+                recast<cutlass::Array<Element, FragmentSize>>(coalesce(tC_rAux));
+            tC_rAux_frg(frg_idx) = convert_input(frg_input);
+            return frg_input;
+        }
+
+        CUTLASS_DEVICE void end_step(int step_idx) {
+            auto src_v = filter(tC_rAux);
+            auto coord_v = filter(tC_cAux(_, _, _, step_idx));
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(src_v); ++i) {
+                auto coord = coord_v(i);
+                const int m = int(get<0>(coord));
+                const int n = int(get<1>(coord));
+                const bool guard = elem_less(coord, problem_shape);
+                const int b = m / int(params_ptr->S);
+                const int s = m % int(params_ptr->S);
+                const int qkv = n / int(params_ptr->C);
+                const int c = n % int(params_ptr->C);
+                const int h = c / params_ptr->D;
+                const int d = c % params_ptr->D;
+                Element* dst = qkv == 0 ? params_ptr->q
+                              : (qkv == 1 ? params_ptr->k : params_ptr->v);
+                if (dst == nullptr) continue;
+                void* addr = dst +
+                    ((int64_t(b) * params_ptr->H + h) * params_ptr->S + s) *
+                        params_ptr->D + d;
+                cutlass::arch::global_store<VecType, sizeof(VecType)>(src_v(i), addr, guard);
+            }
+        }
+    };
+
+    template <class ProblemShape>
+    CUTLASS_DEVICE auto get_callbacks(cutlass::gemm::GemmCoord threadblock_tile_offset,
+                                      int thread_idx, ProblemShape problem_shape) {
+        Tensor mAux = make_tensor(
+            make_gmem_ptr(params_ptr->q), problem_shape,
+            make_stride(int64_t(params_ptr->N), _1{}, int64_t(get<0>(problem_shape)) *
+                                                       params_ptr->N));
+        Tensor tC_gAux = recast<VecType>(
+            group_modes<3, 6>(ThreadMap::partition(mAux, thread_idx, threadblock_tile_offset)));
+        Tensor tC_rAux = make_tensor_like(take<0, 3>(tC_gAux));
+        Tensor cAux = make_identity_tensor(mAux.shape());
+        Tensor tC_cAux = outer_partition(
+            group_modes<3, 6>(ThreadMap::partition(cAux, thread_idx, threadblock_tile_offset)),
+            Shape<Int<VecLength>>{}, (_0{}));
+        return Callbacks<decltype(tC_gAux), decltype(tC_rAux), decltype(tC_cAux), ProblemShape>(
+            cute::move(tC_gAux), cute::move(tC_rAux), cute::move(tC_cAux), problem_shape,
+            params_ptr);
+    }
+};
+
 // One fused int8 GEMM, parameterized on output type AND tile/warp/stage config.
 // bias is read in ElementOutput (nullptr broadcasts 0).
 template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
@@ -116,6 +230,220 @@ struct FusedInt8Gemm {
             {D, {output_stride, _1{}, M * output_stride}} };
         return comfy_cutlass::launch_universal<Gemm>(
             A, B, cb, M, N, K, stream);
+    }
+};
+
+// FusedInt8Gemm with the BHSD/QKV store.
+template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
+          typename ArchTag = cutlass::arch::Sm80,
+          bool ScalarWeightScale = false, int AlignmentAB = 16,
+          typename ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>
+struct FusedInt8GemmQkv {
+    using ElementA = int8_t; using ElementB = int8_t;
+    using ElementC = ElementOutput;
+    using ElementAcc = int32_t; using ElementCompute = float;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    static constexpr int AlignA = AlignmentAB, AlignB = AlignmentAB;
+    static constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
+    using TB   = cutlass::gemm::GemmShape<TBM, TBN, TBK>;
+    using Warp = cutlass::gemm::GemmShape<WM, WN, WK>;
+    using Inst = cutlass::gemm::GemmShape<16, 8, 32>;
+    static constexpr int EVTStages = 1;
+
+    using ThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<TB, Warp, ElementC, AlignC, EVTStages>;
+    using Accum  = cutlass::epilogue::threadblock::VisitorAccFetch;
+    using XScale = cutlass::epilogue::threadblock::VisitorColBroadcast<ThreadMap, ElementCompute, cute::Stride<_1, _0, int32_t>>;
+    using WScale = typename WeightScaleBroadcast<ThreadMap, ScalarWeightScale>::Type;
+    using Bias   = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, ElementOutput, cute::Stride<_0, _1, int32_t>>;
+    using Mul0 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT0 = cutlass::epilogue::threadblock::Sm80EVT<Mul0, Accum, XScale>;
+    using Mul1 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT1 = cutlass::epilogue::threadblock::Sm80EVT<Mul1, EVT0, WScale>;
+    using Add2 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::plus, ElementOutput, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT2 = cutlass::epilogue::threadblock::Sm80EVT<Add2, EVT1, Bias>;
+    using StoreQkv = VisitorQkvStore<ThreadMap, ElementOutput>;
+    using EVTD = cutlass::epilogue::threadblock::Sm80EVT<StoreQkv, EVT2>;
+
+    using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
+        ElementA, LayoutA, cutlass::ComplexTransform::kNone, AlignA,
+        ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignB,
+        ElementC, LayoutC, AlignC,
+        ElementAcc, ElementCompute,
+        cutlass::arch::OpClassTensorOp, ArchTag,
+        TB, Warp, Inst, EVTD,
+        ThreadblockSwizzle,
+        NumStages, cutlass::arch::OpMultiplyAddSaturate, EVTStages>::GemmKernel;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    static bool run(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
+                    const ElementOutput* bias, ElementOutput* q, ElementOutput* k,
+                    ElementOutput* v, int M, int N, int K, int S, int H, int D,
+                    cudaStream_t stream) {
+        const auto weight_scale_args =
+            WeightScaleBroadcast<ThreadMap, ScalarWeightScale>::arguments(ws, N);
+        typename EVTD::Arguments cb{
+            { { { {}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {} },
+                weight_scale_args, {} },
+              {const_cast<ElementOutput*>(bias), ElementOutput(0), {_0{}, _1{}, N}}, {} },
+            {q, k, v, int64_t(S), int64_t(H) * D, H, D, int64_t(N)}};
+        return comfy_cutlass::launch_universal<Gemm>(A, B, cb, M, N, K, stream);
+    }
+};
+
+// DIT-PLUGINS-PATCH: exact erf GELU / SiLU fused into the dequant epilogue.
+// `cutlass::epilogue::thread::GELU` is the erf form (not the tanh approx).
+template <class T>
+struct SiluFn;
+
+template <>
+struct SiluFn<float> {
+    CUTLASS_HOST_DEVICE float operator()(float const& x) const {
+        return x / (1.f + expf(-x));
+    }
+};
+
+template <class T, int N>
+struct SiluFn<cutlass::Array<T, N>> {
+    CUTLASS_HOST_DEVICE cutlass::Array<T, N> operator()(cutlass::Array<T, N> const& x) const {
+        cutlass::Array<T, N> y;
+        SiluFn<T> op;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < N; ++i) y[i] = op(x[i]);
+        return y;
+    }
+};
+
+// FusedInt8Gemm with a unary activation between bias and the store.
+template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK,
+          int NumStages, template <class> class ActOp, typename ArchTag = cutlass::arch::Sm80,
+          bool ScalarWeightScale = false, int AlignmentAB = 16,
+          typename ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>
+struct FusedInt8GemmAct {
+    using ElementA = int8_t; using ElementB = int8_t;
+    using ElementC = ElementOutput;
+    using ElementAcc = int32_t; using ElementCompute = float;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    static constexpr int AlignA = AlignmentAB, AlignB = AlignmentAB;
+    static constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
+    using TB   = cutlass::gemm::GemmShape<TBM, TBN, TBK>;
+    using Warp = cutlass::gemm::GemmShape<WM, WN, WK>;
+    using Inst = cutlass::gemm::GemmShape<16, 8, 32>;
+    static constexpr int EVTStages = 1;
+
+    using ThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<TB, Warp, ElementC, AlignC, EVTStages>;
+    using Accum  = cutlass::epilogue::threadblock::VisitorAccFetch;
+    using XScale = cutlass::epilogue::threadblock::VisitorColBroadcast<ThreadMap, ElementCompute, cute::Stride<_1, _0, int32_t>>;
+    using WScale = typename WeightScaleBroadcast<ThreadMap, ScalarWeightScale>::Type;
+    using Bias   = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, ElementOutput, cute::Stride<_0, _1, int32_t>>;
+    using Mul0 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT0 = cutlass::epilogue::threadblock::Sm80EVT<Mul0, Accum, XScale>;
+    using Mul1 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT1 = cutlass::epilogue::threadblock::Sm80EVT<Mul1, EVT0, WScale>;
+    using Add2 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::plus, ElementOutput, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT2 = cutlass::epilogue::threadblock::Sm80EVT<Add2, EVT1, Bias>;
+    using Act  = cutlass::epilogue::threadblock::VisitorCompute<ActOp, ElementOutput, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT3 = cutlass::epilogue::threadblock::Sm80EVT<Act, EVT2>;
+    using StoreD = cutlass::epilogue::threadblock::VisitorAuxStore<ThreadMap, ElementOutput, cutlass::FloatRoundStyle::round_to_nearest, cute::Stride<int64_t, _1, int64_t>>;
+    using EVTD = cutlass::epilogue::threadblock::Sm80EVT<StoreD, EVT3>;
+
+    using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
+        ElementA, LayoutA, cutlass::ComplexTransform::kNone, AlignA,
+        ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignB,
+        ElementC, LayoutC, AlignC,
+        ElementAcc, ElementCompute,
+        cutlass::arch::OpClassTensorOp, ArchTag,
+        TB, Warp, Inst, EVTD,
+        ThreadblockSwizzle,
+        NumStages, cutlass::arch::OpMultiplyAddSaturate, EVTStages>::GemmKernel;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    static bool run(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
+                    const ElementOutput* bias, ElementOutput* D, int M, int N, int K,
+                    int output_stride, cudaStream_t stream) {
+        const auto weight_scale_args =
+            WeightScaleBroadcast<ThreadMap, ScalarWeightScale>::arguments(ws, N);
+        typename EVTD::Arguments cb{
+            { { { { {}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {} },
+                  weight_scale_args, {} },
+                {const_cast<ElementOutput*>(bias), ElementOutput(0), {_0{}, _1{}, N}}, {} },
+              {} },
+            {D, {output_stride, _1{}, int64_t(M) * output_stride}} };
+        return comfy_cutlass::launch_universal<Gemm>(A, B, cb, M, N, K, stream);
+    }
+};
+
+// DIT-PLUGINS-PATCH: fused residual + gate + activation epilogue:
+//   D = residual + gate[n] * act(acc * xs * ws + bias)
+template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK,
+          int NumStages, template <class> class ActOp, typename ArchTag = cutlass::arch::Sm80,
+          bool ScalarWeightScale = false, int AlignmentAB = 16,
+          typename ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>
+struct FusedInt8GemmActResidualGate {
+    using ElementA = int8_t; using ElementB = int8_t;
+    using ElementC = ElementOutput;
+    using ElementAcc = int32_t; using ElementCompute = float;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    static constexpr int AlignA = AlignmentAB, AlignB = AlignmentAB;
+    static constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
+    using TB   = cutlass::gemm::GemmShape<TBM, TBN, TBK>;
+    using Warp = cutlass::gemm::GemmShape<WM, WN, WK>;
+    using Inst = cutlass::gemm::GemmShape<16, 8, 32>;
+    static constexpr int EVTStages = 1;
+
+    using ThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<TB, Warp, ElementC, AlignC, EVTStages>;
+    using Accum  = cutlass::epilogue::threadblock::VisitorAccFetch;
+    using XScale = cutlass::epilogue::threadblock::VisitorColBroadcast<ThreadMap, ElementCompute, cute::Stride<_1, _0, int32_t>>;
+    using WScale = typename WeightScaleBroadcast<ThreadMap, ScalarWeightScale>::Type;
+    using Bias   = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, ElementOutput, cute::Stride<_0, _1, int32_t>>;
+    using Gate   = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, ElementOutput, cute::Stride<_0, _1, int32_t>>;
+    using Resid  = cutlass::epilogue::threadblock::VisitorAuxLoad<ThreadMap, ElementOutput, cute::Stride<int64_t, _1, int64_t>>;
+    using Mul0 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT0 = cutlass::epilogue::threadblock::Sm80EVT<Mul0, Accum, XScale>;
+    using Mul1 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT1 = cutlass::epilogue::threadblock::Sm80EVT<Mul1, EVT0, WScale>;
+    using Add2 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::plus, ElementOutput, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT2 = cutlass::epilogue::threadblock::Sm80EVT<Add2, EVT1, Bias>;
+    using Act  = cutlass::epilogue::threadblock::VisitorCompute<ActOp, ElementOutput, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT3 = cutlass::epilogue::threadblock::Sm80EVT<Act, EVT2>;
+    using Mul4 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementOutput, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT4 = cutlass::epilogue::threadblock::Sm80EVT<Mul4, EVT3, Gate>;
+    using Add5 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::plus, ElementOutput, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT5 = cutlass::epilogue::threadblock::Sm80EVT<Add5, EVT4, Resid>;
+    using StoreD = cutlass::epilogue::threadblock::VisitorAuxStore<ThreadMap, ElementOutput, cutlass::FloatRoundStyle::round_to_nearest, cute::Stride<int64_t, _1, int64_t>>;
+    using EVTD = cutlass::epilogue::threadblock::Sm80EVT<StoreD, EVT5>;
+
+    using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
+        ElementA, LayoutA, cutlass::ComplexTransform::kNone, AlignA,
+        ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignB,
+        ElementC, LayoutC, AlignC,
+        ElementAcc, ElementCompute,
+        cutlass::arch::OpClassTensorOp, ArchTag,
+        TB, Warp, Inst, EVTD,
+        ThreadblockSwizzle,
+        NumStages, cutlass::arch::OpMultiplyAddSaturate, EVTStages>::GemmKernel;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    static bool run(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
+                    const ElementOutput* bias, const ElementOutput* gate,
+                    const ElementOutput* resid, ElementOutput* D, int M, int N, int K,
+                    cudaStream_t stream) {
+        const auto weight_scale_args =
+            WeightScaleBroadcast<ThreadMap, ScalarWeightScale>::arguments(ws, N);
+        typename EVTD::Arguments cb{
+            { { { { { { {}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {} },
+                      weight_scale_args, {} },
+                    {const_cast<ElementOutput*>(bias), ElementOutput(0), {_0{}, _1{}, N}}, {} },
+                  {} },
+                {const_cast<ElementOutput*>(gate), ElementOutput(0), {_0{}, _1{}, N}}, {} },
+              {const_cast<ElementOutput*>(resid), ElementOutput(0), {int64_t(N), _1{}, int64_t(M) * N}}, {} },
+            {D, {int64_t(N), _1{}, int64_t(M) * N}} };
+        return comfy_cutlass::launch_universal<Gemm>(A, B, cb, M, N, K, stream);
     }
 };
 
@@ -277,6 +605,18 @@ template <typename OutT, typename C>
 using ResidualGemm = FusedInt8GemmResidual<OutT, C::TBM, C::TBN, C::TBK, C::WM, C::WN, C::WK,
                                            C::NumStages, cutlass::arch::Sm80, false,
                                            C::AlignmentAB, typename C::ThreadblockSwizzle>;
+template <typename OutT, typename C>
+using QkvGemm = FusedInt8GemmQkv<OutT, C::TBM, C::TBN, C::TBK, C::WM, C::WN, C::WK,
+                                 C::NumStages, cutlass::arch::Sm80, false,
+                                 C::AlignmentAB, typename C::ThreadblockSwizzle>;
+template <typename OutT, typename C, template <class> class ActOp>
+using ActGemm = FusedInt8GemmAct<OutT, C::TBM, C::TBN, C::TBK, C::WM, C::WN, C::WK,
+                                 C::NumStages, ActOp, cutlass::arch::Sm80, false,
+                                 C::AlignmentAB, typename C::ThreadblockSwizzle>;
+template <typename OutT, typename C, template <class> class ActOp>
+using ActResidualGemm = FusedInt8GemmActResidualGate<
+    OutT, C::TBM, C::TBN, C::TBK, C::WM, C::WN, C::WK, C::NumStages, ActOp,
+    cutlass::arch::Sm80, false, C::AlignmentAB, typename C::ThreadblockSwizzle>;
 
 // One run_strided table (stride == N is the plain case) serves every entry
 // point; bias may be nullptr (the RowBroadcast visitor broadcasts 0).
@@ -287,6 +627,17 @@ template <typename OutT>
 using FusedResidualFn = bool (*)(const int8_t*, const int8_t*, const float*, const float*,
                                  const OutT*, const OutT*, const OutT*, OutT*, int, int, int,
                                  cudaStream_t);
+template <typename OutT>
+using FusedQkvFn = bool (*)(const int8_t*, const int8_t*, const float*, const float*,
+                            const OutT*, OutT*, OutT*, OutT*, int, int, int, int, int, int,
+                            cudaStream_t);
+template <typename OutT>
+using FusedActFn = bool (*)(const int8_t*, const int8_t*, const float*, const float*,
+                            const OutT*, OutT*, int, int, int, int, cudaStream_t);
+template <typename OutT>
+using FusedActResidualFn = bool (*)(const int8_t*, const int8_t*, const float*, const float*,
+                                    const OutT*, const OutT*, const OutT*, OutT*, int, int,
+                                    int, cudaStream_t);
 
 template <typename OutT, typename... Cs>
 const FusedFn<OutT>* make_fused_runners(ConfigList<Cs...>) {
@@ -298,6 +649,75 @@ template <typename OutT, typename... Cs>
 const FusedResidualFn<OutT>* make_fused_residual_runners(ConfigList<Cs...>) {
     static const FusedResidualFn<OutT> runners[sizeof...(Cs)] = {&ResidualGemm<OutT, Cs>::run...};
     return runners;
+}
+
+template <typename OutT, template <class> class ActOp, typename... Cs>
+const FusedActResidualFn<OutT>* make_fused_act_residual_runners(ConfigList<Cs...>) {
+    static const FusedActResidualFn<OutT> runners[sizeof...(Cs)] = {
+        &ActResidualGemm<OutT, Cs, ActOp>::run...};
+    return runners;
+}
+
+template <typename OutT>
+bool dispatch_fused_act_residual(const int8_t* A, const int8_t* B, const float* xs,
+                                 const float* ws, const OutT* bias, const OutT* gate,
+                                 const OutT* resid, OutT* D, int M, int N, int K, int epilogue,
+                                 int config, cudaStream_t stream) {
+    const FusedActResidualFn<OutT>* runners =
+        epilogue == 1
+            ? make_fused_act_residual_runners<OutT, cutlass::epilogue::thread::GELU>(
+                  FusedInt8Configs{})
+            : make_fused_act_residual_runners<OutT, SiluFn>(FusedInt8Configs{});
+    if (config >= 0) {
+        if (config >= kFusedConfigCount) return false;
+        return runners[config](A, B, xs, ws, bias, gate, resid, D, M, N, K, stream);
+    }
+    return launch_fused_int8_heuristic(M, N, K, [&](int c) {
+        return runners[c](A, B, xs, ws, bias, gate, resid, D, M, N, K, stream);
+    });
+}
+
+template <typename OutT, template <class> class ActOp, typename... Cs>
+const FusedActFn<OutT>* make_fused_act_runners(ConfigList<Cs...>) {
+    static const FusedActFn<OutT> runners[sizeof...(Cs)] = {&ActGemm<OutT, Cs, ActOp>::run...};
+    return runners;
+}
+
+template <typename OutT>
+bool dispatch_fused_act(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
+                        const OutT* bias, OutT* D, int M, int N, int K, int output_stride,
+                        int epilogue, int config, cudaStream_t stream) {
+    const FusedActFn<OutT>* runners =
+        epilogue == 1 ? make_fused_act_runners<OutT, cutlass::epilogue::thread::GELU>(
+                            FusedInt8Configs{})
+                      : make_fused_act_runners<OutT, SiluFn>(FusedInt8Configs{});
+    if (config >= 0) {
+        if (config >= kFusedConfigCount) return false;
+        return runners[config](A, B, xs, ws, bias, D, M, N, K, output_stride, stream);
+    }
+    return launch_fused_int8_heuristic(M, N, K, [&](int c) {
+        return runners[c](A, B, xs, ws, bias, D, M, N, K, output_stride, stream);
+    });
+}
+
+template <typename OutT, typename... Cs>
+const FusedQkvFn<OutT>* make_fused_qkv_runners(ConfigList<Cs...>) {
+    static const FusedQkvFn<OutT> runners[sizeof...(Cs)] = {&QkvGemm<OutT, Cs>::run...};
+    return runners;
+}
+
+template <typename OutT>
+bool dispatch_fused_qkv(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
+                        const OutT* bias, OutT* q, OutT* k, OutT* v, int M, int N, int K,
+                        int S, int H, int D, int config, cudaStream_t stream) {
+    const FusedQkvFn<OutT>* runners = make_fused_qkv_runners<OutT>(FusedInt8Configs{});
+    if (config >= 0) {
+        if (config >= kFusedConfigCount) return false;
+        return runners[config](A, B, xs, ws, bias, q, k, v, M, N, K, S, H, D, stream);
+    }
+    return launch_fused_int8_heuristic(M, N, K, [&](int c) {
+        return runners[c](A, B, xs, ws, bias, q, k, v, M, N, K, S, H, D, stream);
+    });
 }
 
 template <typename OutT>
@@ -429,6 +849,104 @@ bool launch_cutlass_int8_dequant_config(
         default: return false;
     }
 }
+// DIT-PLUGINS-PATCH: fused exact GELU/SILU + residual/gate epilogue.
+bool launch_cutlass_int8_dequant_act_residual_gate(
+    const void* A, const void* B, const void* xs, const void* ws, const void* bias,
+    const void* gate, const void* residual, void* D, int64_t M, int64_t N, int64_t K,
+    int out_dtype_code, int epilogue, int config, cudaStream_t stream)
+{
+    if (M == 0 || N == 0 || K == 0) return true;
+    if ((epilogue != 1 && epilogue != 2) || gate == nullptr || residual == nullptr)
+        return false;
+    const int8_t* a = static_cast<const int8_t*>(A);
+    const int8_t* b = static_cast<const int8_t*>(B);
+    const float* x = static_cast<const float*>(xs);
+    const float* w = static_cast<const float*>(ws);
+    switch (out_dtype_code) {
+        case 0: return dispatch_fused_act_residual<float>(
+            a, b, x, w, static_cast<const float*>(bias), static_cast<const float*>(gate),
+            static_cast<const float*>(residual), static_cast<float*>(D), int(M), int(N),
+            int(K), epilogue, config, stream);
+        case 1: return dispatch_fused_act_residual<cutlass::half_t>(
+            a, b, x, w, static_cast<const cutlass::half_t*>(bias),
+            static_cast<const cutlass::half_t*>(gate),
+            static_cast<const cutlass::half_t*>(residual), static_cast<cutlass::half_t*>(D),
+            int(M), int(N), int(K), epilogue, config, stream);
+        case 2: return dispatch_fused_act_residual<cutlass::bfloat16_t>(
+            a, b, x, w, static_cast<const cutlass::bfloat16_t*>(bias),
+            static_cast<const cutlass::bfloat16_t*>(gate),
+            static_cast<const cutlass::bfloat16_t*>(residual),
+            static_cast<cutlass::bfloat16_t*>(D), int(M), int(N), int(K), epilogue, config,
+            stream);
+        default: return false;
+    }
+}
+
+// DIT-PLUGINS-PATCH: fused exact GELU/SILU epilogue (epilogue 1/2).
+bool launch_cutlass_int8_dequant_act_config(
+    const void* A, const void* B, const void* xs, const void* ws, const void* bias, void* D,
+    int64_t M, int64_t N, int64_t K, int out_dtype_code, int epilogue, int config,
+    cudaStream_t stream)
+{
+    if (M == 0 || N == 0 || K == 0) return true;
+    if (epilogue != 1 && epilogue != 2) return false;
+    const int8_t* a = static_cast<const int8_t*>(A);
+    const int8_t* b = static_cast<const int8_t*>(B);
+    const float* x = static_cast<const float*>(xs);
+    const float* w = static_cast<const float*>(ws);
+    switch (out_dtype_code) {
+        case 0: return dispatch_fused_act<float>(
+            a, b, x, w, static_cast<const float*>(bias), static_cast<float*>(D), int(M),
+            int(N), int(K), int(N), epilogue, config, stream);
+        case 1: return dispatch_fused_act<cutlass::half_t>(
+            a, b, x, w, static_cast<const cutlass::half_t*>(bias),
+            static_cast<cutlass::half_t*>(D), int(M), int(N), int(K), int(N), epilogue,
+            config, stream);
+        case 2: return dispatch_fused_act<cutlass::bfloat16_t>(
+            a, b, x, w, static_cast<const cutlass::bfloat16_t*>(bias),
+            static_cast<cutlass::bfloat16_t*>(D), int(M), int(N), int(K), int(N), epilogue,
+            config, stream);
+        default: return false;
+    }
+}
+
+bool launch_cutlass_int8_dequant_act(
+    const void* A, const void* B, const void* xs, const void* ws, const void* bias, void* D,
+    int64_t M, int64_t N, int64_t K, int out_dtype_code, int epilogue, cudaStream_t stream)
+{
+    return launch_cutlass_int8_dequant_act_config(A, B, xs, ws, bias, D, M, N, K,
+                                                  out_dtype_code, epilogue, -1, stream);
+}
+
+// DIT-PLUGINS-PATCH: BHSD/QKV store. k/v may be null (single-tensor layout).
+bool launch_cutlass_int8_qkv(
+    const void* A, const void* B, const void* xs, const void* ws, const void* bias,
+    void* q, void* k, void* v, int64_t M, int64_t N, int64_t K, int64_t S, int H, int D,
+    int out_dtype_code, int config, cudaStream_t stream)
+{
+    if (M == 0 || N == 0 || K == 0) return true;
+    if (q == nullptr || S <= 0 || H <= 0 || D <= 0) return false;
+    const int64_t C = int64_t(H) * D;
+    if (N != C && (k == nullptr || v == nullptr || N != 3 * C)) return false;
+    const int8_t* a = static_cast<const int8_t*>(A);
+    const int8_t* b = static_cast<const int8_t*>(B);
+    const float* x = static_cast<const float*>(xs);
+    const float* w = static_cast<const float*>(ws);
+    switch (out_dtype_code) {
+        case 0: return dispatch_fused_qkv<float>(
+            a, b, x, w, static_cast<const float*>(bias), static_cast<float*>(q),
+            static_cast<float*>(k), static_cast<float*>(v), M, N, K, S, H, D, config, stream);
+        case 1: return dispatch_fused_qkv<cutlass::half_t>(
+            a, b, x, w, static_cast<const cutlass::half_t*>(bias),
+            static_cast<cutlass::half_t*>(q), static_cast<cutlass::half_t*>(k),
+            static_cast<cutlass::half_t*>(v), M, N, K, S, H, D, config, stream);
+        case 2: return dispatch_fused_qkv<cutlass::bfloat16_t>(
+            a, b, x, w, static_cast<const cutlass::bfloat16_t*>(bias),
+            static_cast<cutlass::bfloat16_t*>(q), static_cast<cutlass::bfloat16_t*>(k),
+            static_cast<cutlass::bfloat16_t*>(v), M, N, K, S, H, D, config, stream);
+        default: return false;
+    }
+}
 }  // extern "C"
 
 #else  // !COMFY_HAVE_CUTLASS -- stub; caller falls back to cuBLAS + separate dequant.
@@ -455,6 +973,30 @@ extern "C" bool launch_cutlass_int8_dequant_residual(
     const void*, const void*, const void*, const void*, const void*,
     const void*, const void*, void*, int64_t, int64_t, int64_t, int,
     cudaStream_t) {
+    return false;
+}
+
+extern "C" bool launch_cutlass_int8_qkv(
+    const void*, const void*, const void*, const void*, const void*, void*, void*, void*,
+    int64_t, int64_t, int64_t, int64_t, int, int, int, int, cudaStream_t) {
+    return false;
+}
+
+extern "C" bool launch_cutlass_int8_dequant_act(
+    const void*, const void*, const void*, const void*, const void*, void*, int64_t, int64_t,
+    int64_t, int, int, cudaStream_t) {
+    return false;
+}
+
+extern "C" bool launch_cutlass_int8_dequant_act_residual_gate(
+    const void*, const void*, const void*, const void*, const void*, const void*, const void*,
+    void*, int64_t, int64_t, int64_t, int, int, int, cudaStream_t) {
+    return false;
+}
+
+extern "C" bool launch_cutlass_int8_dequant_act_config(
+    const void*, const void*, const void*, const void*, const void*, void*, int64_t, int64_t,
+    int64_t, int, int, int, cudaStream_t) {
     return false;
 }
 

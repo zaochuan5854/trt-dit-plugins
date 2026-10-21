@@ -25,15 +25,31 @@ int convrot_quant(const void* x, int8_t* q, float* scales, int64_t M, int64_t K,
 
 // Fused GEMM over an already-quantized activation.
 // weight_bits and act_bits are independent: non-sm8x W4A4 is (4, 8).
+// epilogue: 0=none, 1=erf GELU, 2=SiLU. residual/gate are optional; when both
+// are non-null the result is residual + gate * epilogue(gemm).
 int convrot_gemm(void* y, const int8_t* w, const float* ws, const void* bias,
                  const int8_t* xq, const float* xs, int64_t M, int64_t N, int64_t K,
                  int weight_bits, int act_bits, int out_dtype, int bias_dtype, int config,
+                 int epilogue, const void* residual, const void* gate,
                  void* ws_scratch, size_t ws_scratch_bytes, cudaStream_t stream);
 
 // M == 1 fused GEMV (W8A8 only). Returns 1 when this route cannot be used.
 int convrot_gemv_m1(void* y, const void* x, const int8_t* w, const float* ws, const void* bias,
                     int64_t N, int64_t K, int in_dtype, int out_dtype, int bias_dtype,
+                    int epilogue, const void* residual, const void* gate,
                     cudaStream_t stream);
+
+// In-place activation (+ optional residual/gate) for the M<3 routes.
+int convrot_apply_epilogue(void* y, const void* residual, const void* gate,
+                           int64_t rows, int64_t cols, int epilogue, int dtype_code,
+                           cudaStream_t stream);
+
+// BSC -> BHSD/QKV output. y[0]=q, y[1]=k, y[2]=v; k/v are null for a single
+// tensor. cudaMallocAsync is used for the M<3 fallback only.
+int convrot_gemm_layout(void* const* y, const int8_t* w, const float* ws, const void* bias,
+                        const int8_t* xq, const float* xs, int64_t M, int64_t N, int64_t K,
+                        int64_t S, int H, int D, int out_layout, int config, int out_dtype,
+                        int bias_dtype, cudaStream_t stream);
 
 // Build-time only (never from enqueue). Returns the best config index or -1.
 int convrot_int4_autotune(int64_t M, int64_t N, int64_t K, int out_dtype,

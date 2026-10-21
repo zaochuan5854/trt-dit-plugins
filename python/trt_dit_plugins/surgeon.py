@@ -61,8 +61,8 @@ _SPECS: dict[str, tuple[int, int, frozenset[str]]] = {
     PluginOp.STOCHASTIC_ROUND_FP8: (2, 1, frozenset({"alias_rng"})),
     PluginOp.BLOCK_SPARSE_SAGE2_ATTN: (4, 1, frozenset({"scale", "pvthreshd", "attention_sink"})),
     PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: (9, 1, frozenset()),
-    PluginOp.CONVROT_LINEAR: (4, 1, frozenset({"group_size", "has_bias", "out_dtype", "gemm_config"})),
-    PluginOp.CONVROT_LINEAR_W4A4: (4, 1, frozenset({"group_size", "has_bias", "out_dtype", "gemm_config"})),
+    PluginOp.CONVROT_LINEAR: (4, 1, frozenset({"group_size", "has_bias", "out_dtype", "gemm_config", "epilogue", "residual_gate", "out_layout", "qkv_heads", "head_dim"})),
+    PluginOp.CONVROT_LINEAR_W4A4: (4, 1, frozenset({"group_size", "has_bias", "out_dtype", "gemm_config", "epilogue", "residual_gate", "out_layout", "qkv_heads", "head_dim"})),
 }
 
 _LEGACY_ATTN_OPS = (PluginOp.SAGE_INT8_LEGACY, "Attention")
@@ -172,7 +172,9 @@ def add_block_sparse_sage2_attn(graph, q, k, v, m, scale=0.0, pvthreshd=50.0,
 
 
 def add_convrot_linear(graph, x, weight, weight_scale, bias, *, w4a4=False,
-                       has_bias=True, out_dtype=-1, gemm_config=-1, name=None):
+                       has_bias=True, out_dtype=-1, gemm_config=-1,
+                       epilogue="none", residual=None, gate=None,
+                       out_layout="bsc", qkv_heads=0, head_dim=0, name=None):
     """ConvRot linear (W8A8, or W4A4 when ``w4a4=True``).
 
     x: float [..., K] (pre-rotation activation); weight: INT8 [N, K] for W8A8,
@@ -184,7 +186,25 @@ def add_convrot_linear(graph, x, weight, weight_scale, bias, *, w4a4=False,
     The declared output dtype is the plugin's real output; ``bias`` must
     already be in that dtype.
     ``gemm_config``: -1 = automatic route; >= 0 pins a W4A4 GEMM tile config.
+    ``epilogue``: "none" | "gelu" | "silu"; ``residual``/``gate`` append the
+    fused residual+gate inputs (W8A8 only).
     """
+    if isinstance(epilogue, str):
+        ep = {"none": 0, "gelu": 1, "silu": 2}.get(epilogue)
+    else:
+        ep = int(epilogue)
+    if ep not in (0, 1, 2):
+        raise ValueError("epilogue must be 'none', 'gelu' or 'silu'")
+    if (ep or residual is not None) and w4a4:
+        raise ValueError("W4A4 does not support epilogue/residual/gate")
+    if residual is not None and gate is None:
+        raise ValueError("residual requires gate")
+    if out_layout not in ("bsc", "bhsd"):
+        raise ValueError("out_layout must be 'bsc' or 'bhsd'")
+    if w4a4 and (out_layout != "bsc" or qkv_heads or head_dim):
+        raise ValueError("W4A4 does not support out_layout/qkv_heads/head_dim")
+    if out_layout == "bhsd" and (ep or residual is not None):
+        raise ValueError("bhsd output does not support epilogue/residual")
     gs = _gs()
     op = PluginOp.CONVROT_LINEAR_W4A4 if w4a4 else PluginOp.CONVROT_LINEAR
     n = weight.shape[0] if weight.shape is not None else None
@@ -195,12 +215,30 @@ def add_convrot_linear(graph, x, weight, weight_scale, bias, *, w4a4=False,
     if code not in (-1, 0, 1, 2):
         raise ValueError(f"out_dtype must be -1/0/1/2, got {out_dtype!r}")
     dtype = {0: "bfloat16", 1: "float16", 2: "float32"}.get(code, x.dtype)
-    out = gs.Variable(name=f"dit_out{next(_uid)}", dtype=dtype, shape=out_shape)
-    _plugin_node(graph, op, [x, weight, weight_scale, bias], [out],
+    outs = []
+    if out_layout == "bhsd":
+        if x.shape is None or len(x.shape) != 3:
+            raise ValueError("bhsd output requires x [B,S,K]")
+        D = head_dim or 128
+        H = qkv_heads or (n // D if n is not None else None)
+        if n is None or H is None or D <= 0 or H <= 0 or H * D * (3 if qkv_heads else 1) != n:
+            raise ValueError("weight N must be H*D or 3*H*D")
+        for nm in (["q", "k", "v"] if qkv_heads else ["y"]):
+            outs.append(gs.Variable(name=f"dit_out{next(_uid)}", dtype=dtype,
+                                    shape=[x.shape[0], H, x.shape[1], D]))
+    else:
+        outs.append(gs.Variable(name=f"dit_out{next(_uid)}", dtype=dtype, shape=out_shape))
+    ins = [x, weight, weight_scale, bias]
+    if residual is not None:
+        ins.extend([residual, gate])
+    _plugin_node(graph, op, ins, outs,
                  {"group_size": 256, "has_bias": int(bool(has_bias)),
-                  "out_dtype": int(out_dtype), "gemm_config": int(gemm_config)},
+                  "out_dtype": int(out_dtype), "gemm_config": int(gemm_config),
+                  "epilogue": ep, "residual_gate": int(residual is not None),
+                  "out_layout": 1 if out_layout == "bhsd" else 0,
+                  "qkv_heads": int(qkv_heads), "head_dim": int(head_dim)},
                  name=name)
-    return out
+    return tuple(outs) if qkv_heads else outs[0]
 
 
 def import_comfy_convrot(graph, *, gemm_config=-1):
@@ -1244,6 +1282,9 @@ def validate_plugin_nodes(graph) -> list[str]:
         if node.op in (PluginOp.RMS_ADALN, PluginOp.LAYER_NORM_ADALN):
             want_in = 3 + int(node.attrs.get("has_weight", 0)) \
                          + 2 * int(node.attrs.get("residual_gate", 0))
+        elif node.op in (PluginOp.CONVROT_LINEAR, PluginOp.CONVROT_LINEAR_W4A4):
+            want_in = 4 + 2 * int(node.attrs.get("residual_gate", 0))
+            want_out = 3 if int(node.attrs.get("qkv_heads", 0)) else 1
         if len(node.inputs) != want_in:
             errs.append(f"{node.name or node.op}: want {want_in} inputs, got {len(node.inputs)}")
         if len(node.outputs) != want_out:
@@ -1359,6 +1400,30 @@ def validate_plugin_nodes(graph) -> list[str]:
                         tuple(t.shape) != want):
                     errs.append(f"{tag}: input {idx} shape "
                                 f"{tuple(t.shape)}, want {want}")
+            ol = node.attrs.get("out_layout", 0)
+            qh = node.attrs.get("qkv_heads", 0)
+            hd = node.attrs.get("head_dim", 0)
+            if ol not in (0, 1) or not isinstance(qh, int) or qh < 0 or not isinstance(hd, int) or hd < 0:
+                errs.append(f"{tag}: bad out_layout/qkv_heads/head_dim")
+            elif ol == 1:
+                if node.attrs.get("epilogue", 0) or node.attrs.get("residual_gate", 0):
+                    errs.append(f"{tag}: bhsd output does not support epilogue/residual")
+                if xshape is None or len(xshape) != 3:
+                    errs.append(f"{tag}: bhsd output requires x [B,S,K]")
+                elif n is not None:
+                    D = hd or 128
+                    C = n // 3 if qh else n
+                    H = qh or (C // D if D else 0)
+                    if D <= 0 or H <= 0 or C % D or H * D != C:
+                        errs.append(f"{tag}: weight N={n} is not H*D or 3*H*D")
+                    want_out = 3 if qh else 1
+                    if len(node.outputs) != want_out:
+                        errs.append(f"{tag}: want {want_out} outputs, got {len(node.outputs)}")
+                    for o in node.outputs:
+                        if o.shape is not None and all(isinstance(v, int) for v in o.shape):
+                            if tuple(o.shape) != (xshape[0], H, xshape[1], D):
+                                errs.append(f"{tag}: output shape {tuple(o.shape)} "
+                                            f"!= {(xshape[0], H, xshape[1], D)}")
     return errs
 
 

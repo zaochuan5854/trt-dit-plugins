@@ -284,8 +284,12 @@ def fused_rope_sage_attn(q, k, v, rms_w_q, rms_w_k, inv_freq):
                                      inv_freq)
 
 
+_EPILOGUE = {"none": 0, "gelu": 1, "silu": 2}
+
+
 def _convrot_linear(op, x, weight, weight_scale, bias, out_dtype, gemm_config, w4a4,
-                    profile=None):
+                    epilogue="none", residual=None, gate=None, out_layout="bsc",
+                    qkv_heads=0, head_dim=0, profile=None):
     import torch
 
     _require_cuda(x, weight, weight_scale, *(() if bias is None else (bias,)))
@@ -315,34 +319,88 @@ def _convrot_linear(op, x, weight, weight_scale, bias, out_dtype, gemm_config, w
         raise ValueError("bias must be [N] in the output dtype")
     else:
         has_bias = 1
+    if isinstance(epilogue, str):
+        if epilogue not in _EPILOGUE:
+            raise ValueError("epilogue must be 'none', 'gelu' or 'silu'")
+        ep = _EPILOGUE[epilogue]
+    elif epilogue in (0, 1, 2):
+        ep = int(epilogue)
+    else:
+        raise ValueError("epilogue must be 'none', 'gelu' or 'silu'")
+    if w4a4 and (ep or residual is not None or gate is not None):
+        raise ValueError("W4A4 does not support epilogue/residual/gate")
+    if out_layout not in ("bsc", "bhsd"):
+        raise ValueError("out_layout must be 'bsc' or 'bhsd'")
+    if w4a4 and (out_layout != "bsc" or qkv_heads or head_dim):
+        raise ValueError("W4A4 does not support out_layout/qkv_heads/head_dim")
+    if head_dim < 0 or qkv_heads < 0:
+        raise ValueError("qkv_heads and head_dim must be >= 0")
+    tensors = {"x": x, "w": weight, "ws": weight_scale, "b": bias}
+    if residual is not None:
+        n = weight.shape[0]
+        if x.dim() != 3 or gate is None or residual.dim() != 3 \
+                or tuple(residual.shape[:2]) != tuple(x.shape[:2]) \
+                or residual.shape[-1] != n or residual.dtype != otype \
+                or not residual.is_cuda:
+            raise ValueError("residual must be [B,S,N] in the output dtype")
+        if gate.dtype != otype or gate.dim() not in (2, 3) \
+                or gate.shape[-1] != n or gate.shape[0] != x.shape[0] \
+                or (gate.dim() == 3 and gate.shape[1] != 1):
+            raise ValueError("gate must be [B,N] or [B,1,N] in the output dtype")
+        tensors["residual"] = residual
+        tensors["gate"] = gate
+    n = weight.shape[0]
+    if out_layout == "bhsd":
+        if x.dim() != 3:
+            raise ValueError("bhsd output requires x [B,S,K]")
+        if ep or residual is not None or gate is not None:
+            raise ValueError("bhsd output does not support epilogue/residual")
+        D = head_dim or 128
+        H = qkv_heads or n // D
+        if D <= 0 or H <= 0 or H * D * (3 if qkv_heads else 1) != n:
+            raise ValueError("weight N must be H*D or 3*H*D")
+        b, s_, _ = x.shape
+        names = ["q", "k", "v"] if qkv_heads else ["y"]
+        out_specs = [(name, otype, (b, H, s_, D)) for name in names]
+    else:
+        names = ["y"]
+        out_specs = [("y", otype, (*x.shape[:-1], n))]
     outs = E.run_plugin(
         op,
-        {"x": x, "w": weight, "ws": weight_scale, "b": bias},
-        [("y", otype, (*x.shape[:-1], weight.shape[0]))],
+        tensors,
+        out_specs,
         {"group_size": 256, "has_bias": has_bias,
          "out_dtype": -1 if out_dtype is None
          else {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}[otype],
-         "gemm_config": int(gemm_config)},
+         "gemm_config": int(gemm_config), "epilogue": ep,
+         "residual_gate": int(residual is not None), "out_layout": 1 if out_layout == "bhsd" else 0,
+         "qkv_heads": int(qkv_heads), "head_dim": int(head_dim)},
         profile=profile,
     )
-    return outs["y"]
+    return tuple(outs[name] for name in names) if qkv_heads else outs["y"]
 
 
 def convrot_linear(x, weight, weight_scale, bias=None, *, out_dtype=None, gemm_config=-1,
-                   profile=None):
-    """ConvRot W8A8 linear: y = x @ W.T + bias.
+                   epilogue="none", residual=None, gate=None, out_layout="bsc",
+                   qkv_heads=0, head_dim=0, profile=None):
+    """ConvRot W8A8 linear: y = x @ W.T + bias, optional GELU/SiLU epilogue.
 
     x: f32/f16/bf16 CUDA [..., K]; weight: int8 [N, K] already ConvRot-rotated;
     weight_scale: fp32 [N]; bias: [N] in the output dtype (None = zeros, the
     kernel still runs the bias epilogue with has_bias=0).
+    ``epilogue``: "none" | "gelu" (exact erf) | "silu".
+    ``residual``/``gate``: optional [B,S,N] and [B,N]/[B,1,N] in the output
+    dtype; result is residual + gate * epilogue(x @ W.T + bias).
     ``profile``: {"x": (min, opt, max)} makes the M dim dynamic so one engine
     serves many token counts (same form as ``_engine.run_plugin``).
     """
     return _convrot_linear(PluginOp.CONVROT_LINEAR, x, weight, weight_scale, bias,
-                           out_dtype, gemm_config, False, profile)
+                           out_dtype, gemm_config, False, epilogue, residual, gate,
+                           out_layout, qkv_heads, head_dim, profile)
 
 
 def convrot_linear_w4a4(x, qweight, wscales, bias=None, *, out_dtype=None, gemm_config=-1,
+                        epilogue="none", out_layout="bsc", qkv_heads=0, head_dim=0,
                         profile=None):
     """ConvRot W4A4 linear: packed signed INT4 weight [N, K/2], fp32 scales [N].
 
@@ -350,4 +408,5 @@ def convrot_linear_w4a4(x, qweight, wscales, bias=None, *, out_dtype=None, gemm_
     ``profile``: {"x": (min, opt, max)} makes the M dim dynamic.
     """
     return _convrot_linear(PluginOp.CONVROT_LINEAR_W4A4, x, qweight, wscales, bias,
-                           out_dtype, gemm_config, True, profile)
+                           out_dtype, gemm_config, True, epilogue, None, None, out_layout,
+                           qkv_heads, head_dim, profile)
