@@ -56,6 +56,7 @@ _SPECS: dict[str, tuple[int, int, frozenset[str]]] = {
     PluginOp.RMS_ADALN: (3, 1, frozenset({"eps"})),
     PluginOp.APPLY_ROPE: (3, 2, frozenset()),
     PluginOp.RMS_ROPE_SPLIT_HALF: (5, 2, frozenset({"epsilon", "rot_dim"})),
+    PluginOp.RMS_NORM: (2, 1, frozenset({"eps", "in_layout"})),
     PluginOp.STOCHASTIC_ROUND_FP8: (2, 1, frozenset({"alias_rng"})),
     PluginOp.BLOCK_SPARSE_SAGE2_ATTN: (4, 1, frozenset({"scale", "pvthreshd", "attention_sink"})),
     PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: (9, 1, frozenset()),
@@ -126,6 +127,20 @@ def add_apply_rope(graph, q, k, f, name=None):
     outs = [_like(q), _like(k)]
     _plugin_node(graph, PluginOp.APPLY_ROPE, [q, k, f], outs, name=name)
     return outs[0], outs[1]
+
+
+def add_rms_norm(graph, x, weight, *, eps=1e-6, layout="bhsd", name=None):
+    """Single-tensor RMSNorm; layout='bshd' also transposes to BHSD."""
+    gs = _gs()
+    shape = None
+    if x.shape is not None:
+        b, s, h, d = x.shape
+        shape = [b, h, s, d] if layout == "bshd" else list(x.shape)
+    out = gs.Variable(name=f"dit_out{next(_uid)}", dtype=x.dtype, shape=shape)
+    _plugin_node(graph, PluginOp.RMS_NORM, [x, weight], [out],
+                 {"eps": float(eps), "in_layout": int(layout == "bshd")},
+                 name=name)
+    return out
 
 
 def add_rms_rope_split_half(graph, q, k, f, qs, ks, epsilon=1e-6, rot_dim=0, name=None):

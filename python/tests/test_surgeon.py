@@ -1046,3 +1046,15 @@ def test_apply_attention_plugins_fp8_vehicle_excludes_fused():
     assert S.validate_plugin_nodes(g) == []
     assert not [n for n in g.nodes if n.op == "fused_int8_rope_sage_attn"]
     assert not [n for n in g.nodes if n.op == "QuantizeLinear"]
+
+
+def test_add_rms_norm_bshd_has_no_transpose():
+    gs = pytest.importorskip("onnx_graphsurgeon")
+    x = gs.Variable("x", dtype="bfloat16", shape=[1, 64, 2, 128])
+    w = gs.Variable("w", dtype="float32", shape=[128])
+    g = gs.Graph(nodes=[], inputs=[x, w], outputs=[])
+    y = S.add_rms_norm(g, x, w, layout="bshd")
+    g.outputs = [y]
+    assert y.shape == [1, 2, 64, 128]
+    assert not [n for n in g.nodes if n.op == "Transpose"]
+    assert S.validate_plugin_nodes(g) == []

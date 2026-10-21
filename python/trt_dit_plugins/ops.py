@@ -132,6 +132,33 @@ def rms_rope_split_half(q, k, freqs, q_scale, k_scale, epsilon=1e-6, rot_dim=0,
     return outs["qo"], outs["ko"]
 
 
+def rms_norm(x, weight, eps=1e-6, layout="bhsd", profile=None):
+    """RMSNorm with optional BSHD input and BHSD output.
+
+    layout="bshd": x [B,S,H,D] -> out [B,H,S,D] (fuses the q/k transpose)
+    layout="bhsd": x [B,H,S,D] -> out [B,H,S,D]
+    weight: [D] in FP32/FP16/BF16 (kernel reads it as the per-dim scale).
+    """
+    _require_cuda(x, weight)
+    if x.dim() != 4 or weight.dim() != 1 or weight.numel() != x.shape[-1]:
+        raise ValueError("rms_norm expects x [B,S,H,D] / [B,H,S,D] and weight [D]")
+    if layout not in ("bhsd", "bshd"):
+        raise ValueError("layout must be 'bhsd' or 'bshd'")
+    if layout == "bshd":
+        b, s, h, d = x.shape
+        oshape = (b, h, s, d)
+    else:
+        oshape = tuple(x.shape)
+    outs = E.run_plugin(
+        PluginOp.RMS_NORM,
+        {"x": x, "w": weight},
+        [("y", x.dtype, oshape)],
+        {"eps": float(eps), "in_layout": int(layout == "bshd")},
+        profile=profile,
+    )
+    return outs["y"]
+
+
 def stochastic_rounding_fp8(x, rng, alias_rng=False):
     """Stochastically round to FP8 E4M3. x: f32/f16/bf16; rng: int32 same numel.
 

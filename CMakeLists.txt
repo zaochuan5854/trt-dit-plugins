@@ -145,6 +145,7 @@ add_library(trt_dit_plugins SHARED
     src/wrapper/fp8_wrapper.cpp
     src/wrapper/fused_int8_rope_sage_wrapper.cpp
     src/wrapper/rms_rope_wrapper.cpp
+    src/wrapper/rms_norm_wrapper.cpp
     src/wrapper/sparge_wrapper.cpp
     src/wrapper/convrot_linear_wrapper.cpp)
 target_include_directories(trt_dit_plugins PRIVATE ${TRT_INCLUDE_DIR}

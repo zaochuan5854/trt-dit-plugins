@@ -93,6 +93,7 @@ class PluginOp(str, Enum):
     RMS_ADALN = "rms_adaln"
     APPLY_ROPE = "apply_rope"
     RMS_ROPE_SPLIT_HALF = "rms_rope_split_half"
+    RMS_NORM = "rms_norm"
     STOCHASTIC_ROUND_FP8 = "stochastic_round_fp8"
     BLOCK_SPARSE_SAGE2_ATTN = "block_sparse_sage2_attn"
     FUSED_INT8_ROPE_SAGE_ATTN = "fused_int8_rope_sage_attn"

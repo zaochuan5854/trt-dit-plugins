@@ -185,6 +185,35 @@ def test_rms_rope_rms_only_rot_minus_one():
     assert _cos(ko, rk) > 0.9999
 
 
+def test_rms_norm_cross_attention_different_s():
+    B, H, Sq, Sk, D = 1, 2, 1024, 256, 128
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Sk, H, D, device="cuda", dtype=torch.bfloat16)
+    wq = torch.rand(D, device="cuda")
+    wk = torch.rand(D, device="cuda")
+
+    def ref(x, w):
+        xf = x.float()
+        return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)
+                * w.float()).to(x.dtype).permute(0, 2, 1, 3).contiguous()
+
+    qo = tdp.rms_norm(q, wq, layout="bshd")
+    ko = tdp.rms_norm(k, wk, layout="bshd")
+    assert qo.shape == (B, H, Sq, D)
+    assert ko.shape == (B, H, Sk, D)
+    assert _cos(qo, ref(q, wq)) > 0.9999
+    assert _cos(ko, ref(k, wk)) > 0.9999
+
+
+def test_rms_norm_bhsd_matches_bshd():
+    B, H, S_, D = 2, 2, 64, 128
+    x = torch.randn(B, H, S_, D, device="cuda", dtype=torch.bfloat16)
+    w = torch.rand(D, device="cuda")
+    y = tdp.rms_norm(x, w)
+    z = tdp.rms_norm(x.transpose(1, 2).contiguous(), w, layout="bshd")
+    assert _cos(y, z) > 0.9999
+
+
 def test_fused_short_seq():
     S_ = 512
     qi = torch.randint(-127, 127, (B, H, S_, D), device="cuda", dtype=torch.int8)
