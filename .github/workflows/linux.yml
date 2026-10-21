@@ -40,6 +40,14 @@ jobs:
       CCACHE_COMPILERCHECK: content
       CCACHE_MAXSIZE: 2G
     steps:
+      # The CUDA devel image ships without git; checkout would fall back to a
+      # REST download, which cannot fetch `third_party/cutlass` (exit 127).
+      - name: Install git (checkout needs it)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive

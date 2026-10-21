@@ -100,6 +100,13 @@ jobs:
       TENSORRT_ROOT: /tmp/trt
       DEBIAN_FRONTEND: noninteractive
     steps:
+      # The CUDA devel image ships without git; checkout + submodules need it.
+      - name: Install git (checkout needs it)
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            git ca-certificates
+          rm -rf /var/lib/apt/lists/*
       - uses: actions/checkout@v4
         with:
           submodules: recursive
