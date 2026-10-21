@@ -137,3 +137,19 @@ def test_fused_short_seq():
     qr, kr = tdp.rms_rope_split_half(qf, qf, fq, rw, rw)
     ref = tdp.sage_attn(qr, kr, qf)
     assert _cos(of, ref) > 0.99
+
+
+def test_fused_float_input():
+    # R2: linear output (bf16) feeds the fused op with no QuantizeLinear.
+    q = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
+    rw = torch.rand(D, device="cuda") * 0.5 + 0.5
+    inv = torch.rand(64, device="cuda") * 0.05
+    of = tdp.fused_rope_sage_attn(q, q, q, rw, rw, inv)
+    assert of.dtype == torch.bfloat16 and of.shape == q.shape
+
+    ang = torch.arange(S, device="cuda", dtype=torch.float32)[:, None] * inv[None, :]
+    fq = torch.zeros(1, 1, S, 64, 2, 2, device="cuda")
+    fq[..., 0, 0], fq[..., 1, 0] = ang.cos(), ang.sin()
+    fq[..., 0, 1], fq[..., 1, 1] = -ang.sin(), ang.cos()
+    qr, kr = tdp.rms_rope_split_half(q, q, fq, rw, rw)
+    assert _cos(of, tdp.sage_attn(qr, kr, q)) > 0.99

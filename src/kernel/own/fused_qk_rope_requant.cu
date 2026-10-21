@@ -154,6 +154,30 @@ __forceinline__ __device__ float wn_to_float(const WN *w, int idx) {
   return static_cast<float>(__ldg(&w[idx]));
 }
 
+// ---- input load: int8 dequant or float/half/bf16 passthrough ----
+//
+// in_dtype_code: 0=int8, 1=fp16, 2=bf16, 3=fp32. Float inputs skip the
+// per-tensor dequant stage entirely (R2: no extra QuantizeLinear nodes).
+template <typename InT>
+__forceinline__ __device__ void load4_in(const InT *p, float *v, float s) {
+  if constexpr (std::is_same_v<InT, int8_t>) {
+    load4_i8(p, v);
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+      v[c] *= s;
+  } else if constexpr (std::is_same_v<InT, float>) {
+    const float4 t = *reinterpret_cast<const float4 *>(p);
+    v[0] = t.x;
+    v[1] = t.y;
+    v[2] = t.z;
+    v[3] = t.w;
+  } else {
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+      v[c] = static_cast<float>(p[c]);
+  }
+}
+
 // ---- K mean pre-pass (smooth-K): mean[ch] over L rows of dequantized K ----
 //
 // Latency trap this avoids: one block per (b,h) with a scalar byte loop over
@@ -165,8 +189,9 @@ __forceinline__ __device__ float wn_to_float(const WN *w, int idx) {
 constexpr int KMEAN_CHUNK_ROWS = 128; // Larger chunks underfill the SMs at
 // small S (fewer blocks); 128 keeps enough blocks in flight.
 
+template <typename InT>
 __global__ __launch_bounds__(128) void k_mean_kernel(
-    const int8_t *__restrict__ k_in, float *__restrict__ mean_out,
+    const InT *__restrict__ k_in, float *__restrict__ mean_out,
     const float *__restrict__ k_s_in, int L, int C, int H, int64_t stride_b,
     int64_t stride_h) {
   const int chunk = blockIdx.x;
@@ -178,22 +203,19 @@ __global__ __launch_bounds__(128) void k_mean_kernel(
   const float k_s = __ldg(k_s_in);
   const int n0 = chunk * KMEAN_CHUNK_ROWS;
   const int n1 = n0 + KMEAN_CHUNK_ROWS < L ? n0 + KMEAN_CHUNK_ROWS : L;
-  const int8_t *base = k_in + (int64_t)b * stride_b + (int64_t)h * stride_h;
+  const InT *base = k_in + (int64_t)b * stride_b + (int64_t)h * stride_h;
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
   for (int n = n0; n < n1; n += 4) {
-    // 4 rows x 4 ch via int32 vector loads (tail rows past n1 are masked).
+    // 4 rows x 4 ch (tail rows past n1 are masked).
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
       const int nn = n + r;
-      int32_t packed = 0;
-      if (nn < n1) {
-        packed = __ldg(reinterpret_cast<const int32_t *>(
-            base + (int64_t)nn * C + ch));
-      }
-      acc[0] += static_cast<float>(static_cast<int8_t>(packed & 0xff));
-      acc[1] += static_cast<float>(static_cast<int8_t>((packed >> 8) & 0xff));
-      acc[2] += static_cast<float>(static_cast<int8_t>((packed >> 16) & 0xff));
-      acc[3] += static_cast<float>(static_cast<int8_t>((packed >> 24) & 0xff));
+      float t[4] = {0.f, 0.f, 0.f, 0.f};
+      if (nn < n1)
+        load4_in<InT>(&base[(int64_t)nn * C + ch], t, 1.f);
+#pragma unroll
+      for (int c = 0; c < 4; ++c)
+        acc[c] += t[c];
     }
   }
   const float k = k_s / static_cast<float>(L);
@@ -210,9 +232,9 @@ __global__ __launch_bounds__(128) void k_mean_kernel(
 // per head) and any grid dependence beyond S itself. Rotation convention
 // matches the baked 2x2 capture ([[cos,-sin],[sin,cos]]): y0=c*x0-s*x1.
 
-template <typename WN>
+template <typename WN, typename InT>
 __global__ __launch_bounds__(128, 4) void fused_q_kernel(
-    const int8_t *__restrict__ q_in, int8_t *__restrict__ q_out,
+    const InT *__restrict__ q_in, int8_t *__restrict__ q_out,
     float *__restrict__ q_sb, const float *__restrict__ q_s_in,
     const WN *__restrict__ norm_w,
     const float *__restrict__ inv_freq, const int L, const int C, const int H,
@@ -250,10 +272,7 @@ __global__ __launch_bounds__(128, 4) void fused_q_kernel(
       const int n = base + j * 8;
       if (n < L) {
         const int ch = lane << 2;
-        load4_i8(&q_in[in_bh + (int64_t)n * C + ch], &v[j * 4]);
-#pragma unroll
-        for (int c = 0; c < 4; ++c)
-          v[j * 4 + c] *= q_s;
+        load4_in<InT>(&q_in[in_bh + (int64_t)n * C + ch], &v[j * 4], q_s);
       }
     }
 
@@ -363,9 +382,9 @@ __global__ __launch_bounds__(128, 4) void fused_q_kernel(
 // avoiding the local-memory spill a 128-float v[] incurs). One scale per
 // (oblk, otld) is kept by reducing absmax across both halves first.
 
-template <typename WN>
+template <typename WN, typename InT>
 __device__ __forceinline__ void fused_k_half(
-    const int8_t *__restrict__ k_in, const WN *__restrict__ norm_w,
+    const InT *__restrict__ k_in, const WN *__restrict__ norm_w,
     const float *__restrict__ mean, const float *__restrict__ inv_freq,
     float k_s_in, int j_base, int oblk, int otld, int L, int C,
     int64_t in_bh, float *v, float *rnorm) {
@@ -393,10 +412,10 @@ __device__ __forceinline__ void fused_k_half(
       const int vi = (jj * 2 + p) * 4;
       if (n < L) {
         const int ch = lane << 2;
-        load4_i8(&k_in[in_bh + (int64_t)n * C + ch], &v[vi]);
+        load4_in<InT>(&k_in[in_bh + (int64_t)n * C + ch], &v[vi], k_s_in);
 #pragma unroll
         for (int c = 0; c < 4; ++c)
-          v[vi + c] = v[vi + c] * k_s_in - mb[c];
+          v[vi + c] -= mb[c];
       } else {
 #pragma unroll
         for (int c = 0; c < 4; ++c)
@@ -465,9 +484,9 @@ __device__ __forceinline__ void fused_k_half(
     convrot128_f(&v[r * 4]);
 }
 
-template <typename WN>
+template <typename WN, typename InT>
 __global__ __launch_bounds__(128, 4) void fused_k_kernel(
-    const int8_t *__restrict__ k_in, int8_t *__restrict__ k_out,
+    const InT *__restrict__ k_in, int8_t *__restrict__ k_out,
     float *__restrict__ k_sb, const float *__restrict__ k_s_in,
     const WN *__restrict__ norm_w, const float *__restrict__ k_mean,
     const float *__restrict__ inv_freq, const int L, const int C, const int H,
@@ -499,7 +518,7 @@ __global__ __launch_bounds__(128, 4) void fused_k_kernel(
   // Pass A: transform both halves; stage half-0 to SMEM, keep half-1 in v[].
 #pragma unroll
   for (int half = 0; half < 2; ++half) {
-    fused_k_half<WN>(k_in, norm_w, mean, inv_freq, k_s, half * 8, oblk,
+    fused_k_half<WN, InT>(k_in, norm_w, mean, inv_freq, k_s, half * 8, oblk,
                      otld, L, C, in_bh, v, rnorm);
 #pragma unroll
     for (int j = 0; j < 2 * 8 * 4; ++j)
@@ -789,25 +808,15 @@ __global__ void requant_v_int8_kernel(const int8_t *__restrict__ v,
 
 } // namespace
 
-extern "C" {
+namespace {
 
-void launch_fused_qk_rope_int8(
-    const void *q_i8, const void *q_s_in, void *q_int8, void *q_scale,
-    const void *k_i8, const void *k_s_in, void *k_int8, void *k_scale,
-    const void *rms_w_q, const void *rms_w_k, int norm_dtype_code,
-    const void *inv_freq, int B, int H, int L, int C, void *ws_mean,
-    cudaStream_t stream) {
-  if (C != 128)
-    throw std::runtime_error(
-        "fused_qk_rope_int8: head_dim 128 only");
-  if (!ws_mean)
-    throw std::runtime_error("fused_qk_rope_int8: mean workspace required");
-  if (reinterpret_cast<uintptr_t>(q_i8) % 4 != 0 ||
-      reinterpret_cast<uintptr_t>(k_i8) % 4 != 0 ||
-      reinterpret_cast<uintptr_t>(q_int8) % 4 != 0 ||
-      reinterpret_cast<uintptr_t>(k_int8) % 4 != 0)
-    throw std::runtime_error("fused_qk_rope_int8: int8 pointers need 4B align");
-
+template <typename InT>
+void launch_fused_typed(const void *q_i8, const void *q_s_in, void *q_int8,
+                        void *q_scale, const void *k_i8, const void *k_s_in,
+                        void *k_int8, void *k_scale, const void *rms_w_q,
+                        const void *rms_w_k, int norm_dtype_code,
+                        const void *inv_freq, int B, int H, int L, int C,
+                        void *ws_mean, cudaStream_t stream) {
   const int64_t stride_b = (int64_t)H * L * C;
   const int64_t stride_h = (int64_t)L * C;
   const int q_oblk = (L + 128 - 1) / 128 * 4;
@@ -828,10 +837,9 @@ void launch_fused_qk_rope_int8(
     if (e != cudaSuccess)
       throw std::runtime_error(std::string("k_mean memset failed: ") +
                                cudaGetErrorString(e));
-    k_mean_kernel<<<g, 128, 0, stream>>>((const int8_t *)k_i8,
-                                         (float *)ws_mean,
-                                         (const float *)k_s_in, L, C, H,
-                                         stride_b, stride_h);
+    k_mean_kernel<InT><<<g, 128, 0, stream>>>(
+        (const InT *)k_i8, (float *)ws_mean, (const float *)k_s_in, L, C, H,
+        stride_b, stride_h);
     e = cudaGetLastError();
     if (e != cudaSuccess)
       throw std::runtime_error(std::string("k_mean kernel launch failed: ") +
@@ -841,8 +849,8 @@ void launch_fused_qk_rope_int8(
   auto launch_qk = [&](auto dummy_wn) {
     using WN = decltype(dummy_wn);
     dim3 gq(q_oblk, H, B);
-    fused_q_kernel<WN><<<gq, 128, 0, stream>>>(
-        (const int8_t *)q_i8, (int8_t *)q_int8, (float *)q_scale,
+    fused_q_kernel<WN, InT><<<gq, 128, 0, stream>>>(
+        (const InT *)q_i8, (int8_t *)q_int8, (float *)q_scale,
         (const float *)q_s_in, (const WN *)rms_w_q, (const float *)inv_freq,
         L, C, H, q_sc_per_h, stride_b, stride_h);
     cudaError_t e = cudaGetLastError();
@@ -850,8 +858,8 @@ void launch_fused_qk_rope_int8(
       throw std::runtime_error(std::string("fused_q kernel launch failed: ") +
                                cudaGetErrorString(e));
     dim3 gk(k_oblk, H, B);
-    fused_k_kernel<WN><<<gk, 128, 0, stream>>>(
-        (const int8_t *)k_i8, (int8_t *)k_int8, (float *)k_scale,
+    fused_k_kernel<WN, InT><<<gk, 128, 0, stream>>>(
+        (const InT *)k_i8, (int8_t *)k_int8, (float *)k_scale,
         (const float *)k_s_in, (const WN *)rms_w_k, (const float *)ws_mean,
         (const float *)inv_freq, L, C, H, k_sc_per_h, stride_b, stride_h);
     e = cudaGetLastError();
@@ -866,6 +874,55 @@ void launch_fused_qk_rope_int8(
     launch_qk(half{});
   else
     launch_qk(nv_bfloat16{});
+}
+
+} // namespace
+
+extern "C" {
+
+void launch_fused_qk_rope_int8(
+    const void *q_i8, const void *q_s_in, void *q_int8, void *q_scale,
+    const void *k_i8, const void *k_s_in, void *k_int8, void *k_scale,
+    const void *rms_w_q, const void *rms_w_k, int norm_dtype_code,
+    const void *inv_freq, int B, int H, int L, int C, void *ws_mean,
+    int in_dtype_code, cudaStream_t stream) {
+  if (C != 128)
+    throw std::runtime_error("fused_qk_rope_int8: head_dim 128 only");
+  if (!ws_mean)
+    throw std::runtime_error("fused_qk_rope_int8: mean workspace required");
+  const size_t in_align = in_dtype_code == 0 ? 4u : 16u;
+  if (reinterpret_cast<uintptr_t>(q_i8) % in_align != 0 ||
+      reinterpret_cast<uintptr_t>(k_i8) % in_align != 0 ||
+      reinterpret_cast<uintptr_t>(q_int8) % 4 != 0 ||
+      reinterpret_cast<uintptr_t>(k_int8) % 4 != 0)
+    throw std::runtime_error(
+        "fused_qk_rope_int8: input/output pointer alignment");
+  switch (in_dtype_code) {
+  case 0:
+    launch_fused_typed<int8_t>(q_i8, q_s_in, q_int8, q_scale, k_i8, k_s_in,
+                               k_int8, k_scale, rms_w_q, rms_w_k,
+                               norm_dtype_code, inv_freq, B, H, L, C, ws_mean,
+                               stream);
+    break;
+  case 1:
+    launch_fused_typed<half>(q_i8, q_s_in, q_int8, q_scale, k_i8, k_s_in,
+                             k_int8, k_scale, rms_w_q, rms_w_k,
+                             norm_dtype_code, inv_freq, B, H, L, C, ws_mean,
+                             stream);
+    break;
+  case 2:
+    launch_fused_typed<nv_bfloat16>(q_i8, q_s_in, q_int8, q_scale, k_i8,
+                                    k_s_in, k_int8, k_scale, rms_w_q, rms_w_k,
+                                    norm_dtype_code, inv_freq, B, H, L, C,
+                                    ws_mean, stream);
+    break;
+  default:
+    launch_fused_typed<float>(q_i8, q_s_in, q_int8, q_scale, k_i8, k_s_in,
+                              k_int8, k_scale, rms_w_q, rms_w_k,
+                              norm_dtype_code, inv_freq, B, H, L, C, ws_mean,
+                              stream);
+    break;
+  }
 }
 
 void launch_requant_v_int8(const void *v_i8, const void *v_s_in, void *out,

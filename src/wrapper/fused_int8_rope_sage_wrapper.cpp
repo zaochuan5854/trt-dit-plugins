@@ -27,7 +27,10 @@ void launch_fused_qk_rope_int8(const void *q_i8, const void *q_s_in,
     void *q_int8, void *q_scale, const void *k_i8, const void *k_s_in,
     void *k_int8, void *k_scale, const void *rms_w_q, const void *rms_w_k,
     int norm_dtype_code, const void *inv_freq, int B, int H, int L, int C,
-    void *ws_mean, cudaStream_t stream);
+    void *ws_mean, int in_dtype_code, cudaStream_t stream);
+void launch_quant_v_int8_kernel(const void *v, void *out, void *scale, int B,
+    int H, int N, int D, int padded_N, int64_t sb, int64_t sh, int64_t sn,
+    int input_dtype_code, cudaStream_t stream);
 void launch_requant_v_int8(const void *v_i8, const void *v_s_in, void *out,
     void *scale, int B, int H, int N, int D, int padded_N, int64_t sb,
     int64_t sh, int64_t sn, cudaStream_t stream);
@@ -50,6 +53,21 @@ constexpr char const *kNamespace = "dit-plugins";
 // Input positions.
 constexpr int kQ = 0, kQsIn = 1, kK = 2, kKsIn = 3, kV = 4, kVsIn = 5,
               kQn = 6, kKn = 7, kInv = 8, kNbIn = 9;
+
+// 0=int8, 1=fp16, 2=bf16, 3=fp32 (matches the kernel launcher codes).
+int inCode(nvinfer1::DataType t) {
+    switch (t) {
+    case nvinfer1::DataType::kINT8: return 0;
+    case nvinfer1::DataType::kHALF: return 1;
+    case nvinfer1::DataType::kBF16: return 2;
+    default: return 3;
+    }
+}
+
+bool isInDtype(nvinfer1::DataType t) {
+    return t == nvinfer1::DataType::kINT8 || t == nvinfer1::DataType::kHALF ||
+           t == nvinfer1::DataType::kBF16 || t == nvinfer1::DataType::kFLOAT;
+}
 
 int normCode(nvinfer1::DataType t) {
     if (t == nvinfer1::DataType::kFLOAT)
@@ -143,8 +161,9 @@ public:
         return 0;
     }
 
-    // q/k/v INT8 [B,H,S,128]; scales FP32 scalar [1]; norms FP32/BF16 [128];
-    // inv_freq FP32 [64]; output BF16. kLINEAR only.
+    // q/k/v INT8 or BF16/FP16/FP32 [B,H,S,128] (uniform); scales FP32 scalar
+    // [1] (ignored for float inputs); norms FP32/BF16 [128]; inv_freq FP32
+    // [64]; output BF16. kLINEAR only.
     bool supportsFormatCombination(int32_t pos,
         nvinfer1::DynamicPluginTensorDesc const *io, int32_t nbIn,
         int32_t) noexcept override {
@@ -157,7 +176,7 @@ public:
         case kQ:
         case kK:
         case kV:
-            return d.type == nvinfer1::DataType::kINT8;
+            return isInDtype(d.type);
         case kQsIn:
         case kKsIn:
         case kVsIn:
@@ -204,7 +223,7 @@ public:
         for (int i : {kQ, kK, kV}) {
             if (in[i].dims.nbDims != 4)
                 return -1;
-            if (in[i].type != nvinfer1::DataType::kINT8)
+            if (!isInDtype(in[i].type) || in[i].type != in[kQ].type)
                 return -1;
         }
         B_ = in[kQ].dims.d[0];
@@ -234,6 +253,7 @@ public:
             in[kInv].type != nvinfer1::DataType::kFLOAT)
             return -1;
         normCode_ = normCode(in[kQn].type);
+        inCode_ = inCode(in[kQ].type);
         smScale_ = 1.0f / std::sqrt((float)D_);
         plan_ = planWs(B_, H_, L_, D_);
         return 0;
@@ -256,12 +276,21 @@ public:
             launch_fused_qk_rope_int8(in[kQ], in[kQsIn], w + p.off_qi,
                 w + p.off_qs, in[kK], in[kKsIn], w + p.off_ki, w + p.off_ks,
                 in[kQn], in[kKn], normCode_, in[kInv], B_, H_, L_, D_,
-                w + p.off_mean, stream);
+                w + p.off_mean, inCode_, stream);
             const int64_t sb_v = (int64_t)H_ * L_ * D_, sh_v = (int64_t)L_ * D_;
-            // Single-pass int8->int8 requant (s_in folded into block scale).
-            launch_requant_v_int8(in[kV], in[kVsIn], w + p.off_vi,
-                w + p.off_vs, B_, H_, L_, D_, p.padded_L, sb_v, sh_v, D_,
-                stream);
+            if (inCode_ == 0) {
+                // Single-pass int8->int8 requant (s_in folded into block scale).
+                launch_requant_v_int8(in[kV], in[kVsIn], w + p.off_vi,
+                    w + p.off_vs, B_, H_, L_, D_, p.padded_L, sb_v, sh_v, D_,
+                    stream);
+            } else {
+                // Float V skips the input quantizer (R2).
+                // quant_v_int8 codes: 0=f32, 1=f16, 2=bf16 (no int8).
+                const int v_code = inCode_ == 3 ? 0 : inCode_;
+                launch_quant_v_int8_kernel(in[kV], w + p.off_vi,
+                    w + p.off_vs, B_, H_, L_, D_, p.padded_L, sb_v, sh_v, D_,
+                    v_code, stream);
+            }
             const int64_t sb_q = (int64_t)H_ * L_ * D_, sh_q = (int64_t)L_ * D_;
             const int64_t v_bz = (int64_t)H_ * D_ * p.padded_L,
                           v_h = (int64_t)D_ * p.padded_L;
@@ -288,11 +317,16 @@ public:
     }
 
     char const *getTimingCacheID() noexcept override {
-        return "fused_int8_rope_sage_attn/1";
+        static const char *kIds[] = {
+            "fused_int8_rope_sage_attn/1/i8",
+            "fused_int8_rope_sage_attn/1/f16",
+            "fused_int8_rope_sage_attn/1/bf16",
+            "fused_int8_rope_sage_attn/1/f32"};
+        return kIds[inCode_ & 3];
     }
 
 private:
-    int B_ = 0, H_ = 0, L_ = 0, D_ = 0, normCode_ = 0;
+    int B_ = 0, H_ = 0, L_ = 0, D_ = 0, normCode_ = 0, inCode_ = 0;
     float smScale_ = 0;
     WsPlan plan_{};
     nvinfer1::PluginFieldCollection fc_{};

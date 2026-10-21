@@ -173,22 +173,26 @@ def block_sparse_sage2_attn(q, k, v, mask, scale=0.0, pvthreshd=50.0, attention_
 
 def fused_int8_rope_sage_attn(q_i8, q_scale, k_i8, k_scale, v_i8, v_scale,
                                rms_w_q, rms_w_k, inv_freq):
-    """INT8-input RoPE+SageAttn fused DiT-self (D=128 only).
+    """RoPE+SageAttn fused DiT-self (D=128 only).
 
-    q_i8/k_i8/v_i8: int8 CUDA [B,H,S,128] (identical shapes required).
-    q_scale/k_scale/v_scale: per-tensor fp32 scalar (single-element CUDA tensors).
-    rms_w_q/rms_w_k: fp32/bf16 CUDA [128] (same dtype). inv_freq: fp32 CUDA [64].
-    Returns bf16 [B,H,S,128].
+    q_i8/k_i8/v_i8: int8 or f32/f16/bf16 CUDA [B,H,S,128] (identical shapes
+    and dtype). INT8 inputs are dequantized with the per-tensor scales; float
+    inputs skip that stage (scales unused). q_scale/k_scale/v_scale:
+    single-element fp32 CUDA tensors. rms_w_q/rms_w_k: fp32/bf16 CUDA [128]
+    (same dtype). inv_freq: fp32 CUDA [64]. Returns bf16 [B,H,S,128].
     """
     _require_cuda(q_i8, q_scale, k_i8, k_scale, v_i8, v_scale, rms_w_q, rms_w_k,
                   inv_freq)
     import torch
 
+    dtypes = (torch.int8, torch.float32, torch.float16, torch.bfloat16)
     for t in (q_i8, k_i8, v_i8):
-        if t.dim() != 4 or t.dtype != torch.int8 or t.shape[-1] != 128:
-            raise ValueError("fused q/k/v must be 4D int8 with D=128")
+        if t.dim() != 4 or t.dtype not in dtypes or t.shape[-1] != 128:
+            raise ValueError("fused q/k/v must be 4D int8/f32/f16/bf16 with D=128")
     if not (q_i8.shape == k_i8.shape == v_i8.shape):
         raise ValueError("q,k,v shapes must match (DiT-self)")
+    if not (q_i8.dtype == k_i8.dtype == v_i8.dtype):
+        raise ValueError("fused q,k,v must share one dtype")
     for t in (q_scale, k_scale, v_scale):
         if t.dtype != torch.float32 or t.numel() != 1:
             raise ValueError("input scales must be single-element fp32")
@@ -203,6 +207,18 @@ def fused_int8_rope_sage_attn(q_i8, q_scale, k_i8, k_scale, v_i8, v_scale,
         [("o", torch.bfloat16, tuple(q_i8.shape))],
     )
     return outs["o"]
+
+
+def fused_rope_sage_attn(q, k, v, rms_w_q, rms_w_k, inv_freq):
+    """Float-input variant: linear output feeds the fused op directly.
+
+    q/k/v f32/f16/bf16 [B,H,S,128] (no QuantizeLinear/calibration needed).
+    """
+    import torch
+
+    one = torch.ones(1, device=q.device, dtype=torch.float32)
+    return fused_int8_rope_sage_attn(q, one, k, one, v, one, rms_w_q, rms_w_k,
+                                     inv_freq)
 
 
 def _convrot_linear(op, x, weight, weight_scale, bias, out_dtype, gemm_config, w4a4):

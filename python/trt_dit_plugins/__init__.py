@@ -35,6 +35,7 @@ __all__ = [
     "stochastic_rounding_fp8",
     "block_sparse_sage2_attn",
     "fused_int8_rope_sage_attn",
+    "fused_rope_sage_attn",
     "convrot_linear",
     "convrot_linear_w4a4",
 ]
@@ -52,6 +53,7 @@ def __getattr__(name: str):
         "stochastic_rounding_fp8",
         "block_sparse_sage2_attn",
         "fused_int8_rope_sage_attn",
+        "fused_rope_sage_attn",
         "convrot_linear",
         "convrot_linear_w4a4",
     ):
