@@ -111,11 +111,8 @@ def _graph():
     q, k, v = S.add_convrot_linear(
         g, xa, wq, wq_s, bq, out_layout="bhsd", qkv_heads=H, head_dim=D)
     qo, ko = S.add_rms_rope_split_half(g, q, k, fq, qs, ks)
-    attn = S.add_int8_attention(g, qo, ko, v)
-    toks = gs.Variable("attn_tokens", dtype="bfloat16", shape=[1, 256, C])
-    g.nodes.append(gs.Node("Transpose", inputs=[attn], outputs=[toks],
-                           attrs={"perm": [0, 2, 1, 3]}, name="attn_to_tokens"))
-    y = S.add_convrot_linear(g, toks, wo, wo_s, bo)
+    attn = S.add_int8_attention(g, qo, ko, v, out_layout="bsc")
+    y = S.add_convrot_linear(g, attn, wo, wo_s, bo)
     g.outputs = [y]
     return g
 
@@ -128,9 +125,8 @@ def test_fused_block_graph_has_no_layout_glue():
     assert ops.count("rms_rope_split_half") == 1
     assert ops.count("int8_attention") == 1
     assert ops.count("layer_norm_adaln") == 1
-    # Only the attention-output store is still a transpose; the QKV/rope
-    # region is entirely head-major.
-    assert ops.count("Transpose") == 1
+    # Attention stores token-major directly; no layout glue anywhere.
+    assert ops.count("Transpose") == 0
     assert not [n for n in g.nodes
                 if n.op in ("LayerNormalization", "RMSNormalization", "Mul",
                             "Reshape", "ScatterElements")]

@@ -26,9 +26,19 @@ def _require_cuda(*tensors: Any) -> Any:
     return dev
 
 
-def int8_attention(q, k, v):
+def _attn_out_shape(q, out_layout):
+    if out_layout == "bhsd":
+        return tuple(q.shape)
+    if out_layout == "bsc":
+        b, h, s, d = q.shape
+        return (b, s, h * d)
+    raise ValueError('out_layout must be "bhsd" or "bsc"')
+
+
+def int8_attention(q, k, v, *, out_layout="bhsd"):
     """INT8 Q/K/V attention. q,k,v: BF16/FP16/FP32 CUDA [B,H,S,D], D in (64,128,256).
 
+    out_layout="bsc" returns [B,S,H*D] (attention epilogue store, no Transpose).
     Output dtype: BF16 for FP32 input, else input dtype.
     """
     import torch
@@ -43,12 +53,13 @@ def int8_attention(q, k, v):
     outs = E.run_plugin(
         PluginOp.INT8_ATTENTION,
         {"q": q, "k": k, "v": v},
-        [("o", otype, tuple(q.shape))],
+        [("o", otype, _attn_out_shape(q, out_layout))],
+        {"out_layout": int(out_layout == "bsc")},
     )
     return outs["o"]
 
 
-def sage_attn(q, k, v, fp8_pv=False):
+def sage_attn(q, k, v, fp8_pv=False, *, out_layout="bhsd"):
     """Plain dense SageAttention. q: BF16/FP16/FP32 CUDA [B,Hq,Sq,D];
     k,v: same dtype, [B,Hkv,Sk,D] with Hq % Hkv == 0 (GQA ok), D in
     (64,128,256). FP8 inputs are rejected (no kernel consumes them natively).
@@ -57,6 +68,7 @@ def sage_attn(q, k, v, fp8_pv=False):
     fp8_pv=True opts into the FP8-PV dense SageAttention2 path, valid only
     on sm89 with D in (64,128), square S % 128 == 0 and FP16/BF16 inputs
     (measured slower than tactic0 for dense shapes; opt-in for experiments).
+    out_layout="bsc" returns [B,Sq,Hq*D].
     Output dtype: BF16 for FP32 input, else input dtype.
     """
     import torch
@@ -75,8 +87,8 @@ def sage_attn(q, k, v, fp8_pv=False):
     outs = E.run_plugin(
         PluginOp.SAGE_ATTN,
         {"q": q, "k": k, "v": v},
-        [("o", otype, tuple(q.shape))],
-        {"fp8_pv": int(bool(fp8_pv))},
+        [("o", otype, _attn_out_shape(q, out_layout))],
+        {"fp8_pv": int(bool(fp8_pv)), "out_layout": int(out_layout == "bsc")},
     )
     return outs["o"]
 
@@ -205,12 +217,13 @@ def stochastic_rounding_fp8(x, rng, alias_rng=False):
     return outs["o"]
 
 
-def block_sparse_sage2_attn(q, k, v, mask, scale=0.0, pvthreshd=50.0, attention_sink=0):
+def block_sparse_sage2_attn(q, k, v, mask, scale=0.0, pvthreshd=50.0,
+                            attention_sink=0, *, out_layout="bhsd"):
     """Block-sparse SageAttention2 (sm89; kernel from SpargeAttn, see NOTICE).
     q,k,v: [B,H,S,D] f16/bf16, D in (64,128), S % 128 == 0;
     mask: int32 [B,H,S//128,S//64] (all-ones = dense).
 
-    scale=0 selects 1/sqrt(D). Returns o with q's shape/dtype.
+    scale=0 selects 1/sqrt(D). out_layout="bsc" returns [B,S,H*D].
     """
     _require_cuda(q, k, v, mask)
     import torch
@@ -227,22 +240,24 @@ def block_sparse_sage2_attn(q, k, v, mask, scale=0.0, pvthreshd=50.0, attention_
     outs = E.run_plugin(
         PluginOp.BLOCK_SPARSE_SAGE2_ATTN,
         {"q": q, "k": k, "v": v, "m": mask},
-        [("o", q.dtype, tuple(q.shape))],
+        [("o", q.dtype, _attn_out_shape(q, out_layout))],
         {"scale": float(scale), "pvthreshd": float(pvthreshd),
-         "attention_sink": int(attention_sink)},
+         "attention_sink": int(attention_sink),
+         "out_layout": int(out_layout == "bsc")},
     )
     return outs["o"]
 
 
 def fused_int8_rope_sage_attn(q_i8, q_scale, k_i8, k_scale, v_i8, v_scale,
-                               rms_w_q, rms_w_k, inv_freq):
+                               rms_w_q, rms_w_k, inv_freq, *, out_layout="bhsd"):
     """RoPE+SageAttn fused DiT-self (D=128 only).
 
     q_i8/k_i8/v_i8: int8 or f32/f16/bf16 CUDA [B,H,S,128] (identical shapes
     and dtype). INT8 inputs are dequantized with the per-tensor scales; float
     inputs skip that stage (scales unused). q_scale/k_scale/v_scale:
     single-element fp32 CUDA tensors. rms_w_q/rms_w_k: fp32/bf16 CUDA [128]
-    (same dtype). inv_freq: fp32 CUDA [64]. Returns bf16 [B,H,S,128].
+    (same dtype). inv_freq: fp32 CUDA [64]. out_layout="bsc" returns
+    bf16 [B,S,H*128]; default bf16 [B,H,S,128].
     """
     _require_cuda(q_i8, q_scale, k_i8, k_scale, v_i8, v_scale, rms_w_q, rms_w_k,
                   inv_freq)
@@ -267,12 +282,13 @@ def fused_int8_rope_sage_attn(q_i8, q_scale, k_i8, k_scale, v_i8, v_scale,
         PluginOp.FUSED_INT8_ROPE_SAGE_ATTN,
         {"q": q_i8, "qs": q_scale, "k": k_i8, "ks": k_scale, "v": v_i8,
          "vs": v_scale, "qn": rms_w_q, "kn": rms_w_k, "inv": inv_freq},
-        [("o", torch.bfloat16, tuple(q_i8.shape))],
+        [("o", torch.bfloat16, _attn_out_shape(q_i8, out_layout))],
+        {"out_layout": int(out_layout == "bsc")},
     )
     return outs["o"]
 
 
-def fused_rope_sage_attn(q, k, v, rms_w_q, rms_w_k, inv_freq):
+def fused_rope_sage_attn(q, k, v, rms_w_q, rms_w_k, inv_freq, *, out_layout="bhsd"):
     """Float-input variant: linear output feeds the fused op directly.
 
     q/k/v f32/f16/bf16 [B,H,S,128] (no QuantizeLinear/calibration needed).
@@ -281,7 +297,7 @@ def fused_rope_sage_attn(q, k, v, rms_w_q, rms_w_k, inv_freq):
 
     one = torch.ones(1, device=q.device, dtype=torch.float32)
     return fused_int8_rope_sage_attn(q, one, k, one, v, one, rms_w_q, rms_w_k,
-                                     inv_freq)
+                                     inv_freq, out_layout=out_layout)
 
 
 _EPILOGUE = {"none": 0, "gelu": 1, "silu": 2}

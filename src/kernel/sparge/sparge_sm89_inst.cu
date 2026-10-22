@@ -95,18 +95,18 @@ void sparge_launch_sm89(int8_t* q_i8, int8_t* k_i8, __nv_fp8_e4m3* v_fp8, DTypeO
 
 extern "C" void launch_block_sparse_sage2_sm89(
     int8_t* q_i8, int8_t* k_i8, void* v_fp8, void* o, int32_t* lut, int32_t* vbn, float* pv_thr,
-    float* q_s, float* k_s, float* v_s, int B, int Hq, int Hkv, int S, int D, int is_bf16, float sm_scale,
-    cudaStream_t stream) {
+    float* q_s, float* k_s, float* v_s, int B, int Hq, int Hkv, int S, int D, int is_bf16,
+    uint32_t sb_o, uint32_t ss_o, uint32_t sh_o, float sm_scale, cudaStream_t stream) {
     // Lazy per-module driver workaround (see prime.cu), same as preprocess.
     static std::atomic<bool> primed{false};
     if (!primed.exchange(true)) ck_prime_once(stream);
     const int P = (S + 127) / 128 * 128;
-    // Strides in elements for contiguous BHSD (q/k/o) and BHDP (v).
+    // Strides in elements for contiguous BHSD (q/k) and BHDP (v).
     // NOTE: seq stride is D (torch layout-1 stride(2)), not S*D.
+    // Output strides come from the wrapper: BHSD or BSC (epilogue store).
     const uint32_t sb_q = (uint32_t)Hq * S * D, ss_q = (uint32_t)D, sh_q = (uint32_t)S * D;
     const uint32_t sb_k = (uint32_t)Hkv * S * D, ss_k = ss_q, sh_k = sh_q;
     const uint32_t sb_v = (uint32_t)Hkv * D * P, sh_v = (uint32_t)D * P, sd_v = (uint32_t)P;
-    const uint32_t sb_o = sb_q, ss_o = ss_q, sh_o = sh_q;
     if (D == 64 && !is_bf16)
         sparge_launch_sm89<64, half>(q_i8, k_i8, (__nv_fp8_e4m3*)v_fp8, (half*)o, lut, vbn, pv_thr,
                                      q_s, k_s, v_s, B, Hq, Hkv, S, sm_scale, sb_q, ss_q, sh_q, sb_k,

@@ -13,6 +13,9 @@
   SageAttention, fused INT8 RoPE+SageAttention DiT-self, RMSNorm/LayerNorm
   AdaLN, single-tensor RMSNorm, RoPE variants, FP8 stochastic rounding,
   block-sparse SageAttention2 (sm89), ConvRot W8A8/W4A4 linear.
+- 0.7.0: `int8_attention`, `sage_attn`, `fused_int8_rope_sage_attn`, and
+  `block_sparse_sage2_attn` can write attention output directly as
+  `[B,S,C]` with `out_layout="bsc"`, removing the trailing Transpose.
 - Kernels from ComfyKitchen and SpargeAttn (see NOTICE and Kernel sources);
   handwritten TRT glue. Not affiliated with Comfy Org; ComfyKitchen
   compatibility is not a goal.
@@ -46,6 +49,7 @@ import torch, trt_dit_plugins as tdp
 q = torch.randn(1, 16, 4096, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn_like(q); v = torch.randn_like(q)
 out = tdp.int8_attention(q, k, v)          # engines are built once, then cached
+out = tdp.sage_attn(q, k, v, out_layout="bsc")  # [B,S,C], no trailing Transpose
 
 out = tdp.rms_adaln(x, scale, shift)       # eps=1e-6 by default
 qo, ko = tdp.apply_rope(q, k, freqs)
@@ -58,9 +62,9 @@ out = tdp.fused_rope_sage_attn(q, k, v, rms_w_q, rms_w_k, inv_freq)
 
 ```bash
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.6.0-cu13/trt_dit_plugins-0.6.0-py3-none-linux_x86_64.whl   # Linux
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.7.0-cu13/trt_dit_plugins-0.7.0-py3-none-linux_x86_64.whl   # Linux
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.6.0-cu13/trt_dit_plugins-0.6.0-py3-none-win_amd64.whl      # Windows
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.7.0-cu13/trt_dit_plugins-0.7.0-py3-none-win_amd64.whl      # Windows
 ```
 
 ## Quick Start
@@ -83,16 +87,16 @@ input and optional `weight` / `residual` / `gate`.
 
 | TRT name (`dit-plugins::*`) | Op | I/O dtypes | Status |
 |---|---|---|---|
-| `int8_attention` | INT8 Q/K/V attention (SageAttention), D ∈ {64,128,256} | in f32/f16/bf16 → out f16/bf16 (f32→bf16) | cos=0.99990, 0.910 ms/layer @ S=4096,H=16,D=128 (RTX 4070 Ti) |
-| `sage_attn` | Plain dense SageAttention, GQA ok, D ∈ {64,128,256} (new in 0.4.0) | in f32/f16/bf16 (FP8 inputs rejected) → out f16/bf16 (f32→bf16) | sm89+D∈{64,128}+S%128==0: FP8-PV Sage2 tactic (cos=0.99925, opt-in via `fp8_pv=1`); else portable FP16-PV (cos=0.99927) |
+| `int8_attention` | INT8 Q/K/V attention (SageAttention), D ∈ {64,128,256}; `out_layout="bsc"` since 0.7.0 | in f32/f16/bf16 → out f16/bf16 (f32→bf16), or `[B,S,C]` | cos=0.99990, 0.910 ms/layer @ S=4096,H=16,D=128 (RTX 4070 Ti) |
+| `sage_attn` | Plain dense SageAttention, GQA ok, D ∈ {64,128,256} (new in 0.4.0); `out_layout="bsc"` since 0.7.0 | in f32/f16/bf16 (FP8 inputs rejected) → out f16/bf16 (f32→bf16), or `[B,S,C]` | sm89+D∈{64,128}+S%128==0: FP8-PV Sage2 tactic (cos=0.99925, opt-in via `fp8_pv=1`); else portable FP16-PV (cos=0.99927) |
 | `rms_adaln` | Fused RMSNorm AdaLN; 2D/3D x, broadcast modulation, optional weight / residual+gate | f32/f16/bf16 in+out (uniform); modulation one dtype | cos=1.0 |
 | `layer_norm_adaln` | Fused LayerNorm AdaLN (new in 0.6.0), same I/O and residual+gate as `rms_adaln` | f32/f16/bf16 in+out (uniform); modulation one dtype | cos=1.0 |
 | `rms_norm` | Single-tensor RMSNorm; `layout="bshd"` also emits the BHSD view (new in 0.6.0) | x f16/bf16 → same; weight f32/f16/bf16 | cos=1.0 |
 | `apply_rope` | Strided (copy-free) RoPE, D even | f16/bf16 in+out; freqs f32/f16/bf16 | cos=1.0 |
 | `rms_rope_split_half` | Fused RMSNorm + split-half/partial RoPE, D multiple of 32; dynamic B/S, `rot_dim=-1` = RMS-only (new in 0.6.0) | f16/bf16 in+out; freqs/scales f32/f16/bf16 | cos=1.0 |
 | `stochastic_round_fp8` | Stochastic rounding to FP8 E4M3 | in f32/f16/bf16, rng INT32 → out FP8 | exact match |
-| `block_sparse_sage2_attn` | Block-sparse SageAttention2, sm89 only (kernel: SpargeAttn) | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] | cos=0.99953 |
-| `fused_int8_rope_sage_attn` | Fused RoPE+SageAttention DiT-self, D=128 (new in 0.4.0) | in INT8 [B,H,S,128] + FP32 scales, or f32/f16/bf16 [B,H,S,128] (scales ignored; `fused_rope_sage_attn`) + norms → out BF16 | cos=0.99855 vs fp32 eager (matched rotation), 1.578 ms/layer @ S=4096,H=16 (1.29x vs separation; 1.12x @ S=9216, RTX 4070 Ti) |
+| `block_sparse_sage2_attn` | Block-sparse SageAttention2, sm89 only (kernel: SpargeAttn); `out_layout="bsc"` since 0.7.0 | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] → `[B,S,C]` with BSC | cos=0.99953 |
+| `fused_int8_rope_sage_attn` | Fused RoPE+SageAttention DiT-self, D=128 (new in 0.4.0); `out_layout="bsc"` since 0.7.0 | in INT8 [B,H,S,128] + FP32 scales, or f32/f16/bf16 [B,H,S,128] (scales ignored; `fused_rope_sage_attn`) + norms → out BF16, or `[B,S,C]` | cos=0.99855 vs fp32 eager (matched rotation), 1.578 ms/layer @ S=4096,H=16 (1.29x vs separation; 1.12x @ S=9216, RTX 4070 Ti) |
 | `convrot_linear` | ConvRot W8A8 dynamic-quant linear (INT8 weight, online Hadamard rotation); 0.6.0 adds GELU/SiLU + residual+gate epilogue and BHSD/QKV output | x f16/bf16/f32, weight INT8 [N,K], scale FP32 [N], bias [N] → f16/bf16/f32 or `[B,H,S,D]` ×3 | bit-exact vs comfy-kitchen (max_abs=0); epilogue/layout covered by GPU tests |
 | `convrot_linear_w4a4` | ConvRot W4A4 linear (packed signed INT4 weight [N,K/2], INT4 activation) | x f16/bf16/f32, weight INT8 packed [N,K/2], scale FP32 [N], bias [N] → f16/bf16/f32 | bit-exact vs comfy-kitchen (max_abs=0) |
 

@@ -21,4 +21,5 @@ extern "C" void launch_sparge_preprocess(const void* q, const void* k, const voi
 extern "C" void launch_block_sparse_sage2_sm89(int8_t* q_i8, int8_t* k_i8, void* v_fp8, void* o,
                                                int32_t* lut, int32_t* vbn, float* pv_thr, float* q_s,
                                                float* k_s, float* v_s, int B, int Hq, int Hkv, int S,
-                                               int D, int is_bf16, float sm_scale, cudaStream_t stream);
+                                               int D, int is_bf16, uint32_t sb_o, uint32_t ss_o,
+                                               uint32_t sh_o, float sm_scale, cudaStream_t stream);

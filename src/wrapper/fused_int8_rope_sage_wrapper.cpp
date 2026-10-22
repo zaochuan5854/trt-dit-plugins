@@ -18,6 +18,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 
 #include "rt.h"
@@ -114,6 +115,9 @@ class FusedInt8RopeSageAttn : public nvinfer1::IPluginV3,
                               public nvinfer1::IPluginV3OneBuild,
                               public nvinfer1::IPluginV3OneRuntime {
 public:
+    explicit FusedInt8RopeSageAttn(int32_t outLayout = 0)
+        : outLayout_(outLayout) {}
+
     nvinfer1::IPluginCapability *getCapabilityInterface(
         nvinfer1::PluginCapabilityType type) noexcept override {
         if (type == nvinfer1::PluginCapabilityType::kCORE)
@@ -154,10 +158,18 @@ public:
 
     int32_t getOutputShapes(nvinfer1::DimsExprs const *in, int32_t nbIn,
         nvinfer1::DimsExprs const *, int32_t, nvinfer1::DimsExprs *out,
-        int32_t nbOut, nvinfer1::IExprBuilder &) noexcept override {
+        int32_t nbOut, nvinfer1::IExprBuilder &b) noexcept override {
         if (nbIn != kNbIn || nbOut != 1)
             return -1;
-        out[0] = in[kQ]; // [B,H,S,D] passthrough
+        if (outLayout_ == 1) {
+            out[0].nbDims = 3;
+            out[0].d[0] = in[kQ].d[0];
+            out[0].d[1] = in[kQ].d[2];
+            out[0].d[2] = b.operation(nvinfer1::DimensionOperation::kPROD,
+                *in[kQ].d[1], *in[kQ].d[3]);
+        } else {
+            out[0] = in[kQ]; // [B,H,S,D] passthrough
+        }
         return 0;
     }
 
@@ -294,11 +306,12 @@ public:
             const int64_t sb_q = (int64_t)H_ * L_ * D_, sh_q = (int64_t)L_ * D_;
             const int64_t v_bz = (int64_t)H_ * D_ * p.padded_L,
                           v_h = (int64_t)D_ * p.padded_L;
+            dit::AttnOutStrides os = dit::attnOutStrides(outLayout_, B_, H_, L_, D_);
             launch_sage_attn_kernel(w + p.off_qi, w + p.off_ki, w + p.off_vi,
                 out[0], w + p.off_qs, w + p.off_ks, w + p.off_vs, nullptr, 0,
                 0, 0, 0, -1, p.cta_k, B_, L_, L_, H_, H_, D_, (int)sb_q, D_,
                 (int)sh_q, (int)sb_q, D_, (int)sh_q, (int)v_bz, (int)v_h,
-                p.padded_L, (int)sb_q, D_, (int)sh_q, smScale_, 2, stream);
+                p.padded_L, (int)os.b, (int)os.s, (int)os.h, smScale_, 2, stream);
             return 0;
         } catch (...) {
             return -1;
@@ -311,8 +324,9 @@ public:
     }
 
     nvinfer1::PluginFieldCollection const *getFieldsToSerialize() noexcept override {
-        fc_.nbFields = 0;
-        fc_.fields = nullptr;
+        fields_[0] = {"out_layout", &outLayout_, nvinfer1::PluginFieldType::kINT32, 1};
+        fc_.nbFields = 1;
+        fc_.fields = fields_;
         return &fc_;
     }
 
@@ -322,30 +336,46 @@ public:
             "fused_int8_rope_sage_attn/1/f16",
             "fused_int8_rope_sage_attn/1/bf16",
             "fused_int8_rope_sage_attn/1/f32"};
-        return kIds[inCode_ & 3];
+        static const char *kBscIds[] = {
+            "fused_int8_rope_sage_attn/1/i8;bsc",
+            "fused_int8_rope_sage_attn/1/f16;bsc",
+            "fused_int8_rope_sage_attn/1/bf16;bsc",
+            "fused_int8_rope_sage_attn/1/f32;bsc"};
+        return outLayout_ == 1 ? kBscIds[inCode_ & 3] : kIds[inCode_ & 3];
     }
 
 private:
     int B_ = 0, H_ = 0, L_ = 0, D_ = 0, normCode_ = 0, inCode_ = 0;
+    int32_t outLayout_ = 0;
     float smScale_ = 0;
     WsPlan plan_{};
+    nvinfer1::PluginField fields_[1]{};
     nvinfer1::PluginFieldCollection fc_{};
 };
 
 class FusedCreator : public nvinfer1::IPluginCreatorV3One {
 public:
     nvinfer1::IPluginV3 *createPlugin(nvinfer1::AsciiChar const *,
-        nvinfer1::PluginFieldCollection const *,
+        nvinfer1::PluginFieldCollection const *fc,
         nvinfer1::TensorRTPhase) noexcept override {
         try {
-            return new FusedInt8RopeSageAttn();
+            int32_t outLayout = 0;
+            if (fc)
+                for (int i = 0; i < fc->nbFields; ++i)
+                    if (std::strcmp(fc->fields[i].name, "out_layout") == 0 &&
+                        fc->fields[i].type == nvinfer1::PluginFieldType::kINT32)
+                        outLayout = *static_cast<int32_t const *>(fc->fields[i].data);
+            if (outLayout != 0 && outLayout != 1)
+                return nullptr;
+            return new FusedInt8RopeSageAttn(outLayout);
         } catch (...) {
             return nullptr;
         }
     }
     nvinfer1::PluginFieldCollection const *getFieldNames() noexcept override {
-        fc_.nbFields = 0;
-        fc_.fields = nullptr;
+        names_[0] = {"out_layout", nullptr, nvinfer1::PluginFieldType::kINT32, 1};
+        fc_.nbFields = 1;
+        fc_.fields = names_;
         return &fc_;
     }
     nvinfer1::AsciiChar const *getPluginName() const noexcept override {
@@ -359,6 +389,7 @@ public:
     }
 
 private:
+    nvinfer1::PluginField names_[1]{};
     nvinfer1::PluginFieldCollection fc_{};
 };
 

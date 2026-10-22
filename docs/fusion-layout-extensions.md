@@ -1,4 +1,4 @@
-# Fusion / layout extensions (0.6.0)
+# Fusion / layout extensions (0.7.0)
 
 Contract for the ops added for the Anima 2.9B ConvRot request
 (`trt-dit-plugins-fusion-request.md`). The Reforge engine comparison is the
@@ -48,6 +48,34 @@ external handoff gate; this repo verifies the op-level contracts only.
 - All new fields default to their legacy values, so existing serialized
   engines keep working (`PLUGIN_VERSION` stays `"1"`).
 
+## Attention output layout
+
+- `int8_attention`, `sage_attn`, `fused_int8_rope_sage_attn`, and
+  `block_sparse_sage2_attn` accept `out_layout="bhsd"` (default) or
+  `"bsc"` (`out_layout=1`).
+- `"bsc"` returns `[B,S,C]` (`C=H*D`) directly from the attention store;
+  no `Transpose` node is needed after attention. `"bhsd"` keeps the legacy
+  `[B,H,S,D]` shape.
+- `D` remains the contiguous dimension in both layouts. The store address
+  is `b*S*C + s*C + h*D + d` for BSC vs
+  `b*H*S*D + h*S*D + s*D + d` for BHSD, so vectorized stores are unchanged.
+- This is a runtime-stride epilogue (the kernel already takes batch/seq/head
+  output strides), not a second kernel or a layout pass.
+- `fp8_pv=1` and block-sparse also honor `out_layout="bsc"` through the
+  Sparge launcher.
+- Op-level RTX 4070 Ti check (B=1,H=16,S=4096,D=128): `int8_attention`
+  BHSD/BSC = 1.68/1.69 ms; `sage_attn` = 1.69/1.69 ms (run-to-run noise).
+- Layer-level `_gemm_mha_v2` gate: the native Anima 2.9B engine
+  (1024x1024, context 512, `IProfiler`) has 80 Attention layers: 40
+  self-attention at ~1.82 ms plus 40 cross-attention at ~0.235 ms,
+  total **82–85 ms** (ceiling 87 ms). A single-plugin `sage_attn`
+  engine with a preallocated BSC output measures **0.918 ms** at
+  S=4096 (self) and **0.163 ms** at Sq=4096/Sk=512 (cross), so 80
+  layers = **43.2 ms**; replacing self-attention only is **46.1 ms**.
+  These are layer-level proxies; the official full-engine gate still
+  needs the Reforge graph with the plugin and the trailing Transpose
+  removed.
+
 ## Measured op timings
 
 RTX 4070 Ti, TensorRT 11.3 container. Op-level calls through the Python
@@ -89,16 +117,24 @@ PYTHONPATH=python TRT_DIT_LIBDIR=build python -m pytest python/tests/test_fusion
 `test_fusion_e2e.py` pins dynamic `B`/`S` (1x256, 1x4096, 2x4096), the
 identity-rotation RMS parity, attention composition, determinism, and a
 5-node graph (AdaLN -> QKV -> rope -> attention -> out) with no layout glue.
+`test_gpu.py::test_attention_out_layout` checks that the BSC store is
+bit-identical to the BHSD store followed by transpose+reshape for
+`int8_attention`, `sage_attn`, `fp8_pv`, and block-sparse attention.
+
+Known pre-existing limit: `fused_int8_rope_sage_attn` uses float
+`atomicAdd` in its K-mean prepass, so repeated runs can differ by one bf16
+ULP at B>=2/S>=512. This is identical in BHSD and BSC and is not caused by
+the layout epilogue; its BSC/BHSD cosine is >0.999999. The other three
+attention ops are bit-stable.
 
 ## Deferred
 
-Attention epilogue (`[B,H,S,D]` -> `[B,S,C]` store inside the attention
-plugin, request 4.4) is not implemented. The engine can keep one
-`Transpose` after attention; the rope/QKV region has none.
+None for the 0.7.0 layout contract. W4A4 still rejects
+`epilogue`/`residual`/`out_layout`/QKV fields (0.6.0 behavior).
 
 ## Release gate
 
 - Op-level tests: pass on the RTX 4070 Ti (sm89).
 - External Anima engine: `cos` at or above the existing gate, layer count
   < 1000, E2E <= 220 ms, no `Transpose` in the rope/QKV region. Until that
-  is measured, 0.6.0 is "op-level verified, engine gate pending".
+  is measured, 0.7.0 is "op-level verified, engine gate pending".

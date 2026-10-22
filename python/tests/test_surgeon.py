@@ -336,6 +336,25 @@ def test_add_sage_attn():
     assert S.validate_plugin_nodes(g) == []
 
 
+def test_attention_out_layout_bsc():
+    B, Hq, Hkv, Sv, D = 1, 4, 2, 256, 128
+    q = gs.Variable("q", dtype=F32, shape=[B, Hq, Sv, D])
+    k = gs.Variable("k", dtype=F32, shape=[B, Hkv, Sv, D])
+    v = gs.Variable("v", dtype=F32, shape=[B, Hkv, Sv, D])
+    g = gs.Graph(nodes=[], inputs=[q, k, v], outputs=[])
+    o = S.add_sage_attn(g, q, k, v, out_layout="bsc")
+    g.outputs = [o]
+    g.cleanup().toposort()
+    assert o.shape == [B, Sv, Hq * D]
+    assert S.validate_plugin_nodes(g) == []
+    g2 = gs.Graph(nodes=[], inputs=[q, k, v], outputs=[])
+    o2 = S.add_int8_attention(g2, q, k, v, out_layout="bsc")
+    g2.outputs = [o2]
+    g2.cleanup().toposort()
+    assert o2.shape == [B, Sv, Hq * D]
+    assert S.validate_plugin_nodes(g2) == []
+
+
 def test_sage_attn_validation():
     B, H, Sv, D = 1, 2, 256, 128
     q = gs.Variable("q", dtype=F32, shape=[B, H, Sv, D])

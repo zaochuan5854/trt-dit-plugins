@@ -51,16 +51,16 @@ _uid = itertools.count()
 # op -> (n_inputs, n_outputs, field names). Ranks/shapes are checked in
 # validate_plugin_nodes where statically known; dtypes resolve at TRT build.
 _SPECS: dict[str, tuple[int, int, frozenset[str]]] = {
-    PluginOp.INT8_ATTENTION: (3, 1, frozenset()),
-    PluginOp.SAGE_ATTN: (3, 1, frozenset({"fp8_pv"})),
+    PluginOp.INT8_ATTENTION: (3, 1, frozenset({"out_layout"})),
+    PluginOp.SAGE_ATTN: (3, 1, frozenset({"fp8_pv", "out_layout"})),
     PluginOp.RMS_ADALN: (3, 1, frozenset({"eps", "has_weight", "residual_gate"})),
     PluginOp.LAYER_NORM_ADALN: (3, 1, frozenset({"eps", "has_weight", "residual_gate"})),
     PluginOp.APPLY_ROPE: (3, 2, frozenset()),
     PluginOp.RMS_ROPE_SPLIT_HALF: (5, 2, frozenset({"epsilon", "rot_dim"})),
     PluginOp.RMS_NORM: (2, 1, frozenset({"eps", "in_layout"})),
     PluginOp.STOCHASTIC_ROUND_FP8: (2, 1, frozenset({"alias_rng"})),
-    PluginOp.BLOCK_SPARSE_SAGE2_ATTN: (4, 1, frozenset({"scale", "pvthreshd", "attention_sink"})),
-    PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: (9, 1, frozenset()),
+    PluginOp.BLOCK_SPARSE_SAGE2_ATTN: (4, 1, frozenset({"scale", "pvthreshd", "attention_sink", "out_layout"})),
+    PluginOp.FUSED_INT8_ROPE_SAGE_ATTN: (9, 1, frozenset({"out_layout"})),
     PluginOp.CONVROT_LINEAR: (4, 1, frozenset({"group_size", "has_bias", "out_dtype", "gemm_config", "epilogue", "residual_gate", "out_layout", "qkv_heads", "head_dim"})),
     PluginOp.CONVROT_LINEAR_W4A4: (4, 1, frozenset({"group_size", "has_bias", "out_dtype", "gemm_config", "epilogue", "residual_gate", "out_layout", "qkv_heads", "head_dim"})),
 }
@@ -80,9 +80,10 @@ def _gs():
     return gs
 
 
-def _like(ref, name: str | None = None, dtype=None):
+def _like(ref, name: str | None = None, dtype=None, shape=None):
     gs = _gs()
-    shape = list(ref.shape) if ref.shape is not None else None
+    if shape is None:
+        shape = list(ref.shape) if ref.shape is not None else None
     # ONNX forbids empty tensor names; always emit a unique one by default.
     return gs.Variable(name or f"dit_out{next(_uid)}",  # type: ignore[arg-type]
                        dtype=dtype if dtype is not None else ref.dtype, shape=shape)
@@ -98,19 +99,35 @@ def _plugin_node(graph, op: str, inputs, outputs, fields: dict[str, Any] | None 
     return node
 
 
+def _attn_out(q, out_layout, dtype=None):
+    """Attention output variable: BHSD passthrough or BSC epilogue store."""
+    if out_layout == "bhsd":
+        return _like(q, dtype=dtype)
+    if out_layout != "bsc":
+        raise ValueError('out_layout must be "bhsd" or "bsc"')
+    if q.shape is None or any(not isinstance(x, int) for x in q.shape):
+        raise ValueError("out_layout='bsc' needs static B,H,S,D")
+    b, h, s, d = q.shape
+    return _like(q, dtype=dtype, shape=[b, s, h * d])
+
+
 # --- 7 plugin constructors (explicit, exporter-independent) ---
 
-def add_int8_attention(graph, q, k, v, name=None):
-    """q,k,v: [B,H,S,D] variables. Returns o (same shape/dtype as q)."""
-    return _plugin_node(graph, PluginOp.INT8_ATTENTION, [q, k, v], [_like(q)], name=name).outputs[0]
+def add_int8_attention(graph, q, k, v, name=None, *, out_layout="bhsd"):
+    """q,k,v: [B,H,S,D] variables. out_layout='bsc' returns [B,S,H*D]."""
+    return _plugin_node(graph, PluginOp.INT8_ATTENTION, [q, k, v],
+                        [_attn_out(q, out_layout)],
+                        {"out_layout": int(out_layout == "bsc")}, name=name).outputs[0]
 
 
-def add_sage_attn(graph, q, k, v, fp8_pv=False, name=None):
+def add_sage_attn(graph, q, k, v, fp8_pv=False, name=None, *, out_layout="bhsd"):
     """Plain dense SageAttention. q,k,v: [B,H,S,D] f32/f16/bf16 variables
     (GQA: Hq % Hkv == 0 allowed). fp8_pv opts into the FP8-PV dense Sage2
-    path (sm89-only, validated at build). Returns o (same shape as q)."""
-    fields = {"fp8_pv": int(bool(fp8_pv))} if fp8_pv else None
-    return _plugin_node(graph, PluginOp.SAGE_ATTN, [q, k, v], [_like(q)], fields, name=name).outputs[0]
+    path (sm89-only, validated at build). out_layout='bsc' returns [B,S,H*D]."""
+    fields = {"fp8_pv": int(bool(fp8_pv))} if fp8_pv else {}
+    fields["out_layout"] = int(out_layout == "bsc")
+    return _plugin_node(graph, PluginOp.SAGE_ATTN, [q, k, v],
+                        [_attn_out(q, out_layout)], fields, name=name).outputs[0]
 
 
 def _add_adaln(op, graph, x, scale, shift, eps=1e-6, name=None):
@@ -164,11 +181,13 @@ def add_stochastic_round_fp8(graph, x, r, alias_rng=0, name=None):
 
 
 def add_block_sparse_sage2_attn(graph, q, k, v, m, scale=0.0, pvthreshd=50.0,
-                                attention_sink=0, name=None):
+                                attention_sink=0, name=None, *, out_layout="bhsd"):
     """m: INT32 [B,H,S//128,S//64]. scale=0 selects 1/sqrt(D)."""
-    return _plugin_node(graph, PluginOp.BLOCK_SPARSE_SAGE2_ATTN, [q, k, v, m], [_like(q)],
+    return _plugin_node(graph, PluginOp.BLOCK_SPARSE_SAGE2_ATTN, [q, k, v, m],
+                        [_attn_out(q, out_layout)],
                         {"scale": float(scale), "pvthreshd": float(pvthreshd),
-                         "attention_sink": int(attention_sink)}, name=name).outputs[0]
+                         "attention_sink": int(attention_sink),
+                         "out_layout": int(out_layout == "bsc")}, name=name).outputs[0]
 
 
 def add_convrot_linear(graph, x, weight, weight_scale, bias, *, w4a4=False,
@@ -298,7 +317,7 @@ def import_comfy_convrot(graph, *, gemm_config=-1):
 
 def add_dit_self_fused_attn(graph, q_i8, q_scale, k_i8, k_scale, v_i8,
                             v_scale, rms_w_q, rms_w_k, inv_freq, name=None,
-                            out_dtype=None):
+                            out_dtype=None, *, out_layout="bhsd"):
     """DiT-self int8 RoPE+Sage fused (D=128).
 
     q_i8/k_i8/v_i8: INT8 [B,H,S,128]; q_scale/k_scale/v_scale: FP32 scalar;
@@ -311,12 +330,13 @@ def add_dit_self_fused_attn(graph, q_i8, q_scale, k_i8, k_scale, v_i8,
     return _plugin_node(graph, PluginOp.FUSED_INT8_ROPE_SAGE_ATTN,
                         [q_i8, q_scale, k_i8, k_scale, v_i8, v_scale, rms_w_q,
                          rms_w_k, inv_freq],
-                        [_like(q_i8, dtype=out_dtype)], name=name).outputs[0]
+                        [_attn_out(q_i8, out_layout, dtype=out_dtype)],
+                        {"out_layout": int(out_layout == "bsc")}, name=name).outputs[0]
 
 
 def fuse_dit_self_attn_block(graph, *, q_i8, q_scale, k_i8, k_scale, v_i8,
                              v_scale, rms_w_q, rms_w_k, inv_freq, attn_out,
-                             name=None):
+                             name=None, out_layout="bhsd"):
     """Third surgery: collapse a post-rope-surgery self-attn block into one
     ``fused_int8_rope_sage_attn`` node (DiT-self, D=128).
 
@@ -349,6 +369,11 @@ def fuse_dit_self_attn_block(graph, *, q_i8, q_scale, k_i8, k_scale, v_i8,
                    (q_i8, q_scale, k_i8, k_scale, v_i8, v_scale, rms_w_q,
                     rms_w_k, inv_freq)]
     out_var = tensors[attn_out]
+    if out_layout not in ("bhsd", "bsc"):
+        raise ValueError('out_layout must be "bhsd" or "bsc"')
+    if out_var.shape is not None and len(out_var.shape) != (3 if out_layout == "bsc" else 4):
+        raise ValueError(f"{attn_out}: shape rank {len(out_var.shape)} does not match "
+                         f"out_layout={out_layout!r}")
     prods = list(out_var.inputs)
     if len(prods) != 1:
         raise ValueError(f"{attn_out}: want 1 producer, got {len(prods)}")
@@ -372,7 +397,8 @@ def fuse_dit_self_attn_block(graph, *, q_i8, q_scale, k_i8, k_scale, v_i8,
     # caller prunes afterwards (per-fuse cleanup would delete other
     # blocks' not-yet-consumed anchors, breaking multi-block fusion).
     node = _plugin_node(graph, PluginOp.FUSED_INT8_ROPE_SAGE_ATTN, anchor_vars,
-                        [out_var], name=name or f"fused_{attn_out}")
+                        [out_var], {"out_layout": int(out_layout == "bsc")},
+                        name=name or f"fused_{attn_out}")
     if node not in out_var.inputs:
         out_var.inputs.append(node)
     if attn in out_var.inputs:
@@ -1319,6 +1345,15 @@ def validate_plugin_nodes(graph) -> list[str]:
         extra = set(node.attrs) - {"plugin_version", "plugin_namespace"} - fields
         if extra:
             errs.append(f"{node.name or node.op}: unknown fields {sorted(extra)}")
+        ol = node.attrs.get("out_layout")
+        if ol is not None and ol not in (0, 1):
+            errs.append(f"{node.name or node.op}: out_layout={ol}, want 0/1")
+        if (ol == 1 and node.op in (PluginOp.INT8_ATTENTION, PluginOp.SAGE_ATTN,
+                                    PluginOp.BLOCK_SPARSE_SAGE2_ATTN,
+                                    PluginOp.FUSED_INT8_ROPE_SAGE_ATTN)
+                and node.outputs and node.outputs[0].shape is not None):
+            if len(node.outputs[0].shape) != 3:
+                errs.append(f"{node.name or node.op}: out_layout=1 wants [B,S,C]")
         if node.op == PluginOp.INT8_ATTENTION and node.inputs:
             d = _shape_of(node.inputs[0], 3)
             if d is not None and d not in (64, 128, 256):

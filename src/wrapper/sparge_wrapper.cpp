@@ -70,8 +70,8 @@ class BlockSparseSage2Attn : public nvinfer1::IPluginV3,
                              public nvinfer1::IPluginV3OneRuntime {
 public:
     BlockSparseSage2Attn() { (void)::dit::pinnedFloats(); }
-    BlockSparseSage2Attn(float scale, float pvthreshd, int32_t sink)
-        : scale_(scale), pvthreshd_(pvthreshd), sink_(sink) {
+    BlockSparseSage2Attn(float scale, float pvthreshd, int32_t sink, int32_t outLayout = 0)
+        : scale_(scale), pvthreshd_(pvthreshd), sink_(sink), outLayout_(outLayout) {
         (void)::dit::pinnedFloats();
     }
 
@@ -115,10 +115,18 @@ public:
 
     int32_t getOutputShapes(nvinfer1::DimsExprs const* in, int32_t nbIn,
         nvinfer1::DimsExprs const*, int32_t, nvinfer1::DimsExprs* out, int32_t nbOut,
-        nvinfer1::IExprBuilder&) noexcept override {
+        nvinfer1::IExprBuilder& b) noexcept override {
         if (nbIn != 4 || nbOut != 1)
             return -1;
-        out[0] = in[0];
+        if (outLayout_ == 1) {
+            out[0].nbDims = 3;
+            out[0].d[0] = in[0].d[0];
+            out[0].d[1] = in[0].d[2];
+            out[0].d[2] = b.operation(nvinfer1::DimensionOperation::kPROD,
+                *in[0].d[1], *in[0].d[3]);
+        } else {
+            out[0] = in[0];
+        }
         return 0;
     }
 
@@ -192,6 +200,7 @@ public:
             if (p.total == 0) // engine loaded without a shape change
                 p = plan_ = planWs(B_, Hq_, Hkv_, S_, D_);
             char* w = static_cast<char*>(ws);
+            dit::AttnOutStrides os = dit::attnOutStrides(outLayout_, B_, Hq_, S_, D_);
             float sm = scale_ > 0 ? scale_ : 1.0f / std::sqrt((float)D_);
             float* pvhost = ::dit::pinnedFloats();
             if (pvhost == nullptr)
@@ -212,7 +221,8 @@ public:
                 reinterpret_cast<int32_t*>(w + p.off_lut), reinterpret_cast<int32_t*>(w + p.off_vbn),
                 reinterpret_cast<float*>(w + p.off_pv), reinterpret_cast<float*>(w + p.off_qs),
                 reinterpret_cast<float*>(w + p.off_ks), reinterpret_cast<float*>(w + p.off_vs),
-                B_, Hq_, Hkv_, S_, D_, isBf16_ ? 1 : 0, sm, stream);
+                B_, Hq_, Hkv_, S_, D_, isBf16_ ? 1 : 0,
+                (uint32_t)os.b, (uint32_t)os.s, (uint32_t)os.h, sm, stream);
             return 0;
         } catch (...) {
             return -1;
@@ -227,21 +237,25 @@ public:
         fields_[0] = {"scale", &scale_, nvinfer1::PluginFieldType::kFLOAT32, 1};
         fields_[1] = {"pvthreshd", &pvthreshd_, nvinfer1::PluginFieldType::kFLOAT32, 1};
         fields_[2] = {"attention_sink", &sink_, nvinfer1::PluginFieldType::kINT32, 1};
-        fc_.nbFields = 3;
+        fields_[3] = {"out_layout", &outLayout_, nvinfer1::PluginFieldType::kINT32, 1};
+        fc_.nbFields = 4;
         fc_.fields = fields_;
         return &fc_;
     }
 
-    char const* getTimingCacheID() noexcept override { return "block_sparse_sage2_attn/1"; }
+    char const* getTimingCacheID() noexcept override {
+        return outLayout_ == 1 ? "block_sparse_sage2_attn/1;bsc" : "block_sparse_sage2_attn/1";
+    }
 
 private:
     static constexpr int kMaxHeads = 256;
     float scale_ = 0, pvthreshd_ = 50;
     int32_t sink_ = 0;
+    int32_t outLayout_ = 0;
     int B_ = 0, Hq_ = 0, Hkv_ = 0, S_ = 0, D_ = 0;
     bool isBf16_ = false;
     WsPlan plan_{};
-    nvinfer1::PluginField fields_[3]{};
+    nvinfer1::PluginField fields_[4]{};
     nvinfer1::PluginFieldCollection fc_{};
 };
 
@@ -251,7 +265,7 @@ public:
         nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase) noexcept override {
         try {
             float scale = 0, pvthreshd = 50;
-            int32_t sink = 0;
+            int32_t sink = 0, outLayout = 0;
             if (fc)
                 for (int i = 0; i < fc->nbFields; ++i) {
                     if (std::strcmp(fc->fields[i].name, "scale") == 0 && fc->fields[i].type == nvinfer1::PluginFieldType::kFLOAT32)
@@ -260,8 +274,12 @@ public:
                         pvthreshd = *static_cast<float const*>(fc->fields[i].data);
                     if (std::strcmp(fc->fields[i].name, "attention_sink") == 0 && fc->fields[i].type == nvinfer1::PluginFieldType::kINT32)
                         sink = *static_cast<int32_t const*>(fc->fields[i].data);
+                    if (std::strcmp(fc->fields[i].name, "out_layout") == 0 && fc->fields[i].type == nvinfer1::PluginFieldType::kINT32)
+                        outLayout = *static_cast<int32_t const*>(fc->fields[i].data);
                 }
-            return new BlockSparseSage2Attn(scale, pvthreshd, sink);
+            if (outLayout != 0 && outLayout != 1)
+                return nullptr;
+            return new BlockSparseSage2Attn(scale, pvthreshd, sink, outLayout);
         } catch (...) {
             return nullptr;
         }
@@ -270,7 +288,8 @@ public:
         names_[0] = {"scale", nullptr, nvinfer1::PluginFieldType::kFLOAT32, 1};
         names_[1] = {"pvthreshd", nullptr, nvinfer1::PluginFieldType::kFLOAT32, 1};
         names_[2] = {"attention_sink", nullptr, nvinfer1::PluginFieldType::kINT32, 1};
-        fc_.nbFields = 3;
+        names_[3] = {"out_layout", nullptr, nvinfer1::PluginFieldType::kINT32, 1};
+        fc_.nbFields = 4;
         fc_.fields = names_;
         return &fc_;
     }
@@ -279,7 +298,7 @@ public:
     nvinfer1::AsciiChar const* getPluginNamespace() const noexcept override { return kNamespace; }
 
 private:
-    nvinfer1::PluginField names_[3]{};
+    nvinfer1::PluginField names_[4]{};
     nvinfer1::PluginFieldCollection fc_{};
 };
 

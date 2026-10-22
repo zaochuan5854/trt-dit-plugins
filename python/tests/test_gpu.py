@@ -118,6 +118,12 @@ def test_dynamic_profile():
             tdp.PluginOp.SAGE_ATTN, {"q": q, "k": k, "v": v},
             [("o", torch.bfloat16, (B, H, S_, D))], profile=prof)["o"]
         assert _cos(out, ref) > 0.99
+        bsc = _engine.run_plugin(
+            tdp.PluginOp.SAGE_ATTN, {"q": q, "k": k, "v": v},
+            [("o", torch.bfloat16, (B, S_, H * D))], profile=prof,
+            fields={"out_layout": 1})["o"]
+        assert bsc.shape == (B, S_, H * D)
+        assert _cos(bsc, ref.transpose(1, 2).reshape(B, S_, H * D)) > 0.99
 
 
 def _rms_rope_ref(q, k, freqs, qs, ks, rot):
@@ -278,6 +284,46 @@ def test_fused_short_seq():
     qr, kr = tdp.rms_rope_split_half(qf, qf, fq, rw, rw)
     ref = tdp.sage_attn(qr, kr, qf)
     assert _cos(of, ref) > 0.99
+
+
+def test_attention_out_layout():
+    S_ = 512
+    q, k, v = _qkv(S_)
+    ref = tdp.sage_attn(q, k, v)
+    bsc = tdp.sage_attn(q, k, v, out_layout="bsc")
+    assert bsc.shape == (B, S_, H * D)
+    assert torch.equal(bsc, ref.transpose(1, 2).reshape(B, S_, H * D))
+
+    ref8 = tdp.int8_attention(q, k, v)
+    bsc8 = tdp.int8_attention(q, k, v, out_layout="bsc")
+    assert torch.equal(bsc8, ref8.transpose(1, 2).reshape(B, S_, H * D))
+
+    qi = torch.randint(-127, 127, (B, H, S_, D), device="cuda", dtype=torch.int8)
+    one = torch.full((1,), 0.02, device="cuda")
+    rw = torch.ones(D, device="cuda")
+    inv = torch.rand(64, device="cuda") * 0.05
+    reff = tdp.fused_int8_rope_sage_attn(qi, one, qi, one, qi, one, rw, rw, inv)
+    bscf = tdp.fused_int8_rope_sage_attn(qi, one, qi, one, qi, one, rw, rw, inv,
+                                         out_layout="bsc")
+    assert bscf.shape == (B, S_, H * D)
+    rf = reff.transpose(1, 2).reshape(B, S_, H * D)
+    # A wrong layout mapping would collapse the cosine, not nudge it;
+    # allow bf16-level run-to-run noise in the fused path.
+    assert _cos(bscf, rf) > 0.9999
+    assert torch.allclose(bscf.float(), rf.float(), atol=0.02, rtol=0.02)
+
+    if torch.cuda.get_device_capability() == (8, 9):
+        refp = tdp.sage_attn(q, k, v, fp8_pv=True)
+        bscp = tdp.sage_attn(q, k, v, fp8_pv=True, out_layout="bsc")
+        assert torch.equal(bscp, refp.transpose(1, 2).reshape(B, S_, H * D))
+
+        qb = q[:, :, :128].contiguous()
+        kb = k[:, :, :128].contiguous()
+        vb = v[:, :, :128].contiguous()
+        mask = torch.ones(B, H, 1, 2, dtype=torch.int32, device="cuda")
+        refb = tdp.block_sparse_sage2_attn(qb, kb, vb, mask)
+        bscb = tdp.block_sparse_sage2_attn(qb, kb, vb, mask, out_layout="bsc")
+        assert torch.equal(bscb, refb.transpose(1, 2).reshape(B, 128, H * D))
 
 
 def test_fused_float_input():

@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 extern "C" {
 void launch_quant_qk_per_thread_int8(const void* q, void* q_int8, void* q_scale,
@@ -83,6 +84,8 @@ class Int8Attention : public nvinfer1::IPluginV3,
                       public nvinfer1::IPluginV3OneCore,
                       public nvinfer1::IPluginV3OneBuild,
                       public nvinfer1::IPluginV3OneRuntime {
+    friend class Int8AttentionCreator;
+
 public:
     nvinfer1::IPluginCapability* getCapabilityInterface(
         nvinfer1::PluginCapabilityType type) noexcept override {
@@ -124,10 +127,18 @@ public:
 
     int32_t getOutputShapes(nvinfer1::DimsExprs const* in, int32_t nbIn,
         nvinfer1::DimsExprs const*, int32_t, nvinfer1::DimsExprs* out, int32_t nbOut,
-        nvinfer1::IExprBuilder&) noexcept override {
+        nvinfer1::IExprBuilder& b) noexcept override {
         if (nbIn != 3 || nbOut != 1)
             return -1;
-        out[0] = in[0]; // [B,H,S,D] passthrough
+        if (outLayout_ == 1) {
+            out[0].nbDims = 3;
+            out[0].d[0] = in[0].d[0];
+            out[0].d[1] = in[0].d[2];
+            out[0].d[2] = b.operation(nvinfer1::DimensionOperation::kPROD,
+                *in[0].d[1], *in[0].d[3]);
+        } else {
+            out[0] = in[0]; // [B,H,S,D] passthrough
+        }
         return 0;
     }
 
@@ -203,11 +214,12 @@ public:
             launch_quant_v_int8_kernel(in[2], w + p.off_vi, w + p.off_vs, B_, Hkv_,
                 Lk_, D_, p.padded_Lk, sb_v, sh_v, D_, inCode_, stream);
             int64_t v_bz = (int64_t)Hkv_ * D_ * p.padded_Lk, v_h = (int64_t)D_ * p.padded_Lk;
+            dit::AttnOutStrides os = dit::attnOutStrides(outLayout_, B_, Hq_, Lq_, D_);
             launch_sage_attn_kernel(w + p.off_qi, w + p.off_ki, w + p.off_vi, out[0],
                 w + p.off_qs, w + p.off_ks, w + p.off_vs, nullptr, 0, 0, 0, 0, -1,
                 p.cta_k, B_, Lq_, Lk_, Hq_, Hkv_, D_, (int)(sb_q), D_, (int)sh_q,
                 (int)(sb_k), D_, (int)(sh_k), (int)v_bz, (int)v_h, p.padded_Lk,
-                (int)(sb_q), D_, (int)(sh_q), smScale_, outCode_, stream);
+                (int)os.b, (int)os.s, (int)os.h, smScale_, outCode_, stream);
             return 0;
         } catch (...) {
             return -1;
@@ -219,33 +231,49 @@ public:
     }
 
     nvinfer1::PluginFieldCollection const* getFieldsToSerialize() noexcept override {
-        fc_.nbFields = 0;
-        fc_.fields = nullptr;
+        fields_[0] = {"out_layout", &outLayout_, nvinfer1::PluginFieldType::kINT32, 1};
+        fc_.nbFields = 1;
+        fc_.fields = fields_;
         return &fc_;
     }
 
-    char const* getTimingCacheID() noexcept override { return "int8_attention/1"; }
+    char const* getTimingCacheID() noexcept override {
+        return outLayout_ == 1 ? "int8_attention/1;bsc" : "int8_attention/1";
+    }
 
 private:
     int B_ = 0, Hq_ = 0, Lq_ = 0, Hkv_ = 0, Lk_ = 0, D_ = 0, inCode_ = 2, outCode_ = 2;
+    int32_t outLayout_ = 0;
     float smScale_ = 0;
     WsPlan plan_{};
+    nvinfer1::PluginField fields_[1]{};
     nvinfer1::PluginFieldCollection fc_{};
 };
 
 class Int8AttentionCreator : public nvinfer1::IPluginCreatorV3One {
 public:
     nvinfer1::IPluginV3* createPlugin(nvinfer1::AsciiChar const*,
-        nvinfer1::PluginFieldCollection const*, nvinfer1::TensorRTPhase) noexcept override {
+        nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase) noexcept override {
         try {
-            return new Int8Attention();
+            auto* p = new Int8Attention();
+            if (fc)
+                for (int i = 0; i < fc->nbFields; ++i)
+                    if (std::strcmp(fc->fields[i].name, "out_layout") == 0 &&
+                        fc->fields[i].type == nvinfer1::PluginFieldType::kINT32)
+                        p->outLayout_ = *static_cast<int32_t const*>(fc->fields[i].data);
+            if (p->outLayout_ != 0 && p->outLayout_ != 1) {
+                delete p;
+                return nullptr;
+            }
+            return p;
         } catch (...) {
             return nullptr;
         }
     }
     nvinfer1::PluginFieldCollection const* getFieldNames() noexcept override {
-        fc_.nbFields = 0;
-        fc_.fields = nullptr;
+        names_[0] = {"out_layout", nullptr, nvinfer1::PluginFieldType::kINT32, 1};
+        fc_.nbFields = 1;
+        fc_.fields = names_;
         return &fc_;
     }
     nvinfer1::AsciiChar const* getPluginName() const noexcept override { return kName; }
@@ -253,6 +281,7 @@ public:
     nvinfer1::AsciiChar const* getPluginNamespace() const noexcept override { return kNamespace; }
 
 private:
+    nvinfer1::PluginField names_[1]{};
     nvinfer1::PluginFieldCollection fc_{};
 };
 

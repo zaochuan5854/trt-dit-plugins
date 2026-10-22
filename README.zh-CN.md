@@ -12,6 +12,9 @@
   融合 INT8 RoPE+SageAttention DiT-self、RMSNorm/LayerNorm AdaLN、
   单张量 RMSNorm、RoPE 变体、FP8 随机舍入、block-sparse SageAttention2
   （仅 sm89）、ConvRot W8A8/W4A4 linear。
+- 0.7.0：`int8_attention`、`sage_attn`、`fused_int8_rope_sage_attn`、
+  `block_sparse_sage2_attn` 支持 `out_layout="bsc"`，attention 输出直接写入
+  `[B,S,C]`，可删除末尾的 Transpose。
 - Kernel 来自 ComfyKitchen 与 SpargeAttn（见 NOTICE 与 Kernel sources）；
   TRT 胶水为手写。与 Comfy Org 无关；不以 ComfyKitchen 兼容为目标。
 
@@ -44,6 +47,7 @@ import torch, trt_dit_plugins as tdp
 q = torch.randn(1, 16, 4096, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn_like(q); v = torch.randn_like(q)
 out = tdp.int8_attention(q, k, v)          # engine 首次构建后缓存复用
+out = tdp.sage_attn(q, k, v, out_layout="bsc")  # [B,S,C]，无末尾 Transpose
 
 out = tdp.rms_adaln(x, scale, shift)       # eps 默认为 1e-6
 qo, ko = tdp.apply_rope(q, k, freqs)
@@ -54,9 +58,9 @@ out = tdp.stochastic_rounding_fp8(x, rng)  # rng: int32，元素数与 x 相同
 
 ```bash
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.6.0-cu13/trt_dit_plugins-0.6.0-py3-none-linux_x86_64.whl   # Linux
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.7.0-cu13/trt_dit_plugins-0.7.0-py3-none-linux_x86_64.whl   # Linux
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.6.0-cu13/trt_dit_plugins-0.6.0-py3-none-win_amd64.whl      # Windows
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.7.0-cu13/trt_dit_plugins-0.7.0-py3-none-win_amd64.whl      # Windows
 ```
 
 ## Quick Start
@@ -69,16 +73,16 @@ python -c "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
 
 | TRT 名称 (`dit-plugins::*`) | Op | I/O dtypes | Status |
 |---|---|---|---|
-| `int8_attention` | INT8 Q/K/V attention (SageAttention)，D ∈ {64,128,256} | in f32/f16/bf16 → out f16/bf16 (f32→bf16) | cos=0.99990, 0.910 ms/layer @ S=4096,H=16,D=128 (RTX 4070 Ti) |
-| `sage_attn` | 纯 dense SageAttention，支持 GQA，D ∈ {64,128,256}（0.4.0 新增） | in f32/f16/bf16（拒绝 FP8 输入） → out f16/bf16 (f32→bf16) | sm89+D∈{64,128}+S%128==0：FP8-PV Sage2 tactic（cos=0.99925，经 `fp8_pv=1` opt-in）；其余为 portable FP16-PV（cos=0.99927） |
+| `int8_attention` | INT8 Q/K/V attention (SageAttention)，D ∈ {64,128,256}；0.7.0 起支持 `out_layout="bsc"` | in f32/f16/bf16 → out f16/bf16 (f32→bf16)，或 `[B,S,C]` | cos=0.99990, 0.910 ms/layer @ S=4096,H=16,D=128 (RTX 4070 Ti) |
+| `sage_attn` | 纯 dense SageAttention，支持 GQA，D ∈ {64,128,256}（0.4.0 新增）；0.7.0 起支持 `out_layout="bsc"` | in f32/f16/bf16（拒绝 FP8 输入） → out f16/bf16 (f32→bf16)，或 `[B,S,C]` | sm89+D∈{64,128}+S%128==0：FP8-PV Sage2 tactic（cos=0.99925，经 `fp8_pv=1` opt-in）；其余为 portable FP16-PV（cos=0.99927） |
 | `rms_adaln` | 融合 RMSNorm AdaLN，支持 2D/3D x、广播调制、可选 weight / residual+gate | f32/f16/bf16 in+out（统一），调制同一 dtype | cos=1.0 |
 | `layer_norm_adaln` | 融合 LayerNorm AdaLN（0.6.0 新增），I/O 与 residual+gate 同 `rms_adaln` | f32/f16/bf16 in+out（统一），调制同一 dtype | cos=1.0 |
 | `rms_norm` | 单张量 RMSNorm，`layout="bshd"` 同时输出 BHSD（0.6.0 新增） | x f16/bf16 → 同型，weight f32/f16/bf16 | cos=1.0 |
 | `apply_rope` | Strided（零拷贝）RoPE，D 为偶数 | f16/bf16 in+out；freqs f32/f16/bf16 | cos=1.0 |
 | `rms_rope_split_half` | 融合 RMSNorm + split-half/partial RoPE，D 为 32 的倍数，动态 B/S、`rot_dim=-1` 为仅 RMS（0.6.0 新增） | f16/bf16 in+out；freqs/scales f32/f16/bf16 | cos=1.0 |
 | `stochastic_round_fp8` | 随机舍入到 FP8 E4M3 | in f32/f16/bf16, rng INT32 → out FP8 | exact match |
-| `block_sparse_sage2_attn` | Block-sparse SageAttention2，仅 sm89（kernel：SpargeAttn） | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] | cos=0.99953 |
-| `fused_int8_rope_sage_attn` | 融合 INT8 RoPE+SageAttention DiT-self，D=128（0.4.0 新增） | in INT8 [B,H,S,128] + FP32 scales/norms → out BF16 | cos=0.99855（相对 fp32 eager，旋转条件一致），1.578 ms/layer @ S=4096,H=16（相对分离路径 1.29x；S=9216 时 1.12x，RTX 4070 Ti） |
+| `block_sparse_sage2_attn` | Block-sparse SageAttention2，仅 sm89（kernel：SpargeAttn）；0.7.0 起支持 `out_layout="bsc"` | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] → BSC 时 `[B,S,C]` | cos=0.99953 |
+| `fused_int8_rope_sage_attn` | 融合 INT8 RoPE+SageAttention DiT-self，D=128（0.4.0 新增）；0.7.0 起支持 `out_layout="bsc"` | in INT8 [B,H,S,128] + FP32 scales/norms → out BF16，或 `[B,S,C]` | cos=0.99855（相对 fp32 eager，旋转条件一致），1.578 ms/layer @ S=4096,H=16（相对分离路径 1.29x；S=9216 时 1.12x，RTX 4070 Ti） |
 | `convrot_linear` | ConvRot W8A8 动态量化 linear；0.6.0 新增 GELU/SiLU + residual+gate epilogue 与 BHSD/QKV 输出 | x f16/bf16/f32，weight INT8 [N,K]，scale FP32 [N]，bias [N] → f16/bf16/f32 或 `[B,H,S,D]`×3 | base 路径与 comfy-kitchen bit-exact；epilogue/layout 由 GPU 测试覆盖 |
 | `convrot_linear_w4a4` | ConvRot W4A4 linear（打包有符号 INT4 weight [N,K/2]、INT4 activation） | x f16/bf16/f32，weight INT8 打包 [N,K/2]，scale FP32 [N]，bias [N] → f16/bf16/f32 | base 路径与 comfy-kitchen bit-exact |
 

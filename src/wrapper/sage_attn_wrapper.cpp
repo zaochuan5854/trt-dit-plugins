@@ -13,7 +13,10 @@
 //       sage_attn_launcher, mma.sync based, runs sm80/86/89/90/100/120;
 //       mirrors upstream sm80/86).
 //   1 (fp8_pv=1) = QK-INT8 + PV-FP8 dense SageAttention2 via the sparge sm89
-//       kernels with an all-ones mask (mirrors upstream sm89 Sage2++).
+//       kernels with an all-ones mask. The instantiation uses
+//       use_pv_fp16_accu=false, so this is Sage2 (FP32 PV accumulator), not
+//       SageAttention2++ (FP16 accumulator; the code path exists in the
+//       vendored kernel but is not instantiated).
 //       Requires sm89, D in {64,128}, S % 128 == 0, FP16/BF16 inputs,
 //       Lq == Lk; otherwise the build fails. Measured slower than tactic 0
 //       for dense shapes (sparge LUT/preprocess overhead); opt-in only.
@@ -57,7 +60,7 @@ void launch_sparge_preprocess(const void* q, const void* k, const void* mask, co
     int is_bf16, void* stream);
 void launch_block_sparse_sage2_sm89(int8_t* q_i8, int8_t* k_i8, void* v_fp8, void* o,
     int32_t* lut, int32_t* vbn, float* pv_thr, float* q_s, float* k_s, float* v_s, int B, int Hq,
-    int Hkv, int S, int D, int is_bf16, float sm_scale, void* stream);
+    int Hkv, int S, int D, int is_bf16, uint32_t sb_o, uint32_t ss_o, uint32_t sh_o, float sm_scale, void* stream);
 }
 
 namespace {
@@ -198,10 +201,18 @@ public:
 
     int32_t getOutputShapes(nvinfer1::DimsExprs const* in, int32_t nbIn,
         nvinfer1::DimsExprs const*, int32_t, nvinfer1::DimsExprs* out,
-        int32_t nbOut, nvinfer1::IExprBuilder&) noexcept override {
+        int32_t nbOut, nvinfer1::IExprBuilder& b) noexcept override {
         if (nbIn != 3 || nbOut != 1)
             return -1;
-        out[0] = in[0]; // [B,Hq,Lq,D] passthrough
+        if (outLayout_ == 1) {
+            out[0].nbDims = 3;
+            out[0].d[0] = in[0].d[0];
+            out[0].d[1] = in[0].d[2];
+            out[0].d[2] = b.operation(nvinfer1::DimensionOperation::kPROD,
+                *in[0].d[1], *in[0].d[3]);
+        } else {
+            out[0] = in[0]; // [B,Hq,Lq,D] passthrough
+        }
         return 0;
     }
 
@@ -296,6 +307,7 @@ public:
         void const* const* in, void* const* out, void* ws, cudaStream_t stream) noexcept override {
         try {
             char* w = static_cast<char*>(ws);
+            dit::AttnOutStrides os = dit::attnOutStrides(outLayout_, B_, Hq_, Lq_, D_);
             if (tactic_ == 1) {
                 WsPlan1 p = plan1_;
                 if (p.total == 0) // engine loaded without a shape change
@@ -325,7 +337,8 @@ public:
                     reinterpret_cast<int32_t*>(w + p.off_lut), reinterpret_cast<int32_t*>(w + p.off_vbn),
                     reinterpret_cast<float*>(w + p.off_pv), reinterpret_cast<float*>(w + p.off_qs),
                     reinterpret_cast<float*>(w + p.off_ks), reinterpret_cast<float*>(w + p.off_vs),
-                    B_, Hq_, Hkv_, Lk_, D_, inCode_ == 2 ? 1 : 0, smScale_, stream);
+                    B_, Hq_, Hkv_, Lk_, D_, inCode_ == 2 ? 1 : 0,
+                    (uint32_t)os.b, (uint32_t)os.s, (uint32_t)os.h, smScale_, stream);
                 return 0;
             }
             WsPlan0 p = plan0_;
@@ -344,8 +357,8 @@ public:
             launch_sage_attn_kernel(w + p.off_qi, w + p.off_ki, w + p.off_vi, out[0],
                 w + p.off_qs, w + p.off_ks, w + p.off_vs, nullptr, 0, 0, 0, 0, -1,
                 p.cta_k, B_, Lq_, Lk_, Hq_, Hkv_, D_, (int)(sb_q), D_, (int)sh_q,
-                (int)(sb_k), D_, (int)(sh_k), (int)v_bz, (int)v_h, p.padded_Lk,
-                (int)(sb_q), D_, (int)sh_q, smScale_, outCode_, stream);
+                (int)(sb_k), D_, (int)sh_k, (int)v_bz, (int)v_h, p.padded_Lk,
+                (int)os.b, (int)os.s, (int)os.h, smScale_, outCode_, stream);
             return 0;
         } catch (...) {
             return -1;
@@ -358,12 +371,15 @@ public:
 
     nvinfer1::PluginFieldCollection const* getFieldsToSerialize() noexcept override {
         fields_[0] = {"fp8_pv", &fp8pv_, nvinfer1::PluginFieldType::kINT32, 1};
-        fc_.nbFields = 1;
+        fields_[1] = {"out_layout", &outLayout_, nvinfer1::PluginFieldType::kINT32, 1};
+        fc_.nbFields = 2;
         fc_.fields = fields_;
         return &fc_;
     }
 
     char const* getTimingCacheID() noexcept override {
+        if (outLayout_ == 1)
+            return fp8pv_ ? "sage_attn/1;fp8_pv=1;bsc" : "sage_attn/1;fp8_pv=0;bsc";
         return fp8pv_ ? "sage_attn/1;fp8_pv=1" : "sage_attn/1;fp8_pv=0";
     }
 
@@ -376,8 +392,9 @@ private:
     WsPlan0 plan0_{};
     WsPlan1 plan1_{};
     int32_t fp8pv_ = 0;
+    int32_t outLayout_ = 0;
     float smScale_ = 0;
-    nvinfer1::PluginField fields_[1]{};
+    nvinfer1::PluginField fields_[2]{};
     nvinfer1::PluginFieldCollection fc_{};
 };
 
@@ -392,7 +409,14 @@ public:
                     if (std::strcmp(fc->fields[i].name, "fp8_pv") == 0 &&
                         fc->fields[i].type == nvinfer1::PluginFieldType::kINT32)
                         p->fp8pv_ = *static_cast<int32_t const*>(fc->fields[i].data);
+                    if (std::strcmp(fc->fields[i].name, "out_layout") == 0 &&
+                        fc->fields[i].type == nvinfer1::PluginFieldType::kINT32)
+                        p->outLayout_ = *static_cast<int32_t const*>(fc->fields[i].data);
                 }
+            if (p->outLayout_ != 0 && p->outLayout_ != 1) {
+                delete p;
+                return nullptr;
+            }
             return p;
         } catch (...) {
             return nullptr;
@@ -400,7 +424,8 @@ public:
     }
     nvinfer1::PluginFieldCollection const* getFieldNames() noexcept override {
         names_[0] = {"fp8_pv", nullptr, nvinfer1::PluginFieldType::kINT32, 1};
-        fc_.nbFields = 1;
+        names_[1] = {"out_layout", nullptr, nvinfer1::PluginFieldType::kINT32, 1};
+        fc_.nbFields = 2;
         fc_.fields = names_;
         return &fc_;
     }
@@ -409,7 +434,7 @@ public:
     nvinfer1::AsciiChar const* getPluginNamespace() const noexcept override { return kNamespace; }
 
 private:
-    nvinfer1::PluginField names_[1]{};
+    nvinfer1::PluginField names_[2]{};
     nvinfer1::PluginFieldCollection fc_{};
 };
 

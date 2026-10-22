@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
@@ -24,6 +25,19 @@ inline int smVersion() {
         return p.major * 10 + p.minor;
     }();
     return sm;
+}
+
+// Attention output store strides. D is contiguous in both layouts, so only
+// the (batch, seq, head) strides differ; 0 = BHSD, 1 = BSC.
+struct AttnOutStrides {
+    int64_t b, s, h;
+};
+
+inline AttnOutStrides attnOutStrides(int32_t outLayout, int64_t B, int64_t H,
+    int64_t S, int64_t D) {
+    if (outLayout == 1)
+        return {S * H * D, H * D, D};
+    return {H * S * D, D, S * D};
 }
 
 // Pinned host staging for small constant uploads (pv thresholds). Pinned
