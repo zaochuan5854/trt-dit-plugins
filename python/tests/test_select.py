@@ -349,6 +349,25 @@ def test_cli_dry_run(tmp_path, capsys):
     assert S.summarize(S.load(str(src)))["total"] == 2
 
 
+def test_convrot_residual_gate_contract():
+    f = C.convrot_residual_gate_error
+    n = 256
+    # rank-free residual; broadcast or per-batch gate; dynamic dims not judged
+    assert f((2, 8, 2048), (2, 8, 256), (2, 256), n) is None
+    assert f((64, 2048), (1, 1, 64, 256), (1, 1, 256), n) is None
+    assert f((2, 8, 2048), (2, 8, 256), (2, 1, 256), n) is None
+    assert f((-1, 2048), (-1, 1, 256), (1, 1, 256), n) is None
+    assert f((2, 8, 2048), (2, 8, None), (1, None), n) is None
+    assert "residual N" in f((2, 8, 2048), (2, 8, 128), (1, 256), n)
+    assert "residual rows" in f((2, 8, 2048), (2, 7, 256), (1, 256), n)
+    assert "gate N" in f((2, 8, 2048), (2, 8, 256), (1, 128), n)
+    assert "gate rank" in f((2, 8, 2048), (2, 8, 256), (2, 1, 1, 256), n)
+    assert "gate batch" in f((2, 8, 2048), (2, 8, 256), (3, 256), n)
+    assert "gate second dim" in f((2, 8, 2048), (2, 8, 256), (2, 2, 256), n)
+    assert "rank 1" in f((2, 8, 2048), (256,), (1, 256), n)
+    assert f((2, 8, 2048), (2, 8, 128), (1, 256), None) is None  # N unknown
+
+
 def test_plugin_op_enum_is_str_compatible():
     import json
 

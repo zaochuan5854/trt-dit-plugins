@@ -861,6 +861,22 @@ def test_save_falls_back_to_external_data(tmp_path, monkeypatch):
     assert retry.get("location") == "big.onnx.data"
 
 
+def test_validate_bf16_enum_dtype(tmp_path):
+    """Reloaded BF16 stays TensorProto enum 16; validation must name it."""
+    x = gs.Variable("x", dtype="bfloat16", shape=[128, 2048])
+    w = gs.Variable("w", dtype=np.int8, shape=[256, 2048])
+    ws = gs.Variable("ws", dtype=F32, shape=[256])
+    b = gs.Variable("b", dtype="bfloat16", shape=[256])
+    g = gs.Graph(nodes=[], inputs=[x, w, ws, b], outputs=[])
+    g.outputs = [S.add_convrot_linear(g, x, w, ws, b)]
+    dst = tmp_path / "bf16.onnx"
+    S.save(g, str(dst))
+    loaded = S.load(str(dst))
+    assert loaded.tensors()["x"].dtype == 16  # gs keeps the raw enum
+    assert S.validate_plugin_nodes(loaded) == []
+    assert S._dtype_name(16) == "bfloat16"
+
+
 def test_save_caps_ir_version(tmp_path):
     # Newer onnx defaults exceed what the TRT parser reads; save() caps it.
     N, D = 8, 32

@@ -1,4 +1,4 @@
-# Fusion / layout extensions (0.7.0)
+# Fusion / layout extensions (0.8.0)
 
 Contract for the ops added for the Anima 2.9B ConvRot request
 (`trt-dit-plugins-fusion-request.md`). The Reforge engine comparison is the
@@ -40,8 +40,15 @@ external handoff gate; this repo verifies the op-level contracts only.
 
 - `epilogue`: `0` none, `1` exact GELU (erf), `2` SiLU. Applied in the
   dequant epilogue, no extra pass.
-- `residual_gate`: `0` off, `1` on -> `out = residual + gate * y`. `B` is
-  looped per batch in the fused path; `M<3` falls back to gemv + a post-pass.
+- `residual_gate`: `0` off, `1` on -> `out = residual + gate * y`. The
+  residual keeps any rank with `N` columns and x's row count; its shape
+  becomes the output, so a rank-5 `[1,1,H,W,C]` stream fuses without a
+  reshape. The gate broadcasts over rows (`[.., 1, N]`) or repeats per batch
+  (`[B, N]` / `[B, 1, N]`, sliced per batch). `M<3` falls back to gemv + a
+  post-pass.
+- Identity epilogue (`epilogue=0` with no residual/gate) does not launch the
+  post-pass: the GEMM already stored the final value (`0.8.0`; the
+  redundant `[M,N]` read+write cost 1.18 ms/layer at 8192x2048, M=16384).
 - `out_layout="bsc"` (default) or `"bhsd"`; `qkv_heads=H` with
   `head_dim=D` returns three `[B,H,S,D]` tensors (q, k, v).
 - W4A4 rejects `epilogue`/`residual`/`out_layout`/QKV fields in 0.6.0.
@@ -132,9 +139,30 @@ attention ops are bit-stable.
 None for the 0.7.0 layout contract. W4A4 still rejects
 `epilogue`/`residual`/`out_layout`/QKV fields (0.6.0 behavior).
 
+## 0.8.0 fixes
+
+Plugin-side defects found by the Anima 2.9B engine run, no graph contract
+change (`PLUGIN_VERSION` stays `"1"`, existing engines keep loading):
+
+- ConvRot accepts rank >= 4 `x` (`M` = product of the leading dims) and an
+  any-rank residual, so the MLP `[1,1,H,W,C]` stream no longer needs the
+  exporter-side reshape.
+- The identity epilogue post-pass is skipped (perf regression vs 0.5.1).
+- The residual+gate post-pass reads/writes 128-bit vectors and hoists the
+  gate broadcast to the vector index (70.7 -> 49.1 us per 4096x2048 bf16
+  site; equal to the scalar kernel at bandwidth-saturated sizes such as
+  8192x2048, M=16384, where the scalar form stays as the tail /
+  `cols % VEC != 0` fallback).
+- `surgeon.validate_plugin_nodes` resolves BF16's raw ONNX enum (`16`), which
+  used to flag every BF16 convrot node after reloading a model.
+- The residual+gate contract lives in one place per layer:
+  `select.convrot_residual_gate_error` (Python/ONNX) mirrors
+  `ConvRotLinear::checkResidualGate` (C++), and the surgeon declares the node
+  output with the residual's shape.
+
 ## Release gate
 
 - Op-level tests: pass on the RTX 4070 Ti (sm89).
 - External Anima engine: `cos` at or above the existing gate, layer count
   < 1000, E2E <= 220 ms, no `Transpose` in the rope/QKV region. Until that
-  is measured, 0.7.0 is "op-level verified, engine gate pending".
+  is measured, 0.8.0 is "op-level verified, engine gate pending".

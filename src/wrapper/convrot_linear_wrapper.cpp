@@ -14,6 +14,9 @@
 // epilogue 0=none/1=erf GELU/2=SiLU, residual_gate 0/1 (W8A8 only).
 // With residual_gate the inputs are x,w,ws,b,residual,gate and
 // y = residual + gate * epilogue(gemm(x)). All three use the output dtype.
+// The residual keeps x's natural rank or any higher rank whose leading dims
+// hold the same row count ([.., N]), and its shape becomes the output; the
+// gate broadcasts over rows ([.., 1, N]) or repeats per batch ([B,N]/[B,1,N]).
 //
 // Fallback policy is build-time: unsupported shapes return -1 from
 // configurePlugin/onShapeChange so the exporter keeps the float path.
@@ -149,8 +152,13 @@ public:
         if (nbIn != expectedIn() || nbOut != outCount() || !in || !out) return -1;
         if (in[kX].nbDims < 2 || in[kW].nbDims != 2) return -1;
         if (outLayout_ == 0) {
+            // residual+gate takes its output shape from the residual, so x may
+            // keep its natural rank (2/3) while the result lands in a
+            // higher-rank residual stream without a reshape copy.
+            nvinfer1::DimsExprs const& src = residualGate_ ? in[kRes] : in[kX];
+            if (src.nbDims < 2) return -1;
             for (int i = 0; i < nbOut; ++i) {
-                out[i] = in[kX];
+                out[i] = src;
                 out[i].d[out[i].nbDims - 1] = in[kW].d[0];
             }
             return 0;
@@ -246,6 +254,12 @@ public:
             B_ = in[kX].dims.d[0];
             S_ = in[kX].dims.d[1];
             M_ = B_ * S_;
+        } else if (rank > 3) {
+            // [..., K]: collapse every leading dim into M. Treating this as the
+            // 2D case (M = d[0]) silently computed a single row.
+            B_ = 1;
+            M_ = leadingNumel(in[kX].dims);
+            S_ = M_;
         } else {
             B_ = 1;
             S_ = in[kX].dims.d[0];
@@ -344,10 +358,14 @@ public:
                 auto* y = static_cast<char*>(out[0]);
                 auto const* r = static_cast<char const*>(residual);
                 auto const* g = static_cast<char const*>(gate);
+                // A gate with leading numel 1 broadcasts over rows and is
+                // shared by every batch; only [B,N] / [B,1,N] advance.
+                const bool gatePerBatch = leadingNumel(inDesc[kGate].dims) != 1;
                 for (int64_t batch = 0; batch < B_; ++batch) {
+                    const void* gb = gatePerBatch ? g + batch * N_ * elem : gate;
                     if (run(y + batch * S_ * N_ * elem, xq + batch * S_ * K_,
                             xs + batch * S_, S_, r + batch * S_ * N_ * elem,
-                            g + batch * N_ * elem) != 0)
+                            gb) != 0)
                         return -1;
                 }
                 return 0;
@@ -416,16 +434,35 @@ private:
 
         if (numel(ws.dims) != N || numel(b.dims) != N) return false;
         if (residualGate_) {
-            if (WeightBits != 8 || x.dims.nbDims != 3) return false;
-            auto const& r = in[kRes];
-            auto const& g = in[kGate];
-            if (r.type != yType || g.type != yType) return false;
-            if (r.dims.nbDims != 3 || g.dims.nbDims < 2 || g.dims.nbDims > 3) return false;
-            for (int i = 0; i < 2; ++i)
-                if (r.dims.d[i] != x.dims.d[i] && r.dims.d[i] != -1 && x.dims.d[i] != -1)
-                    return false;
-            if (r.dims.d[2] != N) return false;
-            if (g.dims.d[g.dims.nbDims - 1] != N) return false;
+            if (WeightBits != 8) return false;
+            if (!checkResidualGate(x, in[kRes], in[kGate], N, yType)) return false;
+        }
+        return true;
+    }
+
+    // residual_gate contract; mirrors select.convrot_residual_gate_error in the
+    // Python frontend. The residual may keep any rank: the GEMM writes a flat
+    // (M, N) buffer, so the contract is residual numel == M*N with last dim N
+    // (the output shape is taken from it). The gate broadcasts over rows
+    // ([.., 1, N], any rank) or repeats per batch ([B, N] / [B, 1, N], which
+    // enqueue slices per batch).
+    static bool checkResidualGate(nvinfer1::PluginTensorDesc const& x,
+                                  nvinfer1::PluginTensorDesc const& r,
+                                  nvinfer1::PluginTensorDesc const& g,
+                                  int64_t n, nvinfer1::DataType yType) {
+        if (r.type != yType || g.type != yType) return false;
+        if (r.dims.nbDims < 2 || r.dims.d[r.dims.nbDims - 1] != n) return false;
+        bool dynamic = false;
+        for (int i = 0; i + 1 < x.dims.nbDims; ++i)
+            if (x.dims.d[i] < 0) dynamic = true;
+        for (int i = 0; i + 1 < r.dims.nbDims; ++i)
+            if (r.dims.d[i] < 0) dynamic = true;
+        if (!dynamic && leadingNumel(r.dims) != leadingNumel(x.dims)) return false;
+        // -1 (dynamic at build time) makes leadingNumel report 1, which is the
+        // broadcast case; onShapeChange re-checks with resolved dims.
+        if (g.dims.nbDims < 2 || g.dims.d[g.dims.nbDims - 1] != n) return false;
+        if (leadingNumel(g.dims) != 1) {
+            if (g.dims.nbDims > 3) return false;
             if (g.dims.nbDims == 3 && g.dims.d[1] != 1) return false;
             const int64_t rows = g.dims.d[0];
             if (rows == 0 || rows < -1) return false;

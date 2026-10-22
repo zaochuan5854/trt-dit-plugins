@@ -369,6 +369,83 @@ def test_convrot_residual_gate_no_act():
     assert (got.float() - want).abs().mean() < 0.05
 
 
+def test_convrot_residual_gate_rank_free():
+    """rank の異なる residual/gate: plugin 出力は residual の shape を取る."""
+    torch = _torch()
+    _gpu()
+    _, (w8, ws8), _ = _weights()
+    b = torch.randn(256, dtype=torch.bfloat16, device="cuda") * 0.1
+    res5 = torch.randn(1, 1, 64, 64, 256, dtype=torch.bfloat16, device="cuda")
+    gate5 = torch.randn(1, 1, 1, 1, 256, dtype=torch.bfloat16, device="cuda")
+    for x in (
+        torch.randn(1, 4096, 2048, dtype=torch.bfloat16, device="cuda"),
+        torch.randn(4096, 2048, dtype=torch.bfloat16, device="cuda"),
+        torch.randn(1, 1, 64, 64, 2048, dtype=torch.bfloat16, device="cuda"),
+    ):
+        base = tdp.convrot_linear(x, w8, ws8, b)
+        got = tdp.convrot_linear(x, w8, ws8, b, residual=res5, gate=gate5)
+        want = res5.float() + gate5.float() * base.reshape(res5.shape).float()
+        assert got.shape == res5.shape, got.shape
+        assert (got.float() - want).abs().mean() < 0.05
+
+
+def test_convrot_residual_gate_broadcast_batch():
+    """lead numel 1 の gate は batch 間で共有される (per-batch slice しない)."""
+    torch = _torch()
+    _gpu()
+    _, (w8, ws8), _ = _weights()
+    b = torch.randn(256, dtype=torch.bfloat16, device="cuda") * 0.1
+    x = torch.randn(2, 8, 2048, dtype=torch.bfloat16, device="cuda")
+    res = torch.randn(2, 8, 256, dtype=torch.bfloat16, device="cuda")
+    base = tdp.convrot_linear(x, w8, ws8, b)
+    for gate in (torch.randn(1, 1, 1, 256, dtype=torch.bfloat16, device="cuda"),
+                 torch.randn(1, 256, dtype=torch.bfloat16, device="cuda")):
+        got = tdp.convrot_linear(x, w8, ws8, b, residual=res, gate=gate)
+        want = res.float() + gate.reshape(1, 1, 256).float() * base.float()
+        assert got.shape == (2, 8, 256)
+        assert (got.float() - want).abs().mean() < 0.05
+
+
+def test_convrot_residual_gate_epilogue_vector_and_fallback():
+    """128-bit epilogue と、`cols % VEC != 0` のスカラ fallback の両方が正しい."""
+    torch = _torch()
+    _gpu()
+    for n in (16, 12):  # 16 -> vector path, 12 -> scalar fallback (VEC=8, bf16)
+        _, (w8, ws8), _ = _weights(n=n, k=256)
+        b = torch.randn(n, dtype=torch.bfloat16, device="cuda") * 0.1
+        x = torch.randn(1, 256, dtype=torch.bfloat16, device="cuda")
+        res = torch.randn(1, n, dtype=torch.bfloat16, device="cuda")
+        gate = torch.randn(1, 1, n, dtype=torch.bfloat16, device="cuda")
+        base = tdp.convrot_linear(x, w8, ws8, b)
+        got = tdp.convrot_linear(x, w8, ws8, b, residual=res, gate=gate)
+        want = res.float() + gate.reshape(1, n).float() * base.float()
+        assert got.shape == (1, n), (n, got.shape)
+        assert (got.float() - want).abs().mean() < 0.05, n
+
+
+def test_convrot_residual_gate_rejects_bad_shapes():
+    torch = _torch()
+    _gpu()
+    _, (w8, ws8), _ = _weights()
+    b = torch.randn(256, dtype=torch.bfloat16, device="cuda") * 0.1
+    x = torch.randn(2, 8, 2048, dtype=torch.bfloat16, device="cuda")
+    res = torch.randn(2, 8, 256, dtype=torch.bfloat16, device="cuda")
+    gate = torch.randn(2, 256, dtype=torch.bfloat16, device="cuda")
+    bad_res = torch.randn(2, 7, 256, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="residual rows"):
+        tdp.convrot_linear(x, w8, ws8, b, residual=bad_res, gate=gate)
+    with pytest.raises(ValueError, match="gate batch"):
+        tdp.convrot_linear(x, w8, ws8, b, residual=res,
+                           gate=torch.randn(3, 256, dtype=torch.bfloat16,
+                                            device="cuda"))
+    with pytest.raises(ValueError, match="contiguous"):
+        tdp.convrot_linear(x, w8, ws8, b, residual=res,
+                           gate=torch.randn(256, 2, dtype=torch.bfloat16,
+                                            device="cuda").t())
+    with pytest.raises(ValueError, match="residual requires gate"):
+        tdp.convrot_linear(x, w8, ws8, b, residual=res)
+
+
 def test_convrot_w4a4_rejects_epilogue():
     torch = _torch()
     _gpu()
@@ -453,6 +530,34 @@ def test_convrot_w4a4_rejects_layout():
     x = torch.randn(1, 8, 2048, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="W4A4"):
         tdp.convrot_linear_w4a4(x, qw, ws, b, out_layout="bhsd", head_dim=128)
+
+
+def test_add_convrot_residual_gate_rank_free_node():
+    """ONNX 側も plugin と同じ契約: 出力 shape は residual に従う."""
+    x = gs.Variable("x", dtype="bfloat16", shape=[1, 4096, 2048])
+    w = gs.Variable("w", dtype=I8, shape=[256, 2048])
+    ws = gs.Variable("ws", dtype=F32, shape=[256])
+    b = gs.Variable("b", dtype="bfloat16", shape=[256])
+    res = gs.Variable("res", dtype="bfloat16", shape=[1, 1, 64, 64, 256])
+    gate = gs.Variable("gate", dtype="bfloat16", shape=[1, 1, 1, 1, 256])
+    g = gs.Graph(nodes=[], inputs=[x, w, ws, b, res, gate], outputs=[])
+    y = S.add_convrot_linear(g, x, w, ws, b, residual=res, gate=gate)
+    g.outputs = [y]
+    assert y.shape == [1, 1, 64, 64, 256]
+    node = g.nodes[0]
+    assert node.attrs["residual_gate"] == 1 and len(node.inputs) == 6
+    assert S.validate_plugin_nodes(g) == []
+    onnx.checker.check_model(gs.export_onnx(g))
+
+    bad = gs.Variable("bad", dtype="bfloat16", shape=[1, 1, 63, 64, 256])
+    with pytest.raises(ValueError, match="residual rows"):
+        S.add_convrot_linear(g, x, w, ws, b, residual=bad, gate=gate)
+    bad_gate = gs.Variable("bg", dtype="bfloat16", shape=[2, 1, 1, 256])
+    with pytest.raises(ValueError, match="gate rank"):
+        S.add_convrot_linear(g, x, w, ws, b, residual=res, gate=bad_gate)
+    with pytest.raises(ValueError, match="dtype"):
+        S.add_convrot_linear(g, x, w, ws, b, residual=res,
+                             gate=gs.Variable("gf", dtype=F32, shape=[1, 256]))
 
 
 def test_add_convrot_qkv_bhsd_node():

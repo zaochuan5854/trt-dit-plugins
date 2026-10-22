@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import _engine as E
-from .select import PluginOp
+from .select import PluginOp, convrot_residual_gate_error
 
 
 def _require_cuda(*tensors: Any) -> Any:
@@ -318,6 +318,8 @@ def _convrot_linear(op, x, weight, weight_scale, bias, out_dtype, gemm_config, w
     k = weight.shape[1] * (2 if w4a4 else 1)
     if x.shape[-1] != k:
         raise ValueError(f"x K={x.shape[-1]} does not match weight K={k}")
+    if x.dim() < 2:
+        raise ValueError("x must be [.., K] (rank >= 2)")
     if k % 256 != 0 or k > 16384:
         raise ValueError("K must be a multiple of 256 and <= 16384")
     if not w4a4 and weight.shape[0] % 4 != 0:
@@ -352,20 +354,27 @@ def _convrot_linear(op, x, weight, weight_scale, bias, out_dtype, gemm_config, w
     if head_dim < 0 or qkv_heads < 0:
         raise ValueError("qkv_heads and head_dim must be >= 0")
     tensors = {"x": x, "w": weight, "ws": weight_scale, "b": bias}
+    n = weight.shape[0]
+    if gate is not None and residual is None:
+        raise ValueError("gate requires residual")
     if residual is not None:
-        n = weight.shape[0]
-        if x.dim() != 3 or gate is None or residual.dim() != 3 \
-                or tuple(residual.shape[:2]) != tuple(x.shape[:2]) \
-                or residual.shape[-1] != n or residual.dtype != otype \
-                or not residual.is_cuda:
-            raise ValueError("residual must be [B,S,N] in the output dtype")
-        if gate.dtype != otype or gate.dim() not in (2, 3) \
-                or gate.shape[-1] != n or gate.shape[0] != x.shape[0] \
-                or (gate.dim() == 3 and gate.shape[1] != 1):
-            raise ValueError("gate must be [B,N] or [B,1,N] in the output dtype")
+        if gate is None:
+            raise ValueError("residual requires gate")
+        for name, t in (("residual", residual), ("gate", gate)):
+            if not t.is_cuda or t.dtype != otype or not t.is_contiguous():
+                raise ValueError(f"{name} must be a contiguous CUDA tensor in "
+                                 "the output dtype")
+        err = convrot_residual_gate_error(tuple(x.shape), tuple(residual.shape),
+                                          tuple(gate.shape), n)
+        if err is not None:
+            raise ValueError(err)
+        if profile and "x" in profile:
+            lo, _, hi = profile["x"]
+            if tuple(lo[:-1]) != tuple(hi[:-1]):
+                raise ValueError("residual/gate fixes the output shape, so the "
+                                 "rows must stay static; drop profile['x']")
         tensors["residual"] = residual
         tensors["gate"] = gate
-    n = weight.shape[0]
     if out_layout == "bhsd":
         if x.dim() != 3:
             raise ValueError("bhsd output requires x [B,S,K]")
@@ -380,7 +389,8 @@ def _convrot_linear(op, x, weight, weight_scale, bias, out_dtype, gemm_config, w
         out_specs = [(name, otype, (b, H, s_, D)) for name in names]
     else:
         names = ["y"]
-        out_specs = [("y", otype, (*x.shape[:-1], n))]
+        out_specs = [("y", otype, tuple(residual.shape) if residual is not None
+                      else (*x.shape[:-1], n))]
     outs = E.run_plugin(
         op,
         tensors,
@@ -405,10 +415,14 @@ def convrot_linear(x, weight, weight_scale, bias=None, *, out_dtype=None, gemm_c
     weight_scale: fp32 [N]; bias: [N] in the output dtype (None = zeros, the
     kernel still runs the bias epilogue with has_bias=0).
     ``epilogue``: "none" | "gelu" (exact erf) | "silu".
-    ``residual``/``gate``: optional [B,S,N] and [B,N]/[B,1,N] in the output
-    dtype; result is residual + gate * epilogue(x @ W.T + bias).
+    ``residual``/``gate``: optional in the output dtype; the result is
+    residual + gate * epilogue(x @ W.T + bias). The residual keeps any rank
+    with N columns and x's row count, and its shape becomes the output; the
+    gate either broadcasts over rows ([.., 1, N], e.g. [1, 1, 1, N]) or
+    repeats per batch ([B, N] / [B, 1, N]). Both must be contiguous.
     ``profile``: {"x": (min, opt, max)} makes the M dim dynamic so one engine
-    serves many token counts (same form as ``_engine.run_plugin``).
+    serves many token counts (same form as ``_engine.run_plugin``); residual+
+    gate needs a static M, so profile the flat [M, K] form without it.
     """
     return _convrot_linear(PluginOp.CONVROT_LINEAR, x, weight, weight_scale, bias,
                            out_dtype, gemm_config, False, epilogue, residual, gate,

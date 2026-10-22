@@ -38,7 +38,8 @@ import itertools
 from collections import deque
 from typing import Any
 
-from .select import BasePrecision, GemmKind, PluginOp, convrot_shape_ok, require_enum
+from .select import (BasePrecision, GemmKind, PluginOp, convrot_residual_gate_error,
+                     convrot_shape_ok, require_enum)
 
 PLUGIN_DOMAIN = "dit-plugins"
 PLUGIN_VERSION = "1"
@@ -206,7 +207,10 @@ def add_convrot_linear(graph, x, weight, weight_scale, bias, *, w4a4=False,
     already be in that dtype.
     ``gemm_config``: -1 = automatic route; >= 0 pins a W4A4 GEMM tile config.
     ``epilogue``: "none" | "gelu" | "silu"; ``residual``/``gate`` append the
-    fused residual+gate inputs (W8A8 only).
+    fused residual+gate inputs (W8A8 only): ``out = residual + gate * y``.
+    The residual keeps any rank with N columns and x's row count, and its
+    shape becomes the node output; the gate broadcasts over rows
+    (``[.., 1, N]``) or repeats per batch (``[B, N]`` / ``[B, 1, N]``).
     """
     if isinstance(epilogue, str):
         ep = {"none": 0, "gelu": 1, "silu": 2}.get(epilogue)
@@ -218,6 +222,8 @@ def add_convrot_linear(graph, x, weight, weight_scale, bias, *, w4a4=False,
         raise ValueError("W4A4 does not support epilogue/residual/gate")
     if residual is not None and gate is None:
         raise ValueError("residual requires gate")
+    if gate is not None and residual is None:
+        raise ValueError("gate requires residual")
     if out_layout not in ("bsc", "bhsd"):
         raise ValueError("out_layout must be 'bsc' or 'bhsd'")
     if w4a4 and (out_layout != "bsc" or qkv_heads or head_dim):
@@ -234,6 +240,17 @@ def add_convrot_linear(graph, x, weight, weight_scale, bias, *, w4a4=False,
     if code not in (-1, 0, 1, 2):
         raise ValueError(f"out_dtype must be -1/0/1/2, got {out_dtype!r}")
     dtype = {0: "bfloat16", 1: "float16", 2: "float32"}.get(code, x.dtype)
+    if residual is not None:
+        # The plugin's output takes the residual's shape (rank-free), so the
+        # declared ONNX shape must too -- otherwise the parser sees a mismatch.
+        for nm, t in (("residual", residual), ("gate", gate)):
+            if _dtype_name(t.dtype) != _dtype_name(dtype):
+                raise ValueError(f"{nm} dtype {_dtype_name(t.dtype)} != output {dtype}")
+        err = convrot_residual_gate_error(x.shape, residual.shape, gate.shape, n)
+        if err is not None:
+            raise ValueError(err)
+        if residual.shape is not None:
+            out_shape = list(residual.shape)
     outs = []
     if out_layout == "bhsd":
         if x.shape is None or len(x.shape) != 3:
@@ -492,10 +509,25 @@ def _checked_baked_freqs(fq):
 
 
 def _dtype_name(d) -> str | None:
-    """'float32' for both the string and numpy-dtype spellings."""
+    """'float32' for the string, numpy, and ONNX-enum spellings.
+
+    onnx-graphsurgeon keeps BF16/FP8 as the raw ``TensorProto`` enum when it
+    loads a model (BF16 has no numpy dtype), so ``16`` must map to
+    ``"bfloat16"`` instead of the string ``"16"``.
+    """
     if d is None:
         return None
-    return d if isinstance(d, str) else getattr(d, "__name__", str(d))
+    if isinstance(d, str):
+        return d
+    name = getattr(d, "__name__", None)
+    if name is not None:
+        return name
+    try:
+        import onnx
+        name = onnx.TensorProto.DataType.Name(int(d)).lower()
+    except (ImportError, TypeError, ValueError):
+        return str(d)
+    return {"float": "float32", "double": "float64"}.get(name, name)
 
 
 def _check_freqs_tensor(t) -> None:
@@ -1409,7 +1441,8 @@ def validate_plugin_nodes(graph) -> list[str]:
                             tuple(t.shape) != want):
                         errs.append(f"{node.name or node.op}: input {idx} shape "
                                     f"{tuple(t.shape)}, want {want}")
-        if node.op in (PluginOp.CONVROT_LINEAR, PluginOp.CONVROT_LINEAR_W4A4) and len(node.inputs) == 4:
+        if node.op in (PluginOp.CONVROT_LINEAR, PluginOp.CONVROT_LINEAR_W4A4) \
+                and len(node.inputs) in (4, 6):
             w4a4 = node.op == PluginOp.CONVROT_LINEAR_W4A4
             tag = node.name or node.op
             if any(t is None for t in node.inputs):
@@ -1462,6 +1495,28 @@ def validate_plugin_nodes(graph) -> list[str]:
                         tuple(t.shape) != want):
                     errs.append(f"{tag}: input {idx} shape "
                                 f"{tuple(t.shape)}, want {want}")
+            rg = node.attrs.get("residual_gate", 0)
+            if rg not in (0, 1):
+                errs.append(f"{tag}: residual_gate={rg}, want 0/1")
+            elif rg:
+                if w4a4:
+                    errs.append(f"{tag}: W4A4 rejects residual_gate")
+                for idx, nm in ((4, "residual"), (5, "gate")):
+                    dd = _dtype_name(node.inputs[idx].dtype)
+                    if dd != want_dtype:
+                        errs.append(f"{tag}: {nm} dtype {dd}, want {want_dtype}")
+                err = convrot_residual_gate_error(
+                    xshape, node.inputs[4].shape, node.inputs[5].shape, n)
+                if err is not None:
+                    errs.append(f"{tag}: {err}")
+                rshape = node.inputs[4].shape
+                for o in node.outputs:
+                    if (rshape is not None and o.shape is not None
+                            and all(isinstance(v, int) for v in rshape)
+                            and all(isinstance(v, int) for v in o.shape)
+                            and tuple(o.shape) != tuple(rshape)):
+                        errs.append(f"{tag}: output shape {tuple(o.shape)} "
+                                    f"!= residual {tuple(rshape)}")
             ol = node.attrs.get("out_layout", 0)
             qh = node.attrs.get("qkv_heads", 0)
             hd = node.attrs.get("head_dim", 0)

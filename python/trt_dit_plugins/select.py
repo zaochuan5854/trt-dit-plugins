@@ -46,7 +46,7 @@ one site shape, never a substitute for in-plugin tactic benchmarking.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Sequence
 
 NATIVE_OP = None  # selector returns op=None for the plain-TRT path.
 
@@ -639,6 +639,67 @@ def convrot_shape_ok(k: int | None, n: int | None, *, w4a4: bool) -> str | None:
         return f"K={k}, want a multiple of 256 and <= 16384"
     if n is not None and not w4a4 and n % 4:
         return f"N={n}, want a multiple of 4"
+    return None
+
+
+def _known_dim(d: object) -> int | None:
+    """A static dim, or None for dynamic/unknown graph dims."""
+    return d if isinstance(d, int) and d >= 0 else None
+
+
+def _known_leading(shape: Sequence[object]) -> int | None:
+    """Product of every dim but the last, or None when any is unknown."""
+    numel = 1
+    for d in shape[:-1]:
+        dim = _known_dim(d)
+        if dim is None:
+            return None
+        numel *= dim
+    return numel
+
+
+def convrot_residual_gate_error(x_shape: Sequence[object] | None,
+                                residual_shape: Sequence[object] | None,
+                                gate_shape: Sequence[object] | None,
+                                n: int | None) -> str | None:
+    """Why ConvRot residual+gate violates the contract, or None if it may run.
+
+    Mirrors ``ConvRotLinear::checkResidualGate`` in
+    ``src/wrapper/convrot_linear_wrapper.cpp``. The residual keeps any rank
+    ``[.., N]``: its leading dims must hold x's row count and its shape becomes
+    the plugin output. The gate either broadcasts over rows (leading numel 1,
+    e.g. ``[.., 1, N]``) or repeats per batch in the legacy sliced form
+    (``[B, N]`` / ``[B, 1, N]``). Unknown dims are not judged; TRT resolves
+    them at build time (the Python frontend always passes concrete shapes).
+    """
+    if x_shape is None or residual_shape is None or gate_shape is None:
+        return "residual and gate need known shapes to declare the output"
+    if len(residual_shape) < 2:
+        return f"residual rank {len(residual_shape)}, want [.., N]"
+    r_n = _known_dim(residual_shape[-1])
+    if n is not None and r_n is not None and r_n != n:
+        return f"residual N={r_n} != weight N={n}"
+    x_lead = _known_leading(x_shape)
+    r_lead = _known_leading(residual_shape)
+    if x_lead is not None and r_lead is not None and x_lead != r_lead:
+        return f"residual rows {r_lead} != x rows {x_lead}"
+    if len(gate_shape) < 2:
+        return f"gate rank {len(gate_shape)}, want [.., 1, N] or [B, N]"
+    g_n = _known_dim(gate_shape[-1])
+    if n is not None and g_n is not None and g_n != n:
+        return f"gate N={g_n} != weight N={n}"
+    g_lead = _known_leading(gate_shape)
+    if g_lead is None or g_lead == 1:
+        return None  # broadcast over rows
+    if len(gate_shape) > 3:
+        return f"gate rank {len(gate_shape)}: per-batch gates are [B, N] or [B, 1, N]"
+    if len(gate_shape) == 3 and _known_dim(gate_shape[1]) not in (None, 1):
+        return f"gate second dim {gate_shape[1]}, want 1"
+    if x_lead is None:
+        return None
+    x_batch = _known_dim(x_shape[0])
+    if x_batch is not None and g_lead != x_batch:
+        return f"gate batch {g_lead} != x batch {x_batch}"
     return None
 
 

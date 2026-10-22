@@ -215,6 +215,7 @@ int convrot_gemm(void* y, const int8_t* w, const float* ws, const void* bias,
                 launch_int8_gemv_dequant_kernel(xq, w, xs, ws, bias, y, M, N, K, wss, hasBias,
                                                 out_dtype, bias_dtype, nullptr, nullptr, stream);
                 if (cudaGetLastError() != cudaSuccess) return -1;
+                if (epilogue == 0 && residual == nullptr && gate == nullptr) return 0;
                 return convrot_apply_epilogue(y, residual, gate, M, N, epilogue, out_dtype,
                                               stream);
             }
@@ -253,6 +254,11 @@ int convrot_gemm(void* y, const int8_t* w, const float* ws, const void* bias,
                 : launch_cutlass_int8_dequant(xq, w, xs, ws, bias, y, M, N, K, out_dtype, stream);
             if (!ok) (void)cudaGetLastError();  // failed launch leaves a sticky error
             if (!ok) return -1;
+            // Identity epilogue (no act, no residual, no gate): the CUTLASS EVT
+            // already stored the final result, so the in-place pass would be a
+            // pure read+write of [M,N] — it dominated large-M layers (0.7.0
+            // regression vs 0.5.1, which fused it).
+            if (epilogue == 0 && residual == nullptr && gate == nullptr) return 0;
             return convrot_apply_epilogue(y, residual, gate, M, N, epilogue, out_dtype, stream);
         }
 
@@ -322,6 +328,7 @@ int convrot_gemv_m1(void* y, const void* x, const int8_t* w, const float* ws, co
                                               bias != nullptr, bias_dtype, y, out_dtype, N, K, N,
                                               nullptr, nullptr, stream);
         if (cudaGetLastError() != cudaSuccess) return -1;
+        if (epilogue == 0 && residual == nullptr && gate == nullptr) return 0;
         return convrot_apply_epilogue(y, residual, gate, 1, N, epilogue, out_dtype, stream);
     } catch (...) {
         return -1;
