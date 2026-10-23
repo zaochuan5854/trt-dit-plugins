@@ -56,6 +56,36 @@ def test_add_convrot_linear_w4a4():
     assert S.validate_plugin_nodes(g) == []
 
 
+def test_add_convrot_w4a4_epilogue_residual_node():
+    x = gs.Variable("x", dtype="bfloat16", shape=[1, 8, 2048])
+    w = gs.Variable("w", dtype=I8, shape=[256, 1024])
+    ws = gs.Variable("ws", dtype=F32, shape=[256])
+    b = gs.Variable("b", dtype="bfloat16", shape=[256])
+    res = gs.Variable("res", dtype="bfloat16", shape=[1, 8, 256])
+    gate = gs.Variable("gate", dtype="bfloat16", shape=[1, 256])
+    g = gs.Graph(nodes=[], inputs=[x, w, ws, b, res, gate], outputs=[])
+    y = S.add_convrot_linear(g, x, w, ws, b, w4a4=True, epilogue="gelu",
+                             residual=res, gate=gate)
+    g.outputs = [y]
+    node = g.nodes[0]
+    assert node.attrs["epilogue"] == 1 and node.attrs["residual_gate"] == 1
+    assert y.shape == [1, 8, 256]
+    assert S.validate_plugin_nodes(g) == []
+
+
+def test_add_convrot_w4a4_bhsd_node():
+    x = gs.Variable("x", dtype="bfloat16", shape=[1, 8, 2048])
+    w = gs.Variable("w", dtype=I8, shape=[256, 1024])
+    ws = gs.Variable("ws", dtype=F32, shape=[256])
+    b = gs.Variable("b", dtype="bfloat16", shape=[256])
+    g = gs.Graph(nodes=[], inputs=[x, w, ws, b], outputs=[])
+    y = S.add_convrot_linear(g, x, w, ws, b, w4a4=True, out_layout="bhsd",
+                             head_dim=128)
+    g.outputs = [y]
+    assert y.shape == [1, 2, 8, 128]
+    assert S.validate_plugin_nodes(g) == []
+
+
 def test_add_convrot_out_dtype_declares_real_output():
     for xdt in ("float16", "float32", "bfloat16"):
         x = gs.Variable("x", dtype=xdt, shape=[4, 2048])
@@ -446,15 +476,26 @@ def test_convrot_residual_gate_rejects_bad_shapes():
         tdp.convrot_linear(x, w8, ws8, b, residual=res)
 
 
-def test_convrot_w4a4_rejects_epilogue():
+def test_convrot_w4a4_epilogue_residual():
     torch = _torch()
-    _gpu()
-    qw = torch.randint(-8, 7, (256, 1024), device="cuda", dtype=torch.int8)
-    ws = torch.rand(256, device="cuda") * 0.01
-    b = torch.randn(256, dtype=torch.bfloat16, device="cuda")
-    x = torch.randn(1, 8, 2048, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="W4A4"):
-        tdp.convrot_linear_w4a4(x, qw, ws, b, epilogue="gelu")
+    ck = _gpu()
+    _, _, (w4, ws4) = _weights()
+    b = torch.randn(256, dtype=torch.bfloat16, device="cuda") * 0.1
+    for m in (1, 128):
+        x = torch.randn(m, 2048, dtype=torch.bfloat16, device="cuda")
+        base = ck.convrot_w4a4_linear(x, w4, ws4, b)
+        for ep, ref in (
+            ("gelu", torch.nn.functional.gelu(base.float())),
+            ("silu", torch.nn.functional.silu(base.float())),
+        ):
+            got = tdp.convrot_linear_w4a4(x, w4, ws4, b, epilogue=ep)
+            torch.testing.assert_close(got.float(), ref, rtol=2e-2, atol=2e-2)
+
+        res = torch.randn(m, 256, dtype=torch.bfloat16, device="cuda")
+        gate = torch.randn(1, 256, dtype=torch.bfloat16, device="cuda")
+        got = tdp.convrot_linear_w4a4(x, w4, ws4, b, residual=res, gate=gate)
+        want = res.float() + gate.float() * base.float()
+        torch.testing.assert_close(got.float(), want, rtol=2e-2, atol=2e-2)
 
 
 def test_convrot_qkv_bhsd_store():
@@ -521,15 +562,28 @@ def test_convrot_bhsd_m_lt_3_fallback():
         assert (got.float() - ref.float()).abs().mean() < 1e-3
 
 
-def test_convrot_w4a4_rejects_layout():
+def test_convrot_w4a4_bhsd():
     torch = _torch()
     _gpu()
-    qw = torch.randint(-8, 7, (256, 1024), device="cuda", dtype=torch.int8)
-    ws = torch.rand(256, device="cuda") * 0.01
-    b = torch.randn(256, dtype=torch.bfloat16, device="cuda")
-    x = torch.randn(1, 8, 2048, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="W4A4"):
-        tdp.convrot_linear_w4a4(x, qw, ws, b, out_layout="bhsd", head_dim=128)
+    _, _, (w4, ws4) = _weights()
+    b = torch.randn(256, dtype=torch.bfloat16, device="cuda") * 0.1
+    batch, seq, heads, dim = 2, 8, 2, 128
+    x = torch.randn(batch, seq, 2048, dtype=torch.bfloat16, device="cuda")
+    base = tdp.convrot_linear_w4a4(x, w4, ws4, b)
+    got = tdp.convrot_linear_w4a4(x, w4, ws4, b, out_layout="bhsd",
+                                  head_dim=dim)
+    ref = base.reshape(batch, seq, heads, dim).permute(0, 2, 1, 3).contiguous()
+    torch.testing.assert_close(got.float(), ref.float(), rtol=0, atol=0)
+
+    _, _, (w4q, ws4q) = _weights(n=3 * heads * dim)
+    bq = torch.randn(3 * heads * dim, dtype=torch.bfloat16, device="cuda")
+    baseq = tdp.convrot_linear_w4a4(x, w4q, ws4q, bq)
+    q, k, v = tdp.convrot_linear_w4a4(x, w4q, ws4q, bq, out_layout="bhsd",
+                                      qkv_heads=heads, head_dim=dim)
+    qkv_ref = baseq.reshape(batch, seq, 3, heads, dim)
+    for i, out in enumerate((q, k, v)):
+        ref = qkv_ref[:, :, i].permute(0, 2, 1, 3).contiguous()
+        torch.testing.assert_close(out.float(), ref.float(), rtol=0, atol=0)
 
 
 def test_add_convrot_residual_gate_rank_free_node():

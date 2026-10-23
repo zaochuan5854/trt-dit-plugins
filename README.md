@@ -23,6 +23,11 @@
   pass uses 128-bit vector accesses (70.7 → 49.1 µs per 4096x2048 bf16 site),
   and `validate_plugin_nodes` resolves BF16's raw ONNX enum (no false
   positives on reloaded graphs).
+- 0.8.1: ConvRot W4A4 supports `epilogue`, `residual`/`gate`, `out_layout`,
+  and QKV heads (activation/residual runs as a post-pass after the GEMM);
+  the smooth-K K-mean reduction is deterministic (no `atomicAdd`), and
+  `libck_kernels.so` is built with `-Bsymbolic` + `-fno-gnu-unique` so it no
+  longer shares CUTLASS's thread_local state with comfy-kitchen.
 - Kernels from ComfyKitchen and SpargeAttn (see NOTICE and Kernel sources);
   handwritten TRT glue. Not affiliated with Comfy Org; ComfyKitchen
   compatibility is not a goal.
@@ -69,9 +74,9 @@ out = tdp.fused_rope_sage_attn(q, k, v, rms_w_q, rms_w_k, inv_freq)
 
 ```bash
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.8.0-cu13/trt_dit_plugins-0.8.0-py3-none-linux_x86_64.whl   # Linux
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.8.1-cu13/trt_dit_plugins-0.8.1-py3-none-linux_x86_64.whl   # Linux
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.8.0-cu13/trt_dit_plugins-0.8.0-py3-none-win_amd64.whl      # Windows
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.8.1-cu13/trt_dit_plugins-0.8.1-py3-none-win_amd64.whl      # Windows
 ```
 
 ## Quick Start
@@ -105,7 +110,7 @@ input and optional `weight` / `residual` / `gate`.
 | `block_sparse_sage2_attn` | Block-sparse SageAttention2, sm89 only (kernel: SpargeAttn); `out_layout="bsc"` since 0.7.0 | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] → `[B,S,C]` with BSC | cos=0.99953 |
 | `fused_int8_rope_sage_attn` | Fused RoPE+SageAttention DiT-self, D=128 (new in 0.4.0); `out_layout="bsc"` since 0.7.0 | in INT8 [B,H,S,128] + FP32 scales, or f32/f16/bf16 [B,H,S,128] (scales ignored; `fused_rope_sage_attn`) + norms → out BF16, or `[B,S,C]` | cos=0.99855 vs fp32 eager (matched rotation), 1.578 ms/layer @ S=4096,H=16 (1.29x vs separation; 1.12x @ S=9216, RTX 4070 Ti) |
 | `convrot_linear` | ConvRot W8A8 dynamic-quant linear (INT8 weight, online Hadamard rotation); 0.6.0 adds GELU/SiLU + residual+gate epilogue and BHSD/QKV output; 0.8.0 accepts any-rank residual/gate | x f16/bf16/f32, weight INT8 [N,K], scale FP32 [N], bias [N] → f16/bf16/f32 or `[B,H,S,D]` ×3 | bit-exact vs comfy-kitchen (max_abs=0); epilogue/layout covered by GPU tests |
-| `convrot_linear_w4a4` | ConvRot W4A4 linear (packed signed INT4 weight [N,K/2], INT4 activation) | x f16/bf16/f32, weight INT8 packed [N,K/2], scale FP32 [N], bias [N] → f16/bf16/f32 | bit-exact vs comfy-kitchen (max_abs=0) |
+| `convrot_linear_w4a4` | ConvRot W4A4 linear (packed signed INT4 weight [N,K/2], INT4 activation); 0.8.1 adds epilogue, residual+gate, BHSD/QKV output (post-pass) | x f16/bf16/f32, weight INT8 packed [N,K/2], scale FP32 [N], bias [N] → f16/bf16/f32 or `[B,H,S,D]` ×3 | bit-exact vs comfy-kitchen (max_abs=0); post-pass/layout covered by GPU tests |
 
 All plugin I/O is `kLINEAR` only. Q/K/V/scale inputs to one plugin must share
 one dtype. `UINT8` plugin I/O is unsupported by TRT 11.
@@ -195,7 +200,10 @@ W4A4 picks a fixed CUTLASS tile from `gemm_config`; on `sm80/86/89` only the
 tiles that fit the 99 KiB shared-memory budget exist, so measure with
 `autotune` rather than hand-picking (a bad index falls back, it never
 corrupts the result). On non-sm8x GPUs W4A4 degrades to W4A8 (INT8
-activation) inside the same plugin.
+activation) inside the same plugin. W4A4 also accepts `epilogue`,
+`residual`/`gate`, `out_layout="bhsd"`, and QKV heads since 0.8.1; unlike
+W8A8, its activation/residual/gate is a post-pass, so use W8A8 where that
+pass is on the hot path.
 
 `autotune_convrot_w4a4` covers the CUTLASS shapes (`N % 32 == 0`) and
 returns `-1` otherwise; pass that to `gemm_config` and the legacy fallback

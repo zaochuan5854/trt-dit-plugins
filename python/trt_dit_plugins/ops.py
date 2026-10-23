@@ -345,12 +345,8 @@ def _convrot_linear(op, x, weight, weight_scale, bias, out_dtype, gemm_config, w
         ep = int(epilogue)
     else:
         raise ValueError("epilogue must be 'none', 'gelu' or 'silu'")
-    if w4a4 and (ep or residual is not None or gate is not None):
-        raise ValueError("W4A4 does not support epilogue/residual/gate")
     if out_layout not in ("bsc", "bhsd"):
         raise ValueError("out_layout must be 'bsc' or 'bhsd'")
-    if w4a4 and (out_layout != "bsc" or qkv_heads or head_dim):
-        raise ValueError("W4A4 does not support out_layout/qkv_heads/head_dim")
     if head_dim < 0 or qkv_heads < 0:
         raise ValueError("qkv_heads and head_dim must be >= 0")
     tensors = {"x": x, "w": weight, "ws": weight_scale, "b": bias}
@@ -430,13 +426,16 @@ def convrot_linear(x, weight, weight_scale, bias=None, *, out_dtype=None, gemm_c
 
 
 def convrot_linear_w4a4(x, qweight, wscales, bias=None, *, out_dtype=None, gemm_config=-1,
-                        epilogue="none", out_layout="bsc", qkv_heads=0, head_dim=0,
-                        profile=None):
+                        epilogue="none", residual=None, gate=None, out_layout="bsc",
+                        qkv_heads=0, head_dim=0, profile=None):
     """ConvRot W4A4 linear: packed signed INT4 weight [N, K/2], fp32 scales [N].
 
     ``gemm_config``: -1 = automatic route, else a pinned sm8x tile config.
+    ``epilogue``/``residual``/``gate`` and ``out_layout`` follow
+    :func:`convrot_linear`; W4A4 runs the activation/residual/gate as a
+    post-pass instead of the W8A8 fused epilogue.
     ``profile``: {"x": (min, opt, max)} makes the M dim dynamic.
     """
     return _convrot_linear(PluginOp.CONVROT_LINEAR_W4A4, x, qweight, wscales, bias,
-                           out_dtype, gemm_config, True, epilogue, None, None, out_layout,
-                           qkv_heads, head_dim, profile)
+                           out_dtype, gemm_config, True, epilogue, residual, gate,
+                           out_layout, qkv_heads, head_dim, profile)

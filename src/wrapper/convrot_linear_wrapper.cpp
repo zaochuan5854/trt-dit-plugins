@@ -336,22 +336,48 @@ public:
             if (outLayout_ == 1) {
                 void* outs[3]{out[0], qkvHeads_ > 0 ? out[1] : nullptr,
                               qkvHeads_ > 0 ? out[2] : nullptr};
-                return convrot_gemm_layout(
-                           outs, static_cast<int8_t const*>(in[kW]),
-                           static_cast<float const*>(in[kWS]), bias, xq, xs, M_, N_, K_, S_,
-                           static_cast<int>(H_), static_cast<int>(D_), outLayout_, gemmConfig_,
-                           outCode, biasCode, stream) == 0
-                       ? 0
-                       : -1;
+                if (WeightBits != 4) {
+                    return convrot_gemm_layout(
+                               outs, static_cast<int8_t const*>(in[kW]),
+                               static_cast<float const*>(in[kWS]), bias, xq, xs, M_, N_, K_, S_,
+                               static_cast<int>(H_), static_cast<int>(D_), outLayout_, gemmConfig_,
+                               outCode, biasCode, stream) == 0
+                           ? 0
+                           : -1;
+                }
+                // W4A4 has no layout-aware CUTLASS launcher: GEMM flat, then
+                // a single BSC -> BHSD/QKV pass. cudaMallocAsync is capture-safe.
+                const size_t elem = outCode == 0 ? sizeof(float) : sizeof(uint16_t);
+                const size_t tmpBytes = size_t(M_) * size_t(N_) * elem;
+                void* tmp = nullptr;
+                if (cudaMallocAsync(&tmp, tmpBytes, stream) != cudaSuccess) return -1;
+                int rc = convrot_gemm(
+                    tmp, static_cast<int8_t const*>(in[kW]),
+                    static_cast<float const*>(in[kWS]), bias, xq, xs, M_, N_, K_, WeightBits,
+                    actBits, outCode, biasCode, gemmConfig_, 0, nullptr, nullptr, scratch,
+                    scratchBytes - quantBytes - scaleBytes, stream);
+                if (rc == 0)
+                    rc = convrot_layout_bhsd(tmp, outs[0], outs[1], outs[2], B_, S_, H_, D_,
+                                             qkvHeads_ > 0 ? 3 : 1, outCode, stream);
+                if (cudaFreeAsync(tmp, stream) != cudaSuccess) rc = -1;
+                return rc == 0 ? 0 : -1;
             }
 
             const auto run = [&](void* y, int8_t const* q, float const* scales,
                                  int64_t rows, const void* r, const void* g) {
-                return convrot_gemm(y, static_cast<int8_t const*>(in[kW]),
-                                    static_cast<float const*>(in[kWS]), bias, q, scales, rows,
-                                    N_, K_, WeightBits, actBits, outCode, biasCode, gemmConfig_,
-                                    epilogue_, r, g, scratch,
-                                    scratchBytes - quantBytes - scaleBytes, stream);
+                // W4A4 launchers store the plain GEMM result; apply the
+                // activation/residual/gate post-pass here.
+                const int ep = WeightBits == 4 ? 0 : epilogue_;
+                const void* rr = WeightBits == 4 ? nullptr : r;
+                const void* gg = WeightBits == 4 ? nullptr : g;
+                int rc = convrot_gemm(y, static_cast<int8_t const*>(in[kW]),
+                                      static_cast<float const*>(in[kWS]), bias, q, scales, rows,
+                                      N_, K_, WeightBits, actBits, outCode, biasCode, gemmConfig_,
+                                      ep, rr, gg, scratch,
+                                      scratchBytes - quantBytes - scaleBytes, stream);
+                if (rc == 0 && WeightBits == 4 && (epilogue_ != 0 || residualGate_))
+                    rc = convrot_apply_epilogue(y, r, g, rows, N_, epilogue_, outCode, stream);
+                return rc;
             };
             if (residualGate_ && B_ > 1) {
                 const size_t elem = outCode == 0 ? sizeof(float) : sizeof(uint16_t);
@@ -407,9 +433,7 @@ private:
             return false;
         // W8A8 has 14 tiles, W4A4 seven; a pinned index beyond that is a caller bug.
         if (gemmConfig_ >= (WeightBits == 4 ? 7 : 14)) return false;
-        if (WeightBits == 4 && (epilogue_ != 0 || residualGate_ != 0)) return false;
         if (outLayout_ < 0 || outLayout_ > 1 || qkvHeads_ < 0 || headDim_ < 0) return false;
-        if (WeightBits == 4 && (outLayout_ != 0 || qkvHeads_ != 0)) return false;
         const int64_t N = w.dims.d[0];
         const int64_t K = w.dims.d[1] * (WeightBits == 4 ? 2 : 1);
         if (outLayout_ == 1) {
@@ -434,7 +458,6 @@ private:
 
         if (numel(ws.dims) != N || numel(b.dims) != N) return false;
         if (residualGate_) {
-            if (WeightBits != 8) return false;
             if (!checkResidualGate(x, in[kRes], in[kGate], N, yType)) return false;
         }
         return true;

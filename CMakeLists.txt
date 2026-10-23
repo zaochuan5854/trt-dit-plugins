@@ -90,6 +90,19 @@ add_library(ck_kernels SHARED
     src/kernel/convrot/layout.cu
     src/kernel/prime.cu
     ${CONVROT_SOURCES})
+# CUTLASS's GemmUniversalBase thread_local statics are emitted as
+# STB_GNU_UNIQUE. The dynamic linker then unifies them with comfy-kitchen's
+# copies, so our kernel can read/write ck's state even with -Bsymbolic.
+# -fno-gnu-unique makes them ordinary weak definitions and -Bsymbolic binds
+# them inside libck_kernels.so. Verify with: readelf -sW libck_kernels.so |
+# grep UNIQUE  (expect 0).
+option(TRT_DIT_SYMBOLIC_BINDING "Bind ck_kernels symbols locally" ON)
+if(TRT_DIT_SYMBOLIC_BINDING AND NOT MSVC)
+    target_compile_options(ck_kernels PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-fno-gnu-unique>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-gnu-unique>)
+    target_link_options(ck_kernels PRIVATE "-Wl,-Bsymbolic")
+endif()
 # ConvRot (comfy-kitchen v0.2.39): the vendor TUs keep upstream's nvcc flags
 # verbatim (CMakeLists.txt of comfy_kitchen/backends/cuda) so numerics match
 # the oracle.

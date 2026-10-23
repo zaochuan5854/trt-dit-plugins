@@ -1,4 +1,4 @@
-# Fusion / layout extensions (0.8.0)
+# Fusion / layout extensions (0.8.1)
 
 Contract for the ops added for the Anima 2.9B ConvRot request
 (`trt-dit-plugins-fusion-request.md`). The Reforge engine comparison is the
@@ -38,8 +38,9 @@ external handoff gate; this repo verifies the op-level contracts only.
 
 ## ConvRot
 
-- `epilogue`: `0` none, `1` exact GELU (erf), `2` SiLU. Applied in the
-  dequant epilogue, no extra pass.
+- `epilogue`: `0` none, `1` exact GELU (erf), `2` SiLU. W8A8 applies it in
+  the dequant epilogue (no extra pass); W4A4 (0.8.1) applies it as a
+  post-pass after the GEMM.
 - `residual_gate`: `0` off, `1` on -> `out = residual + gate * y`. The
   residual keeps any rank with `N` columns and x's row count; its shape
   becomes the output, so a rank-5 `[1,1,H,W,C]` stream fuses without a
@@ -51,7 +52,11 @@ external handoff gate; this repo verifies the op-level contracts only.
   redundant `[M,N]` read+write cost 1.18 ms/layer at 8192x2048, M=16384).
 - `out_layout="bsc"` (default) or `"bhsd"`; `qkv_heads=H` with
   `head_dim=D` returns three `[B,H,S,D]` tensors (q, k, v).
-- W4A4 rejects `epilogue`/`residual`/`out_layout`/QKV fields in 0.6.0.
+- W4A4 supports `epilogue`, `residual`/`gate`, `out_layout`, and QKV fields
+  since 0.8.1. Its activation/residual/gate is a post-pass; `out_layout`
+  runs a flat GEMM into a temporary followed by one BSC -> BHSD/QKV pass.
+  `out_layout="bhsd"` still requires no epilogue/residual (use BSC for
+  those, then reshape/transpose in the graph or a separate layout op).
 - All new fields default to their legacy values, so existing serialized
   engines keep working (`PLUGIN_VERSION` stays `"1"`).
 
@@ -128,16 +133,34 @@ identity-rotation RMS parity, attention composition, determinism, and a
 bit-identical to the BHSD store followed by transpose+reshape for
 `int8_attention`, `sage_attn`, `fp8_pv`, and block-sparse attention.
 
-Known pre-existing limit: `fused_int8_rope_sage_attn` uses float
-`atomicAdd` in its K-mean prepass, so repeated runs can differ by one bf16
-ULP at B>=2/S>=512. This is identical in BHSD and BSC and is not caused by
-the layout epilogue; its BSC/BHSD cosine is >0.999999. The other three
-attention ops are bit-stable.
+`fused_int8_rope_sage_attn`'s K-mean prepass is deterministic since 0.8.1:
+one block per `(b,h)`, fixed 16-stripe fold order, no `atomicAdd` (the old
+form could differ by one bf16 ULP between runs at B>=2/S>=512). BSC and BHSD
+share the same reduction.
 
 ## Deferred
 
-None for the 0.7.0 layout contract. W4A4 still rejects
-`epilogue`/`residual`/`out_layout`/QKV fields (0.6.0 behavior).
+None for the 0.8.1 layout contract.
+
+## 0.8.1 fixes
+
+Plugin-side fixes from the ConvRot INT8 Anima integration review, no graph
+contract change (`PLUGIN_VERSION` stays `"1"`, existing engines keep
+loading):
+
+- `libck_kernels.so` is linked with `-Bsymbolic` and compiled with
+  `-fno-gnu-unique` (option `TRT_DIT_SYMBOLIC_BINDING`, default ON). CUTLASS's
+  `STB_GNU_UNIQUE` thread_local statics are no longer unified with
+  comfy-kitchen's copies, so running both in one process stays bit-exact.
+  Verify with `readelf -sW libck_kernels.so | grep UNIQUE` (expect 0).
+- The smooth-K K-mean prepass is deterministic: one block per `(b,h)`, 16
+  row stripes, fixed fold order, no `atomicAdd`. Repeated fused-attention
+  calls on identical input are bit-exact.
+- W4A4 gains `epilogue`, `residual`/`gate`, `out_layout`/QKV heads. The
+  activation/residual/gate runs as a post-pass; BHSD/QKV runs a flat GEMM
+  into a temporary plus one layout pass. W8A8 keeps its fused epilogue.
+- Tests cover W4A4 epilogue/residual parity, W4A4 BHSD/QKV (bit-exact against
+  the BSC output), and fused-attention repeat determinism.
 
 ## 0.8.0 fixes
 
@@ -165,4 +188,4 @@ change (`PLUGIN_VERSION` stays `"1"`, existing engines keep loading):
 - Op-level tests: pass on the RTX 4070 Ti (sm89).
 - External Anima engine: `cos` at or above the existing gate, layer count
   < 1000, E2E <= 220 ms, no `Transpose` in the rope/QKV region. Until that
-  is measured, 0.8.0 is "op-level verified, engine gate pending".
+  is measured, 0.8.1 is "op-level verified, engine gate pending".

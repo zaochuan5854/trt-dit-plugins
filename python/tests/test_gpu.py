@@ -326,6 +326,17 @@ def test_attention_out_layout():
         assert torch.equal(bscb, refb.transpose(1, 2).reshape(B, 128, H * D))
 
 
+def test_fused_smooth_k_deterministic():
+    # R12: the K-mean reduction has a fixed fold order (no atomics), so
+    # repeated calls on identical input must be bit-exact.
+    q, k, v = _qkv()
+    rw = torch.rand(D, device="cuda") * 0.5 + 0.5
+    inv = torch.rand(64, device="cuda") * 0.05
+    ref = tdp.fused_rope_sage_attn(q, k, v, rw, rw, inv)
+    for _ in range(3):
+        assert torch.equal(ref, tdp.fused_rope_sage_attn(q, k, v, rw, rw, inv))
+
+
 def test_fused_float_input():
     # R2: linear output (bf16) feeds the fused op with no QuantizeLinear.
     q = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)

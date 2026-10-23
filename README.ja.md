@@ -23,6 +23,11 @@
   ベクトルアクセス化（4096x2048 bf16で70.7 → 49.1 µs/site）。
   `validate_plugin_nodes`はBF16の生ONNX enumを解決する（再ロードした
   graphのfalse positiveが消える）。
+- 0.8.1：ConvRot W4A4が`epilogue`、`residual`/`gate`、`out_layout`、QKV
+  headに対応（activation/residualはGEMM後のpost-pass）。smooth-KのK平均は
+  `atomicAdd`を廃止して決定的になり、`libck_kernels.so`を
+  `-Bsymbolic`＋`-fno-gnu-unique`でビルドしてcomfy-kitchenとCUTLASSの
+  thread_local状態を共有しないようにした。
 - KernelはComfyKitchenおよびSpargeAttn由来（NOTICE・Kernel sources参照）。
   TRT glueは手書き。Comfy Orgとは無関係。ComfyKitchen互換は目標ではない。
 
@@ -66,9 +71,9 @@ out = tdp.stochastic_rounding_fp8(x, rng)  # rng: int32、xと同要素数
 
 ```bash
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.8.0-cu13/trt_dit_plugins-0.8.0-py3-none-linux_x86_64.whl   # Linux
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.8.1-cu13/trt_dit_plugins-0.8.1-py3-none-linux_x86_64.whl   # Linux
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.8.0-cu13/trt_dit_plugins-0.8.0-py3-none-win_amd64.whl      # Windows
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.8.1-cu13/trt_dit_plugins-0.8.1-py3-none-win_amd64.whl      # Windows
 ```
 
 ## Quick Start
@@ -92,7 +97,7 @@ python -c "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
 | `block_sparse_sage2_attn` | Block-sparse SageAttention2、sm89のみ（kernel：SpargeAttn）。0.7.0で`out_layout="bsc"`対応 | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] → BSCで`[B,S,C]` | cos=0.99953 |
 | `fused_int8_rope_sage_attn` | 融合INT8 RoPE+SageAttention DiT-self、D=128（0.4.0で新規）。0.7.0で`out_layout="bsc"`対応 | in INT8 [B,H,S,128]＋FP32 scales/norms → out BF16、または`[B,S,C]` | cos=0.99855（fp32 eager比、回転条件一致）、1.578 ms/layer @ S=4096,H=16（分離比1.29x；S=9216で1.12x、RTX 4070 Ti） |
 | `convrot_linear` | ConvRot W8A8 動的量子化linear。0.6.0でGELU/SiLU＋residual+gate epilogueとBHSD/QKV出力を追加、0.8.0で任意rankのresidual/gateに対応 | x f16/bf16/f32、weight INT8 [N,K]、scale FP32 [N]、bias [N] → f16/bf16/f32 または `[B,H,S,D]`×3 | base経路はcomfy-kitchenとbit-exact、epilogue/layoutはGPUテストで検証 |
-| `convrot_linear_w4a4` | ConvRot W4A4 linear（パック符号付きINT4 weight [N,K/2]、INT4 activation） | x f16/bf16/f32、weight INT8パック [N,K/2]、scale FP32 [N]、bias [N] → f16/bf16/f32 | base経路はcomfy-kitchenとbit-exact |
+| `convrot_linear_w4a4` | ConvRot W4A4 linear（パック符号付きINT4 weight [N,K/2]、INT4 activation）。0.8.1でepilogue・residual+gate・BHSD/QKV出力に対応（post-pass） | x f16/bf16/f32、weight INT8パック [N,K/2]、scale FP32 [N]、bias [N] → f16/bf16/f32 または `[B,H,S,D]`×3 | base経路はcomfy-kitchenとbit-exact、post-pass/layoutはGPUテストで検証 |
 
 全plugin I/Oは`kLINEAR`のみ。同一pluginへのQ/K/V/scale入力はdtype統一必須。
 TRT 11は`UINT8`プラグインI/O非対応。

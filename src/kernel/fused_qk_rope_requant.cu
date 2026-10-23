@@ -180,50 +180,66 @@ __forceinline__ __device__ void load4_in(const InT *p, float *v, float s) {
 
 // ---- K mean pre-pass (smooth-K): mean[ch] over L rows of dequantized K ----
 //
-// Latency trap this avoids: one block per (b,h) with a scalar byte loop over
-// L rows under-fills the GPU and scales with S only. Instead L is split
-// into 128-row chunks processed by many blocks, each vectorized, combined
-// with one atomicAdd per (chunk, channel); the single-block/no-atomic form
-// loses memory-level parallelism.
+// Deterministic fixed map: one block per (b,h), 16 row stripes x 32 lanes.
+// Each warp owns 4 stripes and all 128 channels (4 channels per lane); the
+// 16 stripe sums are folded in the fixed order 0..15 through shared memory,
+// with no atomics. The previous chunked/atomicAdd form changed the float
+// reduction order with block scheduling, so the same input could produce
+// different K means (and therefore different attention outputs and layer
+// parity runs) between calls.
 
-constexpr int KMEAN_CHUNK_ROWS = 128; // Larger chunks underfill the SMs at
-// small S (fewer blocks); 128 keeps enough blocks in flight.
+constexpr int KMEAN_STRIPES = 16;
+constexpr int KMEAN_STRIPE_ROWS = 16;
+constexpr int KMEAN_PASS_ROWS = KMEAN_STRIPES * KMEAN_STRIPE_ROWS;
 
 template <typename InT>
 __global__ __launch_bounds__(128) void k_mean_kernel(
     const InT *__restrict__ k_in, float *__restrict__ mean_out,
     const float *__restrict__ k_s_in, int L, int C, int H, int64_t stride_b,
     int64_t stride_h) {
-  const int chunk = blockIdx.x;
-  const int h = blockIdx.y, b = blockIdx.z;
+  __shared__ float part[KMEAN_STRIPES][128];
+  const int h = blockIdx.x, b = blockIdx.y;
   const int lane = threadIdx.x & 31;
   const int wid = threadIdx.x >> 5;
-  // 4 warps cover 128 channels, 4 ch per lane.
-  const int ch = wid * 32 + (lane << 2);
+  const int ch = lane << 2; // 4 warps x 32 lanes x 4 channels = 128
   const float k_s = __ldg(k_s_in);
-  const int n0 = chunk * KMEAN_CHUNK_ROWS;
-  const int n1 = n0 + KMEAN_CHUNK_ROWS < L ? n0 + KMEAN_CHUNK_ROWS : L;
   const InT *base = k_in + (int64_t)b * stride_b + (int64_t)h * stride_h;
-  float acc[4] = {0.f, 0.f, 0.f, 0.f};
-  for (int n = n0; n < n1; n += 4) {
-    // 4 rows x 4 ch (tail rows past n1 are masked).
+  float acc[4][4] = {};
+
+  for (int pass = 0; pass * KMEAN_PASS_ROWS < L; ++pass) {
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
-      const int nn = n + r;
-      float t[4] = {0.f, 0.f, 0.f, 0.f};
-      if (nn < n1)
-        load4_in<InT>(&base[(int64_t)nn * C + ch], t, 1.f);
+    for (int s = 0; s < 4; ++s) {
+      const int stripe = wid + (s << 2);
+      const int n0 = pass * KMEAN_PASS_ROWS + stripe * KMEAN_STRIPE_ROWS;
+      const int n1 = n0 + KMEAN_STRIPE_ROWS < L ? n0 + KMEAN_STRIPE_ROWS : L;
+      for (int n = n0; n < n1; ++n) {
+        float t[4] = {0.f, 0.f, 0.f, 0.f};
+        load4_in<InT>(&base[(int64_t)n * C + ch], t, 1.f);
 #pragma unroll
-      for (int c = 0; c < 4; ++c)
-        acc[c] += t[c];
+        for (int c = 0; c < 4; ++c)
+          acc[s][c] += t[c];
+      }
     }
   }
+
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    const int stripe = wid + (s << 2);
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+      part[stripe][ch + c] = acc[s][c];
+  }
+  __syncthreads();
+
   const float k = k_s / static_cast<float>(L);
   float *mout = mean_out + ((int64_t)b * H + h) * C;
-  atomicAdd(&mout[ch], acc[0] * k);
-  atomicAdd(&mout[ch + 1], acc[1] * k);
-  atomicAdd(&mout[ch + 2], acc[2] * k);
-  atomicAdd(&mout[ch + 3], acc[3] * k);
+  if (threadIdx.x < C) {
+    float sum = 0.f;
+#pragma unroll
+    for (int stripe = 0; stripe < KMEAN_STRIPES; ++stripe)
+      sum += part[stripe][threadIdx.x];
+    mout[threadIdx.x] = sum * k;
+  }
 }
 
 // Fused Q kernel: thread map IDENTICAL to quant_q_kernel NR=4/WARPQ=32.
@@ -824,7 +840,8 @@ void launch_fused_typed(const void *q_i8, const void *q_s_in, void *q_int8,
   const int q_sc_per_h = q_oblk * 8;
   const int k_sc_per_h = k_oblk * 4;
 
-  // K mean pre-pass over dequantized K (smooth-K). Chunked + atomicAdd.
+  // K mean pre-pass over dequantized K (smooth-K), one deterministic block
+  // per (b,h); the block writes the full mean row, so no memset is needed.
   // Stream overlap (k_mean+requant on a side stream, join via events) stays
   // unwritten: sharing events across sequential enqueues is unsound (a
   // lagging main stream can observe a later call's record, then read
@@ -832,15 +849,11 @@ void launch_fused_typed(const void *q_i8, const void *q_s_in, void *q_int8,
   // be safely destroyed (must outlive the wait's execution). Sound overlap
   // needs full graph capture; sequential stands.
   {
-    dim3 g((L + KMEAN_CHUNK_ROWS - 1) / KMEAN_CHUNK_ROWS, H, B);
-    cudaError_t e = cudaMemsetAsync(ws_mean, 0, (size_t)B * H * C * 4, stream);
-    if (e != cudaSuccess)
-      throw std::runtime_error(std::string("k_mean memset failed: ") +
-                               cudaGetErrorString(e));
+    dim3 g(H, B);
     k_mean_kernel<InT><<<g, 128, 0, stream>>>(
         (const InT *)k_i8, (float *)ws_mean, (const float *)k_s_in, L, C, H,
         stride_b, stride_h);
-    e = cudaGetLastError();
+    cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess)
       throw std::runtime_error(std::string("k_mean kernel launch failed: ") +
                                cudaGetErrorString(e));

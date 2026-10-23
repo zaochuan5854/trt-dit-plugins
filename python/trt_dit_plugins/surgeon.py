@@ -207,10 +207,10 @@ def add_convrot_linear(graph, x, weight, weight_scale, bias, *, w4a4=False,
     already be in that dtype.
     ``gemm_config``: -1 = automatic route; >= 0 pins a W4A4 GEMM tile config.
     ``epilogue``: "none" | "gelu" | "silu"; ``residual``/``gate`` append the
-    fused residual+gate inputs (W8A8 only): ``out = residual + gate * y``.
-    The residual keeps any rank with N columns and x's row count, and its
-    shape becomes the node output; the gate broadcasts over rows
-    (``[.., 1, N]``) or repeats per batch (``[B, N]`` / ``[B, 1, N]``).
+    residual+gate inputs: ``out = residual + gate * y``. The residual keeps
+    any rank with N columns and x's row count, and its shape becomes the node
+    output; the gate broadcasts over rows (``[.., 1, N]``) or repeats per
+    batch (``[B, N]`` / ``[B, 1, N]``).
     """
     if isinstance(epilogue, str):
         ep = {"none": 0, "gelu": 1, "silu": 2}.get(epilogue)
@@ -218,16 +218,12 @@ def add_convrot_linear(graph, x, weight, weight_scale, bias, *, w4a4=False,
         ep = int(epilogue)
     if ep not in (0, 1, 2):
         raise ValueError("epilogue must be 'none', 'gelu' or 'silu'")
-    if (ep or residual is not None) and w4a4:
-        raise ValueError("W4A4 does not support epilogue/residual/gate")
     if residual is not None and gate is None:
         raise ValueError("residual requires gate")
     if gate is not None and residual is None:
         raise ValueError("gate requires residual")
     if out_layout not in ("bsc", "bhsd"):
         raise ValueError("out_layout must be 'bsc' or 'bhsd'")
-    if w4a4 and (out_layout != "bsc" or qkv_heads or head_dim):
-        raise ValueError("W4A4 does not support out_layout/qkv_heads/head_dim")
     if out_layout == "bhsd" and (ep or residual is not None):
         raise ValueError("bhsd output does not support epilogue/residual")
     gs = _gs()
@@ -1499,8 +1495,6 @@ def validate_plugin_nodes(graph) -> list[str]:
             if rg not in (0, 1):
                 errs.append(f"{tag}: residual_gate={rg}, want 0/1")
             elif rg:
-                if w4a4:
-                    errs.append(f"{tag}: W4A4 rejects residual_gate")
                 for idx, nm in ((4, "residual"), (5, "gate")):
                     dd = _dtype_name(node.inputs[idx].dtype)
                     if dd != want_dtype:

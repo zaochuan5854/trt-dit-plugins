@@ -21,6 +21,11 @@
   M=16384 时每层 1.18 ms），residual+gate pass 改为 128-bit 向量访问
   （4096x2048 bf16 时 70.7 → 49.1 µs/site）；`validate_plugin_nodes` 能解析
   BF16 的原始 ONNX enum（重新加载的 graph 不再产生误报）。
+- 0.8.1：ConvRot W4A4 支持 `epilogue`、`residual`/`gate`、`out_layout` 和
+  QKV head（activation/residual 在 GEMM 后作为 post-pass 执行）；smooth-K
+  的 K 均值去掉 `atomicAdd`，结果确定；`libck_kernels.so` 使用
+  `-Bsymbolic` + `-fno-gnu-unique` 构建，不再与 comfy-kitchen 共享 CUTLASS
+  的 thread_local 状态。
 - Kernel 来自 ComfyKitchen 与 SpargeAttn（见 NOTICE 与 Kernel sources）；
   TRT 胶水为手写。与 Comfy Org 无关；不以 ComfyKitchen 兼容为目标。
 
@@ -64,9 +69,9 @@ out = tdp.stochastic_rounding_fp8(x, rng)  # rng: int32，元素数与 x 相同
 
 ```bash
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.8.0-cu13/trt_dit_plugins-0.8.0-py3-none-linux_x86_64.whl   # Linux
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.8.1-cu13/trt_dit_plugins-0.8.1-py3-none-linux_x86_64.whl   # Linux
 pip install --extra-index-url https://pypi.nvidia.com \
-  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.8.0-cu13/trt_dit_plugins-0.8.0-py3-none-win_amd64.whl      # Windows
+  https://github.com/zaochuan5854/trt-dit-plugins/releases/download/v0.8.1-cu13/trt_dit_plugins-0.8.1-py3-none-win_amd64.whl      # Windows
 ```
 
 ## Quick Start
@@ -90,7 +95,7 @@ python -c "import trt_dit_plugins as t; print(t.__version__, sorted(t.PLUGINS))"
 | `block_sparse_sage2_attn` | Block-sparse SageAttention2，仅 sm89（kernel：SpargeAttn）；0.7.0 起支持 `out_layout="bsc"` | q/k/v f16/bf16 [B,H,S,D], mask INT32 [B,H,S//128,S//64] → BSC 时 `[B,S,C]` | cos=0.99953 |
 | `fused_int8_rope_sage_attn` | 融合 INT8 RoPE+SageAttention DiT-self，D=128（0.4.0 新增）；0.7.0 起支持 `out_layout="bsc"` | in INT8 [B,H,S,128] + FP32 scales/norms → out BF16，或 `[B,S,C]` | cos=0.99855（相对 fp32 eager，旋转条件一致），1.578 ms/layer @ S=4096,H=16（相对分离路径 1.29x；S=9216 时 1.12x，RTX 4070 Ti） |
 | `convrot_linear` | ConvRot W8A8 动态量化 linear；0.6.0 新增 GELU/SiLU + residual+gate epilogue 与 BHSD/QKV 输出；0.8.0 支持任意 rank 的 residual/gate | x f16/bf16/f32，weight INT8 [N,K]，scale FP32 [N]，bias [N] → f16/bf16/f32 或 `[B,H,S,D]`×3 | base 路径与 comfy-kitchen bit-exact；epilogue/layout 由 GPU 测试覆盖 |
-| `convrot_linear_w4a4` | ConvRot W4A4 linear（打包有符号 INT4 weight [N,K/2]、INT4 activation） | x f16/bf16/f32，weight INT8 打包 [N,K/2]，scale FP32 [N]，bias [N] → f16/bf16/f32 | base 路径与 comfy-kitchen bit-exact |
+| `convrot_linear_w4a4` | ConvRot W4A4 linear（打包有符号 INT4 weight [N,K/2]、INT4 activation）；0.8.1 新增 epilogue、residual+gate、BHSD/QKV 输出（post-pass） | x f16/bf16/f32，weight INT8 打包 [N,K/2]，scale FP32 [N]，bias [N] → f16/bf16/f32 或 `[B,H,S,D]`×3 | base 路径与 comfy-kitchen bit-exact，post-pass/layout 由 GPU 测试覆盖 |
 
 所有插件 I/O 均为 `kLINEAR`。同一插件的 Q/K/V/scale 输入 dtype 必须一致。
 TRT 11 不支持 `UINT8` 插件 I/O。

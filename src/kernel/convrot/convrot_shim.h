@@ -51,6 +51,11 @@ int convrot_gemm_layout(void* const* y, const int8_t* w, const float* ws, const 
                         int64_t S, int H, int D, int out_layout, int config, int out_dtype,
                         int bias_dtype, cudaStream_t stream);
 
+// BSC [B,S,C] -> BHSD [B,H,S,D] (qkv_count=1) or [B,H,S,D] x3 (qkv_count=3).
+int convrot_layout_bhsd(const void* src, void* q, void* k, void* v, int64_t B, int64_t S,
+                        int64_t H, int64_t D, int qkv_count, int dtype_code,
+                        cudaStream_t stream);
+
 // Build-time only (never from enqueue). Returns the best config index or -1.
 int convrot_int4_autotune(int64_t M, int64_t N, int64_t K, int out_dtype,
                           void* scratch, size_t scratch_bytes, cudaStream_t stream);
